@@ -1,0 +1,26 @@
+# Core ML/DL frameworks
+torch==2.8.0
+pytorch-lightning==2.5.2
+
+# Data processing
+datasets==4.0.0
+numpy==2.3.2
+pandas==2.3.1
+pyarrow==21.0.0
+
+# Training utilities
+tensorboard==2.20.0
+tqdm==4.67.1
+torchmetrics==1.8.0
+
+# HuggingFace ecosystem
+huggingface-hub==0.34.3
+tokenizers==0.21.4
+transformers==4.55.0
+safetensors==0.5.3
+
+# Utilities
+PyYAML==6.0.2
+fsspec==2025.3.0
+filelock==3.18.0
+regex==2025.7.34
