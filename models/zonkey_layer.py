@@ -325,7 +325,7 @@ class ZonkeyLayer(nn.Module):
         num_total_positions = doc_batch * doc_seq_len
         num_valid = doc_mask.sum().item()
         
-        if num_valid == 0:
+        if num_valid <= 1:
             return torch.tensor(0.0, device=device, requires_grad=True)
         
         encoder_output_flat = encoder_output.reshape(-1, hidden_dim)
@@ -351,6 +351,14 @@ class ZonkeyLayer(nn.Module):
             num_negatives,
             replacement=True
         )
+        
+        # Fix collisions where negative == positive (loop until none remain)
+        positive_indices_exp = positive_indices.unsqueeze(1)
+        collision_mask = (sampled_indices == positive_indices_exp)
+        while collision_mask.any():
+            num_collisions = collision_mask.sum().item()
+            sampled_indices[collision_mask] = torch.multinomial(sample_probs, num_collisions, replacement=True)
+            collision_mask = (sampled_indices == positive_indices_exp)
         
         neg_targets = targets_norm[sampled_indices]
         
