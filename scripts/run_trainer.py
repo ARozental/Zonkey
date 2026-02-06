@@ -38,7 +38,7 @@ def run_training(args):
     trainer = pl.Trainer(**make_trainer_config(time_now))
     
     # Pass ckpt_path to trainer.fit() to restore trainer state (global_step, epoch, etc.)
-    if ckpt_path:
+    if ckpt_path and Config.USE_OPTIMIZER_CHECKPOINT:
         trainer.fit(model, dataloader, ckpt_path=str(ckpt_path))
     else:
         trainer.fit(model, dataloader)

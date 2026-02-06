@@ -31,6 +31,9 @@ class Config:
     WORKING_LEVEL_LOSS_WEIGHT = 1.0
     EPS = 1e-7
     EOS_TARGET_BIAS = [-2.0,-2.0,-2.0] #this is a hyperparameter, for slightly better initialization
+    USE_MUON = True  # Use Muon optimizer for hidden layers, otherwise use AdamW for all parameters
+    MUON_MOMENTUM = 0.95  # Momentum for Muon optimizer
+    USE_OPTIMIZER_CHECKPOINT = True #use checkpoint when available to restore optimizer state
 
 
 

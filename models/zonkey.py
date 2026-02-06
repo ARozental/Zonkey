@@ -10,6 +10,8 @@ from torch.utils.checkpoint import checkpoint
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from configs.default_config import Config
 from models.zonkey_layer import ZonkeyLayer
+from muon import SingleDeviceMuonWithAuxAdam, MuonWithAuxAdam
+import torch.distributed as dist
 
 class PlZonkey(pl.LightningModule):
     def __init__(self, writer=None):
@@ -24,6 +26,36 @@ class PlZonkey(pl.LightningModule):
             for group in opt.param_groups:
                 group["lr"] = Config.LEARNING_RATE
 
+    def on_load_checkpoint(self, checkpoint):
+        """
+        Override checkpoint loading to handle optimizer switching.
+        When switching between Muon and AdamW, skip loading the old optimizer state.
+        """
+        # Check if optimizer type has changed
+        checkpoint_had_muon = False
+        if 'optimizer_states' in checkpoint and len(checkpoint['optimizer_states']) > 0:
+            # Try to detect if the checkpoint used Muon by checking for 'use_muon' in param_groups
+            try:
+                first_opt_state = checkpoint['optimizer_states'][0]
+                if 'param_groups' in first_opt_state:
+                    for group in first_opt_state['param_groups']:
+                        if 'use_muon' in group:
+                            checkpoint_had_muon = True
+                            break
+            except (KeyError, IndexError, TypeError):
+                pass
+        
+        current_uses_muon = Config.USE_MUON
+        
+        # If optimizer type changed, remove optimizer states from checkpoint
+        if checkpoint_had_muon != current_uses_muon:
+            print(f"\n⚠️  Optimizer type changed: checkpoint used {'Muon' if checkpoint_had_muon else 'AdamW'}, "
+                  f"current config uses {'Muon' if current_uses_muon else 'AdamW'}")
+            print("   Skipping old optimizer state - will initialize fresh optimizer\n")
+            if 'optimizer_states' in checkpoint:
+                del checkpoint['optimizer_states']
+            if 'lr_schedulers' in checkpoint:
+                del checkpoint['lr_schedulers']
     
     def forward(self, x):
         return self.model(x)
@@ -187,8 +219,40 @@ class PlZonkey(pl.LightningModule):
         return None
 
     def configure_optimizers(self):
-        params = [p for p in self.model.parameters() if p.requires_grad]
-        optimizer = torch.optim.AdamW(params, lr=Config.LEARNING_RATE, eps=Config.EPS)
+        if Config.USE_MUON:
+            # Separate parameters for Muon (2D hidden layers) vs Adam (embeddings, biases, scalars)
+            hidden_matrix_params = []
+            other_params = []
+            
+            for name, p in self.model.named_parameters():
+                if p.requires_grad:
+                    # Use Muon for 2D+ parameters in hidden layers (not embeddings)
+                    if p.ndim >= 2 and "embedding" not in name.lower():
+                        hidden_matrix_params.append(p)
+                    else:
+                        other_params.append(p)
+            
+            # Create parameter groups for MuonWithAuxAdam
+            param_groups = []
+            if hidden_matrix_params:
+                param_groups.append(dict(params=hidden_matrix_params, lr=Config.LEARNING_RATE, 
+                                        momentum=Config.MUON_MOMENTUM, use_muon=True))
+            if other_params:
+                param_groups.append(dict(params=other_params, lr=Config.LEARNING_RATE, 
+                                        eps=Config.EPS, use_muon=False))
+            
+            # Detect if we're in distributed training mode
+            is_distributed = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+            
+            if is_distributed:
+                optimizer = MuonWithAuxAdam(param_groups)
+            else:
+                optimizer = SingleDeviceMuonWithAuxAdam(param_groups)
+        else:
+            # Use standard AdamW for all parameters
+            params = [p for p in self.model.parameters() if p.requires_grad]
+            optimizer = torch.optim.AdamW(params, lr=Config.LEARNING_RATE, eps=Config.EPS)
+
         return {"optimizer": optimizer}
 
 class Zonkey(nn.Module):
