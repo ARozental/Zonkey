@@ -6,7 +6,7 @@ from typing import Tuple, Optional
 import math
 import torch.nn.functional as F
 from losses.reconstruction import calculate_reconstruction_loss,calculate_token_loss
-from utils.helper_functions import calculate_mean_similarity,expected_l2_norm
+from utils.helper_functions import calculate_mean_similarity,expected_l2_norm,calculate_spherical_uniformity_loss
 from splitter.segment_splitter import SegmentSplitter
 from splitter.stitcher import Stitcher
 from torch.distributions import Beta
@@ -412,7 +412,7 @@ class ZonkeyLayer(nn.Module):
         
         clean_compressed = self.compress(input_sequence, is_real_inferred)
         doc_ids = original_position[:,0,0]
-        clean_compressed_sim = calculate_mean_similarity(clean_compressed, doc_ids)
+        # clean_compressed_sim = calculate_mean_similarity(clean_compressed, doc_ids)
         
         # Per-sample noise level for the batch
         t0 = self.noise_last_step_size * (self.beta_dist.sample((clean_compressed.shape[0],)) / self.beta_dist_mean)
@@ -430,7 +430,7 @@ class ZonkeyLayer(nn.Module):
         
         # Compress with the soft mask from predicted EoS probabilities
         compressed = self.compress(denoised, is_real_inferred)
-        noisy_compressed_sim = calculate_mean_similarity(compressed, doc_ids)
+        # noisy_compressed_sim = calculate_mean_similarity(compressed, doc_ids)
         
         # Calculate mean cosine similarity between different batch elements
 
@@ -452,9 +452,15 @@ class ZonkeyLayer(nn.Module):
             original_position=original_position
         )
         
+        # Spherical uniformity loss for both clean and noisy compressed
+        # Exclude same-doc pairs and same-position pairs
+        positions = original_position[:, 0, 1]  # position within doc for each sequence
+        clean_uniformity = calculate_spherical_uniformity_loss(clean_compressed, doc_ids, positions)
+        noisy_uniformity = calculate_spherical_uniformity_loss(compressed, doc_ids, positions)
+        
         # Combine and rename losses
         losses = {
-            "collapse_loss": (clean_compressed_sim+noisy_compressed_sim).abs(),
+            "coverage_loss": (clean_uniformity + noisy_uniformity) * Config.COVERAGE_WEIGHT[self.level],
             "clean_bos_loss": clean_losses["bos_loss"],
             "clean_mlm_loss": mlm_loss * Config.MLM_WEIGHT[self.level],
             "clean_reconstruction_loss": clean_losses["reconstruction_loss"],
@@ -467,7 +473,11 @@ class ZonkeyLayer(nn.Module):
         return denoised2[:input_sequence.shape[0]], clean_compressed, losses, is_real_inferred
     
     def bos_probs_to_inferred_real_position(self, bos_probs: torch.Tensor) -> torch.Tensor:
-        cum_not_bos = torch.exp(torch.cumsum(torch.log1p(-bos_probs), dim=1))
+        # Clamp bos_probs to minimum to prevent float32 precision loss in cumsum
+        # When bos_prob is tiny (e.g. 1e-8), log1p(-bos_prob) ≈ -1e-8 which is smaller
+        # than float32 precision can represent when added to cumsum values like -3.5
+        bos_probs_clamped = torch.clamp(bos_probs, min=Config.EPS)
+        cum_not_bos = torch.exp(torch.cumsum(torch.log1p(-bos_probs_clamped), dim=1))
         is_real_inferred = cum_not_bos / cum_not_bos[:, 0].unsqueeze(1)
         return torch.clamp(is_real_inferred, min=Config.EPS, max=1-Config.EPS)
     
@@ -593,7 +603,8 @@ class ZonkeyLayer(nn.Module):
             compressed_flat = F.normalize(compressed_flat, p=2, dim=-1) * self.upwards_norm
             compressed = compressed_flat.view(batch_size, Config.COMPRESSION_VECTORS[self.level], d_model)
             initial_noise_level = torch.full((batch_size,), noise_level_scalar, device=device, dtype=compressed.dtype)
-            fixed_vectors, is_real_inferred = self.compressed_to_denoised(compressed, initial_noise_level)
+            noisy_compressed = self.add_noise(compressed, initial_noise_level)
+            fixed_vectors, is_real_inferred = self.compressed_to_denoised(noisy_compressed, initial_noise_level)
 
         
         if fixed_compressed_vectors is not None:
@@ -609,7 +620,8 @@ class ZonkeyLayer(nn.Module):
             compressed_flat = F.normalize(compressed_flat, p=2, dim=-1) * self.upwards_norm
             compressed = compressed_flat.view(batch_size, Config.COMPRESSION_VECTORS[self.level], d_model)
             initial_noise_level = torch.full((batch_size,), noise_level_scalar, device=device, dtype=compressed.dtype)
-            fixed_vectors, is_real_inferred = self.compressed_to_denoised(compressed, initial_noise_level)
+            noisy_compressed = self.add_noise(compressed, initial_noise_level)
+            fixed_vectors, is_real_inferred = self.compressed_to_denoised(noisy_compressed, initial_noise_level)
         
         t_schedule = torch.linspace(1.0, 0.0, num_diffusion_steps+1, device=device) * noise_level_scalar
         
@@ -618,7 +630,8 @@ class ZonkeyLayer(nn.Module):
         is_real_inferred = None
         for step in range(num_diffusion_steps):
             current_noise_level = noise_levels[step].expand(batch_size)
-            denoised, is_real_inferred = self.compressed_to_denoised(compressed, current_noise_level)
+            noisy_compressed = self.add_noise(compressed, current_noise_level)
+            denoised, is_real_inferred = self.compressed_to_denoised(noisy_compressed, current_noise_level)
             compressed = self.compress(denoised, is_real_inferred)
 
         bos_probability_final = self.compute_bos_probability(denoised)

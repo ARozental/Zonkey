@@ -27,6 +27,7 @@ class Config:
     DROPOUT = 0.0
     MAX_SEQ_LENGTHS = [16,32]
     COMPRESSION_PENALTY = [3,3] #trades off compression and quality
+    COVERAGE_WEIGHT = [0.1,0.2]
     LEVEL_LOSS_WEIGHT = [1,1]
     WORKING_LEVEL_LOSS_WEIGHT = 1.0
     EPS = 1e-7

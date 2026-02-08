@@ -207,6 +207,64 @@ def make_trainer_config(time_now):
         trainer_config["callbacks"] = [checkpoint_callback]
     return trainer_config
 
+def calculate_spherical_uniformity_loss(
+    compressed: torch.Tensor,
+    doc_ids: torch.Tensor = None,
+    positions: torch.Tensor = None
+) -> torch.Tensor:
+    """
+    Calculate loss that encourages uniform distribution on the sphere.
+    Uses Gram matrix to penalize pairwise similarity.
+    
+    Args:
+        compressed: Tensor of shape (batch_size, ...) - already normalized to fixed L2 norm
+        doc_ids: Optional (batch_size,) - exclude same-doc pairs from loss
+        positions: Optional (batch_size,) - exclude same-position pairs from loss
+        
+    Returns:
+        Loss encouraging uniform spherical distribution
+    """
+    batch_size = compressed.shape[0]
+    if batch_size <= 1:
+        return torch.tensor(0.0, device=compressed.device, requires_grad=True)
+    
+    # Flatten each batch element into a single vector
+    compressed_flat = compressed.view(batch_size, -1)
+    
+    # Normalize to unit vectors
+    compressed_norm = F.normalize(compressed_flat, p=2, dim=-1)
+    
+    # 1. Mean should be zero (no angular bias)
+    mean_vec = compressed_norm.mean(dim=0)
+    mean_loss = (mean_vec ** 2).mean()
+    
+    # 2. Gram matrix: (batch, batch) - penalize pairwise similarity
+    gram = compressed_norm @ compressed_norm.T
+    
+    # Create mask for valid pairs (True = include in loss)
+    # Start with all off-diagonal pairs
+    valid_mask = ~torch.eye(batch_size, dtype=torch.bool, device=compressed.device)
+    
+    # Exclude same-doc pairs
+    if doc_ids is not None:
+        same_doc = doc_ids.unsqueeze(0) == doc_ids.unsqueeze(1)
+        valid_mask = valid_mask & ~same_doc
+    
+    # Exclude same-position pairs (e.g., first word across docs)
+    if positions is not None:
+        same_pos = positions.unsqueeze(0) == positions.unsqueeze(1)
+        valid_mask = valid_mask & ~same_pos
+    
+    num_valid = valid_mask.sum()
+    if num_valid == 0:
+        return mean_loss
+    
+    # Only penalize valid pairs
+    off_diag_loss = (gram[valid_mask].pow(2)).mean()
+    
+    return mean_loss + off_diag_loss
+
+
 def calculate_mean_similarity(compressed: torch.Tensor, doc_ids: torch.Tensor) -> torch.Tensor:
     """
     Calculate mean cosine similarity between vectors from different documents.
