@@ -6,7 +6,7 @@ from typing import Tuple, Optional
 import math
 import torch.nn.functional as F
 from losses.reconstruction import calculate_reconstruction_loss,calculate_token_loss
-from utils.helper_functions import calculate_mean_similarity,expected_l2_norm,calculate_spherical_uniformity_loss
+from utils.helper_functions import calculate_mean_similarity,expected_l2_norm,calculate_spherical_uniformity_loss,compute_drifting_loss
 from splitter.segment_splitter import SegmentSplitter
 from splitter.stitcher import Stitcher
 from torch.distributions import Beta
@@ -113,6 +113,14 @@ class ZonkeyLayer(nn.Module):
             num_layers = Config.NUM_DECOMPRESSOR_LAYERS[level]
             )
         
+        # Drifting loss queue: FIFO of detached clean_compressed vectors from recent batches
+        # persistent=False -> excluded from state_dict, no checkpoint mismatch
+        queue_size = Config.DRIFTING_QUEUE_SIZE[level]
+        flat_dim = Config.COMPRESSION_VECTORS[level] * d_model
+        self.register_buffer('_drifting_queue', torch.zeros(queue_size, flat_dim), persistent=False)
+        self._drifting_queue_ptr = 0
+        self._drifting_queue_count = 0
+
         if Config.USE_GRADIENT_CHECKPOINTING:
             self.denoise_and_reconstruct = lambda *args, **kwargs: torch.utils.checkpoint.checkpoint(
                 self._denoise_and_reconstruct, *args, **kwargs, use_reentrant=False
@@ -412,7 +420,7 @@ class ZonkeyLayer(nn.Module):
         
         clean_compressed = self.compress(input_sequence, is_real_inferred)
         doc_ids = original_position[:,0,0]
-        # clean_compressed_sim = calculate_mean_similarity(clean_compressed, doc_ids)
+        clean_compressed_sim = calculate_mean_similarity(clean_compressed, doc_ids)
         
         # Per-sample noise level for the batch
         t0 = self.noise_last_step_size * (self.beta_dist.sample((clean_compressed.shape[0],)) / self.beta_dist_mean)
@@ -430,7 +438,7 @@ class ZonkeyLayer(nn.Module):
         
         # Compress with the soft mask from predicted EoS probabilities
         compressed = self.compress(denoised, is_real_inferred)
-        # noisy_compressed_sim = calculate_mean_similarity(compressed, doc_ids)
+        noisy_compressed_sim = calculate_mean_similarity(compressed, doc_ids)
         
         # Calculate mean cosine similarity between different batch elements
 
@@ -442,10 +450,15 @@ class ZonkeyLayer(nn.Module):
             original_position=original_position
         )
 
+        # Recompress the noisy denoised output — this chains through the
+        # compress error so the dirty pass trains on realistic intermediate
+        # compressed vectors (matching what generation actually produces).
+        recompressed = self.compress(denoised, is_real_inferred)
+
         t2 = t1 * (torch.rand_like(t1)*self.noise_step_size+(1-self.noise_step_size))
         
         denoised2, dirty_losses, is_real_inferred = self.denoise_and_reconstruct(
-            compressed, input_sequence, all_sentence_bos_probs, t2, splitter_existence_share,
+            recompressed, input_sequence, all_sentence_bos_probs, t2, splitter_existence_share,
             token_ids=token_ids,
             num_sentences_per_doc=num_sentences_per_doc,
             previous_denoised=denoised,
@@ -454,13 +467,53 @@ class ZonkeyLayer(nn.Module):
         
         # Spherical uniformity loss for both clean and noisy compressed
         # Exclude same-doc pairs and same-position pairs
-        positions = original_position[:, 0, 1]  # position within doc for each sequence
-        clean_uniformity = calculate_spherical_uniformity_loss(clean_compressed, doc_ids, positions)
-        noisy_uniformity = calculate_spherical_uniformity_loss(compressed, doc_ids, positions)
+        # to be used if we want to ensure that meaningful texts are spread all across the space, conflicts with drifting loss objective
+        # positions = original_position[:, 0, 1]  # position within doc for each sequence
+        # clean_uniformity = calculate_spherical_uniformity_loss(clean_compressed, doc_ids, positions)
+        # noisy_uniformity = calculate_spherical_uniformity_loss(compressed, doc_ids, positions)
+        
+        # Drifting loss: pull compressed toward clean_compressed distribution
+        # Push current clean_compressed into FIFO queue for richer real targets across batches
+        with torch.no_grad():
+            batch_flat = clean_compressed.detach().view(clean_compressed.shape[0], -1)
+            batch_size_q = batch_flat.shape[0]
+            queue_size = self._drifting_queue.shape[0]
+            # Write into queue (wrap around)
+            space = queue_size - self._drifting_queue_ptr
+            if batch_size_q <= space:
+                self._drifting_queue[self._drifting_queue_ptr:self._drifting_queue_ptr + batch_size_q] = batch_flat
+            else:
+                self._drifting_queue[self._drifting_queue_ptr:] = batch_flat[:space]
+                self._drifting_queue[:batch_size_q - space] = batch_flat[space:]
+            self._drifting_queue_ptr = (self._drifting_queue_ptr + batch_size_q) % queue_size
+            self._drifting_queue_count = min(self._drifting_queue_count + batch_size_q, queue_size)
+            # Use queue contents as the real target distribution
+            real_targets = self._drifting_queue[:self._drifting_queue_count]
+
+        # Optionally include random-origin vectors to teach the model to handle OOD inputs
+        num_random = Config.DRIFTING_NUM_RANDOM[self.level]
+        if num_random > 0:
+            d_model = Config.D_MODEL[self.level]
+            compression_vectors = Config.COMPRESSION_VECTORS[self.level]
+            # Pure random noise on the sphere, conditioned as noise_level=1.0 (matches generation start)
+            rand_noise = torch.randn(num_random, compression_vectors, d_model, device=input_sequence.device)
+            rand_flat = rand_noise.view(num_random, -1)
+            rand_flat = F.normalize(rand_flat, p=2, dim=-1) * self.upwards_norm
+            rand_noise = rand_flat.view(num_random, compression_vectors, d_model)
+            rand_noise_levels = torch.ones(num_random, device=input_sequence.device)
+            rand_denoised, rand_is_real = self.compressed_to_denoised(rand_noise, rand_noise_levels)
+            rand_recompressed = self.compress(rand_denoised, rand_is_real)
+            # Concatenate noisy-path compressed + random-origin compressed as "generated"
+            all_generated = torch.cat([compressed, rand_recompressed], dim=0)
+        else:
+            all_generated = compressed
+        drifting_loss = compute_drifting_loss(all_generated, real_targets, temperature=Config.DRIFTING_TEMPERATURE)
         
         # Combine and rename losses
         losses = {
-            "coverage_loss": (clean_uniformity + noisy_uniformity) * Config.COVERAGE_WEIGHT[self.level],
+            # "coverage_loss": (clean_uniformity + noisy_uniformity) * Config.COVERAGE_WEIGHT[self.level],
+            "collapse_loss": (clean_compressed_sim+noisy_compressed_sim).abs()*Config.COMPRESSED_SIM_WEIGHT[self.level],
+            "drifting_loss": drifting_loss * Config.DRIFTING_WEIGHT[self.level],
             "clean_bos_loss": clean_losses["bos_loss"],
             "clean_mlm_loss": mlm_loss * Config.MLM_WEIGHT[self.level],
             "clean_reconstruction_loss": clean_losses["reconstruction_loss"],
@@ -633,6 +686,13 @@ class ZonkeyLayer(nn.Module):
             noisy_compressed = self.add_noise(compressed, current_noise_level)
             denoised, is_real_inferred = self.compressed_to_denoised(noisy_compressed, current_noise_level)
             compressed = self.compress(denoised, is_real_inferred)
+
+        # Final clean decode: the model is trained with a clean pass at noise_level≈0
+        # which produces the sharpest token vectors. Without this, the last step
+        # decodes at noise_level=1/num_steps which is noisier than the clean regime.
+        if num_diffusion_steps > 0:
+            final_noise = torch.zeros(batch_size, device=device)
+            denoised, is_real_inferred = self.compressed_to_denoised(compressed, final_noise)
 
         bos_probability_final = self.compute_bos_probability(denoised)
         is_real_inferred_final = self.bos_probs_to_inferred_real_position(bos_probability_final)

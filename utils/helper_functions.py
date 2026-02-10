@@ -4,7 +4,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from torch.utils.tensorboard import SummaryWriter
 import torch
 import torch.nn.functional as F
-from typing import Dict
+from typing import Dict, Optional
 import math
 
 def expected_l2_norm(d):
@@ -263,6 +263,105 @@ def calculate_spherical_uniformity_loss(
     off_diag_loss = (gram[valid_mask].pow(2)).mean()
     
     return mean_loss + off_diag_loss
+
+
+def compute_drifting_loss(
+    generated: torch.Tensor,
+    real: torch.Tensor,
+    temperature = 0.1,
+    num_real: Optional[int] = None
+) -> torch.Tensor:
+    """
+    Compute drifting loss that pulls generated vectors toward real distribution
+    while repelling from other generated vectors.
+    
+    Matches the paper "Generative Modeling via Drifting" (Deng et al. 2026) Algorithm 2:
+    - Multi-scale kernel: sum doubly-stochastic attention across temperatures (Section 3.3)
+    - Double softmax: geometric mean of row and column normalization
+    - Weight cross-multiplication for balanced attraction/repulsion
+    - Cosine similarity / temperature as kernel logits
+    - Unit-sphere inputs make ||V|| dimension-invariant (no drift normalization needed)
+    
+    Args:
+        generated: Tensor of shape (N, ...) - compressed vectors (noisy and/or random path)
+        real: Tensor of shape (N_real, ...) - clean compressed vectors (target distribution)
+        temperature: Single float or list of floats for multi-scale kernel
+        num_real: If provided, subsample this many real vectors. If None, use all.
+        
+    Returns:
+        MSE loss toward drifted target (decreases as generated matches real)
+    """
+    device = generated.device
+    N = generated.shape[0]
+    N_real = real.shape[0]
+    
+    if N <= 1 or N_real == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+    
+    # Flatten to (N, D) - detach real to make it a frozen target
+    gen_flat = generated.view(N, -1)
+    real_flat = real.detach().view(N_real, -1)
+
+    if num_real is not None and num_real > 0 and num_real < N_real:
+        sampled = torch.randperm(N_real, device=device)[:num_real]
+        real_flat = real_flat.index_select(0, sampled)
+        N_real = real_flat.shape[0]
+    
+    # Normalize to unit sphere for cosine similarity kernel
+    gen_norm = F.normalize(gen_flat, p=2, dim=-1)
+    real_norm = F.normalize(real_flat, p=2, dim=-1)
+
+    # Support single or multi-scale temperature
+    temperatures = temperature if isinstance(temperature, (list, tuple)) else [temperature]
+
+    # Compute drifting field V under full stop-gradient (paper Section 3.2)
+    with torch.no_grad():
+        gen_ng = gen_norm.detach()
+
+        # Cosine similarities (computed once, reused across temperatures)
+        sim_to_real = gen_ng @ real_norm.T  # (N, N_real)
+        sim_to_gen = gen_ng @ gen_ng.T      # (N, N)
+
+        # Mask self-similarity (paper: dist_neg += eye * 1e6)
+        diag = torch.eye(N, dtype=torch.bool, device=device)
+        sim_to_gen_masked = sim_to_gen.masked_fill(diag, float('-inf'))
+
+        # Multi-scale kernel: average doubly-stochastic attention across temperatures
+        A = torch.zeros(N, N_real + N, device=device)
+        for T in temperatures:
+            logit_real = sim_to_real / T
+            logit_gen = sim_to_gen_masked / T
+            logits = torch.cat([logit_real, logit_gen], dim=1)  # (N, N_real + N)
+
+            # Double softmax (paper Algorithm 2): geometric mean of row and column normalization
+            A_row = F.softmax(logits, dim=-1)   # normalize over candidates
+            A_col = F.softmax(logits, dim=-2)   # normalize over queries
+            A = A + torch.sqrt(A_row * A_col)
+        A = A / len(temperatures)
+
+        # Split back to positive (real) and negative (generated) attention
+        A_pos = A[:, :N_real]   # (N, N_real)
+        A_neg = A[:, N_real:]   # (N, N)
+
+        # Weight cross-multiplication (paper Algorithm 2 / Eq. 11)
+        W_pos = A_pos * A_neg.sum(dim=1, keepdim=True)  # (N, N_real)
+        W_neg = A_neg * A_pos.sum(dim=1, keepdim=True)  # (N, N)
+
+        # Compute drift: V = weighted_sum(y_pos) - weighted_sum(y_neg)
+        drift_pos = W_pos @ real_norm  # (N, D)
+        drift_neg = W_neg @ gen_ng     # (N, D)
+        V = drift_pos - drift_neg
+
+        # Drifted target (fully stop-grad including the x term)
+        # No drift normalization: since inputs are unit-normalized, ||V|| is
+        # dimension-invariant and naturally decreases as generated matches real
+        target = gen_ng + V
+
+    # Per-sample squared L2 toward drifted target ≈ ||V||², decreases with training
+    diff = gen_norm - target
+    loss = (diff ** 2).sum(dim=-1).mean()
+
+    return loss
 
 
 def calculate_mean_similarity(compressed: torch.Tensor, doc_ids: torch.Tensor) -> torch.Tensor:

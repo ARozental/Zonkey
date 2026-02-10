@@ -32,7 +32,7 @@ class Config:
     WORKING_LEVEL_LOSS_WEIGHT = 1.0
     EPS = 1e-7
     EOS_TARGET_BIAS = [-2.0,-2.0,-2.0] #this is a hyperparameter, for slightly better initialization
-    USE_MUON = True  # Use Muon optimizer for hidden layers, otherwise use AdamW for all parameters
+    USE_MUON = False  # Use Muon optimizer for hidden layers, otherwise use AdamW for all parameters
     MUON_MOMENTUM = 0.95  # Momentum for Muon optimizer
     USE_OPTIMIZER_CHECKPOINT = True #use checkpoint when available to restore optimizer state
 
@@ -51,10 +51,14 @@ class Config:
     
 
     #losses
-    COMPRESSED_SIM_WEIGHT = [5,5] #anti mode collapse loss weight
-    NOISE_STEP_SIZE = [0.02,0.02]
-    NOISE_LAST_STEP_SIZE = [0.02,0.02]
+    COMPRESSED_SIM_WEIGHT = [1,1] #anti mode collapse loss weight
+    DRIFTING_WEIGHT = [1.0,1.0]
+    DRIFTING_TEMPERATURE = [0.05, 0.1, 0.5]
+    DRIFTING_NUM_RANDOM = [128,32]
+    DRIFTING_QUEUE_SIZE = [8192, 2048]
+    NOISE_STEP_SIZE = [0.05,0.05]
+    NOISE_LAST_STEP_SIZE = [0.05,0.05]
     DIRTY_RECONSTRUCTION_WEIGHT = [1.0,1.0]
-    MLM_WEIGHT = [0.0,1.0] #0.0 for token level always 
+    MLM_WEIGHT = [0.0,2.0] #0.0 for token level always 
     EXISTS_WEIGHT = [0.05,0.05] 
     

@@ -33,6 +33,13 @@ def run_training(args):
     else:
         model = PlZonkey(writer=tb_writer)
 
+    # Optional: run memory calibration before training
+    if getattr(args, 'calibrate', False):
+        fits = model.calibrate_memory()
+        if not fits:
+            print("Aborting: worst-case batch does not fit in GPU memory.")
+            return
+
     # Data & Trainer
     dataloader = create_dataloader(batch_size=Config.BATCH_SIZE, num_workers=Config.NUM_WORKERS)
     trainer = pl.Trainer(**make_trainer_config(time_now))
