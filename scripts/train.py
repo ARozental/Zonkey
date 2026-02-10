@@ -52,6 +52,8 @@ def parse_args():
                         help='Parameter file in param_versions directory')
     parser.add_argument('--resume', type=str, default=None,
                         help='Resume from checkpoint file')
+    parser.add_argument('--calibrate', action='store_true',
+                        help='Run memory calibration (worst-case batch) before training')
     return parser.parse_args()
 
 if __name__ == "__main__":

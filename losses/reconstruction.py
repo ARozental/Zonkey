@@ -50,6 +50,10 @@ def calculate_reconstruction_loss(
     
     N = batch * seq_len
     
+    # Need at least 2 positions for contrastive loss
+    if N <= 1:
+        return torch.tensor(0.0, device=device, requires_grad=True), None
+    
     if previous_denoised is not None:
         # Use sequence-level optimal t with importance weighting
         pos_sim, _, optimal_t = segment_cosine_similarity_seq(
@@ -73,6 +77,14 @@ def calculate_reconstruction_loss(
             replacement=True
         )
         
+        # Fix collisions where negative == self (loop until none remain)
+        self_indices = torch.arange(N, device=device).unsqueeze(1)
+        collision_mask = (sampled_indices == self_indices)
+        while collision_mask.any():
+            num_collisions = collision_mask.sum().item()
+            sampled_indices[collision_mask] = torch.multinomial(sample_probs, num_collisions, replacement=True)
+            collision_mask = (sampled_indices == self_indices)
+        
         neg_previous = previous_flat[sampled_indices]
         neg_target = target_flat[sampled_indices]
         
@@ -95,7 +107,7 @@ def calculate_reconstruction_loss(
         # Positive: element-wise
         pos_sim = torch.sum(denoised_norm * target_norm, dim=-1)  # <N>
         
-        # Sample negatives
+        # Sample negatives (excluding self)
         sample_probs = is_real_flat.float()
         sample_probs = sample_probs / (sample_probs.sum() + Config.EPS)
         
@@ -104,6 +116,14 @@ def calculate_reconstruction_loss(
             num_negatives,
             replacement=True
         )  # <N, num_negatives>
+        
+        # Fix collisions where negative == self (loop until none remain)
+        self_indices = torch.arange(N, device=device).unsqueeze(1)
+        collision_mask = (sampled_indices == self_indices)
+        while collision_mask.any():
+            num_collisions = collision_mask.sum().item()
+            sampled_indices[collision_mask] = torch.multinomial(sample_probs, num_collisions, replacement=True)
+            collision_mask = (sampled_indices == self_indices)
         
         neg_target_norm = target_norm[sampled_indices]
         

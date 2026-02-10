@@ -10,6 +10,8 @@ from torch.utils.checkpoint import checkpoint
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from configs.default_config import Config
 from models.zonkey_layer import ZonkeyLayer
+from muon import SingleDeviceMuonWithAuxAdam, MuonWithAuxAdam
+import torch.distributed as dist
 
 class PlZonkey(pl.LightningModule):
     def __init__(self, writer=None):
@@ -19,11 +21,131 @@ class PlZonkey(pl.LightningModule):
         self.model.compile()
         self.tb_writer = writer
 
+    def calibrate_memory(self):
+        """Run a worst-case forward+backward pass to measure peak GPU memory.
+        
+        Forces all SegmentSplitters to produce the maximum number of segments,
+        creates a synthetic batch, and measures the actual peak memory usage.
+        Returns True if the worst-case batch fits in GPU memory.
+        """
+        if not torch.cuda.is_available():
+            print("Memory calibration requires CUDA.")
+            return True
+
+        device = Config.DEVICE
+        self.to(device)
+        print("\n--- Memory Calibration (worst-case batch) ---")
+        for i, layer in enumerate(self.model.layers):
+            print(f"  Level {i}: max_sequences={layer.segment_splitter.max_num_sentences}, "
+                  f"seq_len={Config.MAX_SEQ_LENGTHS[i]}, d_model={Config.D_MODEL[i]}")
+
+        # Force all splitters to produce maximum segments
+        for layer in self.model.layers:
+            layer.segment_splitter.force_max_segments = True
+
+        # Create synthetic batch (random token IDs, full length, all positions real)
+        fake_texts = torch.randint(
+            1, Config.TOKENIZER_VOCAB_SIZE_CHARS,
+            (Config.BATCH_SIZE, Config.MAX_DOC_LENGTHS[0]), device=device)
+        batch = {"full_texts": fake_texts}
+
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+
+        oom = False
+        try:
+            # Full forward pass
+            leveled_compressed, leveled_losses = self.model.forward(batch)
+
+            # Replicate the same loss aggregation as training_step
+            total_loss = torch.zeros(1, device=device)
+            for l in range(len(leveled_losses) - 1):
+                leveled_losses[l]["clean_mlm_loss"] = leveled_losses[l + 1]["clean_mlm_loss"]
+            del leveled_losses[len(leveled_losses) - 1]["clean_mlm_loss"]
+
+            for l in range(len(leveled_losses)):
+                vals = []
+                for name, value in leveled_losses[l].items():
+                    if isinstance(value, torch.Tensor):
+                        vals.append(value)
+                    elif hasattr(value, 'tensor'):
+                        vals.append(value.tensor)
+                if vals:
+                    total_loss = total_loss + torch.stack(vals).mean()
+
+            # Full backward pass (this is where peak memory usually occurs)
+            total_loss.backward()
+            torch.cuda.synchronize()
+
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                oom = True
+            else:
+                raise
+        finally:
+            # Restore normal splitter behaviour
+            for layer in self.model.layers:
+                layer.segment_splitter.force_max_segments = False
+            # Cleanup
+            self.zero_grad(set_to_none=True)
+            del batch, fake_texts
+            torch.cuda.empty_cache()
+
+        total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        if oom:
+            print(f"\n  RESULT: OOM! Worst-case batch exceeds GPU memory ({total_gb:.1f} GB).")
+            print(f"  -> Reduce MAX_SEQUENCES_PER_BATCH or other size parameters.\n")
+            return False
+        else:
+            peak_gb = torch.cuda.max_memory_allocated() / 1024**3
+            pct = 100 * peak_gb / total_gb
+            print(f"\n  Peak memory:  {peak_gb:.2f} GB / {total_gb:.2f} GB ({pct:.1f}%)")
+            print(f"  Headroom:     {total_gb - peak_gb:.2f} GB")
+            if pct > 95:
+                print(f"  WARNING: >95% usage. Will likely cause slowdowns or OOM on some batches.")
+            elif pct > 85:
+                print(f"  CAUTION: >85% usage. May slow down under memory pressure.")
+            else:
+                print(f"  Looks safe for training.")
+            print()
+            return True
+
     def on_train_start(self):
         for opt in self.trainer.optimizers:
             for group in opt.param_groups:
                 group["lr"] = Config.LEARNING_RATE
 
+    def on_load_checkpoint(self, checkpoint):
+        """
+        Override checkpoint loading to handle optimizer switching.
+        When switching between Muon and AdamW, skip loading the old optimizer state.
+        """
+        # Check if optimizer type has changed
+        checkpoint_had_muon = False
+        if 'optimizer_states' in checkpoint and len(checkpoint['optimizer_states']) > 0:
+            # Try to detect if the checkpoint used Muon by checking for 'use_muon' in param_groups
+            try:
+                first_opt_state = checkpoint['optimizer_states'][0]
+                if 'param_groups' in first_opt_state:
+                    for group in first_opt_state['param_groups']:
+                        if 'use_muon' in group:
+                            checkpoint_had_muon = True
+                            break
+            except (KeyError, IndexError, TypeError):
+                pass
+        
+        current_uses_muon = Config.USE_MUON
+        
+        # If optimizer type changed, remove optimizer states from checkpoint
+        if checkpoint_had_muon != current_uses_muon:
+            print(f"\n⚠️  Optimizer type changed: checkpoint used {'Muon' if checkpoint_had_muon else 'AdamW'}, "
+                  f"current config uses {'Muon' if current_uses_muon else 'AdamW'}")
+            print("   Skipping old optimizer state - will initialize fresh optimizer\n")
+            if 'optimizer_states' in checkpoint:
+                del checkpoint['optimizer_states']
+            if 'lr_schedulers' in checkpoint:
+                del checkpoint['lr_schedulers']
     
     def forward(self, x):
         return self.model(x)
@@ -187,8 +309,40 @@ class PlZonkey(pl.LightningModule):
         return None
 
     def configure_optimizers(self):
-        params = [p for p in self.model.parameters() if p.requires_grad]
-        optimizer = torch.optim.AdamW(params, lr=Config.LEARNING_RATE, eps=Config.EPS)
+        if Config.USE_MUON:
+            # Separate parameters for Muon (2D hidden layers) vs Adam (embeddings, biases, scalars)
+            hidden_matrix_params = []
+            other_params = []
+            
+            for name, p in self.model.named_parameters():
+                if p.requires_grad:
+                    # Use Muon for 2D+ parameters in hidden layers (not embeddings)
+                    if p.ndim >= 2 and "embedding" not in name.lower():
+                        hidden_matrix_params.append(p)
+                    else:
+                        other_params.append(p)
+            
+            # Create parameter groups for MuonWithAuxAdam
+            param_groups = []
+            if hidden_matrix_params:
+                param_groups.append(dict(params=hidden_matrix_params, lr=Config.LEARNING_RATE, 
+                                        momentum=Config.MUON_MOMENTUM, use_muon=True))
+            if other_params:
+                param_groups.append(dict(params=other_params, lr=Config.LEARNING_RATE, 
+                                        eps=Config.EPS, use_muon=False))
+            
+            # Detect if we're in distributed training mode
+            is_distributed = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+            
+            if is_distributed:
+                optimizer = MuonWithAuxAdam(param_groups)
+            else:
+                optimizer = SingleDeviceMuonWithAuxAdam(param_groups)
+        else:
+            # Use standard AdamW for all parameters
+            params = [p for p in self.model.parameters() if p.requires_grad]
+            optimizer = torch.optim.AdamW(params, lr=Config.LEARNING_RATE, eps=Config.EPS)
+
         return {"optimizer": optimizer}
 
 class Zonkey(nn.Module):

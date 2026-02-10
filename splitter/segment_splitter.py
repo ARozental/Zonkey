@@ -93,6 +93,7 @@ class SegmentSplitter(nn.Module):
         self.max_sentence_length = Config.MAX_SEQ_LENGTHS[level]
         self.min_sentence_length = Config.COMPRESSION_VECTORS[level]
         self.max_num_sentences = max_num_sentences #per batch
+        self.force_max_segments = False
 
         self.bos_classifier = LinearEncoder(self.d_model, level)
 
@@ -288,6 +289,8 @@ class SegmentSplitter(nn.Module):
         batch_size, full_seq_len, _ = input_sequence.shape
         
         bos_probs = self.bos_classifier(input_sequence)   # [batch, full_seq_len]
+        if self.force_max_segments:
+            bos_probs = torch.ones_like(bos_probs)
         bos_probs[:, 0] = 1
         bos_probs = torch.clip(bos_probs, Config.EPS, 1 - Config.EPS)
         bos_probs = bos_probs * is_real_position
