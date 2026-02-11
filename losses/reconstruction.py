@@ -39,7 +39,8 @@ def calculate_reconstruction_loss(
     splitter_existence_share,
     previous_denoised=None,
     sequence_weight=1,
-    num_negatives=63
+    num_negatives=63,
+    fake_negatives=None
     ):
     batch, seq_len, hidden = denoised.shape
     device = denoised.device
@@ -88,16 +89,25 @@ def calculate_reconstruction_loss(
         neg_previous = previous_flat[sampled_indices]
         neg_target = target_flat[sampled_indices]
         
-        denoised_exp = denoised_flat.unsqueeze(1).expand(-1, num_negatives, -1).reshape(N * num_negatives, hidden)
-        neg_previous_flat = neg_previous.reshape(N * num_negatives, hidden)
-        neg_target_flat = neg_target.reshape(N * num_negatives, hidden)
+        # Append fake negatives: use fake vector as both segment endpoints
+        total_neg = num_negatives
+        if fake_negatives is not None and fake_negatives.shape[0] > 0:
+            K = fake_negatives.shape[0]
+            fake_exp = fake_negatives.unsqueeze(0).expand(N, K, hidden)
+            neg_previous = torch.cat([neg_previous, fake_exp], dim=1)
+            neg_target = torch.cat([neg_target, fake_exp], dim=1)
+            total_neg += K
+        
+        denoised_exp = denoised_flat.unsqueeze(1).expand(-1, total_neg, -1).reshape(N * total_neg, hidden)
+        neg_previous_flat = neg_previous.reshape(N * total_neg, hidden)
+        neg_target_flat = neg_target.reshape(N * total_neg, hidden)
         
         neg_sim_flat, _ = segment_cosine_similarity(
-            neg_previous_flat.unsqueeze(0),  # <1, N*num_negatives, hidden>
-            denoised_exp.unsqueeze(0),       # <1, N*num_negatives, hidden>
-            neg_target_flat.unsqueeze(0)     # <1, N*num_negatives, hidden>
+            neg_previous_flat.unsqueeze(0),  # <1, N*total_neg, hidden>
+            denoised_exp.unsqueeze(0),       # <1, N*total_neg, hidden>
+            neg_target_flat.unsqueeze(0)     # <1, N*total_neg, hidden>
         )
-        neg_sim = neg_sim_flat.squeeze(0).reshape(N, num_negatives)  # <N, num_negatives>
+        neg_sim = neg_sim_flat.squeeze(0).reshape(N, total_neg)  # <N, total_neg>
         
     else:
         # Regular cosine similarity (no segments)
@@ -127,14 +137,20 @@ def calculate_reconstruction_loss(
         
         neg_target_norm = target_norm[sampled_indices]
         
+        # Append fake negatives
+        if fake_negatives is not None and fake_negatives.shape[0] > 0:
+            fake_neg_norm = F.normalize(fake_negatives, p=2, dim=-1)
+            fake_exp = fake_neg_norm.unsqueeze(0).expand(N, -1, -1)
+            neg_target_norm = torch.cat([neg_target_norm, fake_exp], dim=1)
+        
         # Compute negative similarities
         neg_sim = torch.sum(
             denoised_norm.unsqueeze(1) * neg_target_norm,
             dim=-1
-        )  # <N, num_negatives>
+        )  # <N, num_negatives + K>
     
     all_sim = torch.cat([pos_sim.unsqueeze(1), neg_sim], dim=1)
-    
+
     logits = 2 * torch.atanh(torch.clamp(all_sim, min=Config.EPS-1, max=1-Config.EPS))
     
     labels = torch.zeros(N, dtype=torch.long, device=device)

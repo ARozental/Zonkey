@@ -203,19 +203,19 @@ class PlZonkey(pl.LightningModule):
                     print("original doc start: ","".join([chr(x) for x in tokens_out]))
 
                     # test to see if we make a reasonable split for the first word
-                    denoised, existence_mask, is_real_inferred_final = self.model.layers[0].generate(num_diffusion_steps=1,fixed_compressed_vectors=leveled_compressed[0][0][0:1],noise_level=torch.tensor([0.0],device=Config.DEVICE))
+                    denoised, existence_mask, is_real_inferred_final = self.model.layers[0].generate(num_diffusion_steps=0,fixed_compressed_vectors=leveled_compressed[0][0][0:1],noise_level=torch.tensor([0.0],device=Config.DEVICE))
                     tokens_normalized = F.normalize(denoised[0][0:Config.MAX_SEQ_LENGTHS[0]], dim=-1)  # (1, seq_len, d_model)
                     logits = torch.matmul(tokens_normalized, embeddings_normalized.t())
                     best_token_idx = logits.argmax(dim=-1)
                     tokens_out0 = best_token_idx.tolist()
 
-                    denoised, existence_mask, is_real_inferred_final1 = self.model.layers[0].generate(num_diffusion_steps=1,fixed_compressed_vectors=leveled_compressed[0][0][1:2],noise_level=torch.tensor([0.0],device=Config.DEVICE))
+                    denoised, existence_mask, is_real_inferred_final1 = self.model.layers[0].generate(num_diffusion_steps=0,fixed_compressed_vectors=leveled_compressed[0][0][1:2],noise_level=torch.tensor([0.0],device=Config.DEVICE))
                     tokens_normalized = F.normalize(denoised[0][0:Config.MAX_SEQ_LENGTHS[0]], dim=-1)  # (1, seq_len, d_model)
                     logits = torch.matmul(tokens_normalized, embeddings_normalized.t())
                     best_token_idx = logits.argmax(dim=-1)
                     tokens_out1 = best_token_idx.tolist()
 
-                    denoised, existence_mask, is_real_inferred_final2 = self.model.layers[0].generate(num_diffusion_steps=1,fixed_compressed_vectors=leveled_compressed[0][0][2:3],noise_level=torch.tensor([0.0],device=Config.DEVICE))
+                    denoised, existence_mask, is_real_inferred_final2 = self.model.layers[0].generate(num_diffusion_steps=0,fixed_compressed_vectors=leveled_compressed[0][0][2:3],noise_level=torch.tensor([0.0],device=Config.DEVICE))
                     tokens_normalized = F.normalize(denoised[0][0:Config.MAX_SEQ_LENGTHS[0]], dim=-1)  # (1, seq_len, d_model)
                     logits = torch.matmul(tokens_normalized, embeddings_normalized.t())
                     best_token_idx = logits.argmax(dim=-1)
@@ -423,20 +423,22 @@ class Zonkey(nn.Module):
         leveled_compressed = []
         leveled_losses = []
         
+        fake_negatives = None
         for i in range(len(self.layers)):
             if Config.USE_GRADIENT_CHECKPOINTING:
                 if i == 0:
-                    denoised, is_real_inferred, compressed, losses, reconstructed_docs, is_real = checkpoint(
-                        self.layers[i], token_embeddings, is_real_position, texts, use_reentrant=False)
+                    denoised, is_real_inferred, compressed, losses, reconstructed_docs, is_real, fake_negatives = checkpoint(
+                        self.layers[i], token_embeddings, is_real_position, texts, False, None, use_reentrant=False)
                 else:
-                    _, _, compressed, losses, _, is_real = checkpoint(
-                        self.layers[i], compressed, is_real.bool(), use_reentrant=False)
+                    _, _, compressed, losses, _, is_real, fake_negatives = checkpoint(
+                        self.layers[i], compressed, is_real.bool(), None, False, fake_negatives, use_reentrant=False)
             else:
                 if i == 0:
-                    denoised, is_real_inferred, compressed, losses, reconstructed_docs, is_real = self.layers[i](
+                    denoised, is_real_inferred, compressed, losses, reconstructed_docs, is_real, fake_negatives = self.layers[i](
                         token_embeddings, is_real_position, token_ids=texts)
                 else:
-                    _, _, compressed, losses, _, is_real = self.layers[i](compressed, is_real.bool())
+                    _, _, compressed, losses, _, is_real, fake_negatives = self.layers[i](
+                        compressed, is_real.bool(), fake_negatives=fake_negatives)
 
             leveled_compressed.append(compressed)
             leveled_losses.append(losses)

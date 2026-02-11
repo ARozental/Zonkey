@@ -215,6 +215,7 @@ class ZonkeyLayer(nn.Module):
         previous_denoised: Optional[torch.Tensor] = None,
         original_position: Optional[torch.Tensor] = None,
         clean=False,
+        fake_negatives: Optional[torch.Tensor] = None,
         ) -> Tuple[torch.Tensor, Optional[dict], torch.Tensor]:
         noisy_compressed = self.add_noise(compressed, noise_level)
         denoised, is_real_inferred = self.compressed_to_denoised(noisy_compressed, noise_level)
@@ -246,7 +247,8 @@ class ZonkeyLayer(nn.Module):
                     is_real_inferred=is_real_inferred, 
                     target_sequences=input_sequence, 
                     splitter_existence_share=splitter_existence_share, 
-                    previous_denoised=previous_denoised)
+                    previous_denoised=previous_denoised,
+                    fake_negatives=fake_negatives)
             
             # Compute BOS loss using same interpolation parameter as reconstruction loss
             if previous_denoised is not None and optimal_t is not None:
@@ -287,6 +289,7 @@ class ZonkeyLayer(nn.Module):
         original_position,
         replacement_prob=0.25,
         num_negatives=63,
+        fake_negatives=None,
         ):
         batch_size, seq_len, hidden_dim = input_sequence.shape
         doc_batch, doc_seq_len, _ = doc_sequences.shape
@@ -376,7 +379,13 @@ class ZonkeyLayer(nn.Module):
         )
         
         all_sim = torch.cat([pos_sim.unsqueeze(1), neg_sim], dim=1)
-        
+
+        # Append fake negatives (chimeric compressed vectors from lower level)
+        if fake_negatives is not None and fake_negatives.shape[0] > 0:
+            fake_neg_norm = F.normalize(fake_negatives, p=2, dim=-1)
+            fake_sim = torch.matmul(encoder_output_norm, fake_neg_norm.T)  # (N_queries, K)
+            all_sim = torch.cat([all_sim, fake_sim], dim=1)
+
         logits = 2 * torch.atanh(torch.clamp(all_sim, min=Config.EPS-1, max=1-Config.EPS))
         
         labels = torch.zeros(N_queries, dtype=torch.long, device=device)
@@ -398,6 +407,7 @@ class ZonkeyLayer(nn.Module):
                          is_real_doc_position_boolean: Optional[torch.Tensor] = None,
                          doc_sequences: Optional[torch.Tensor] = None,
                          mlm_only: Optional[bool] = False,
+                         fake_negatives: Optional[torch.Tensor] = None,
                          ) -> torch.Tensor:
         input_sequence = F.normalize(input_sequence, p=2, dim=-1) * self.dim_norm
 
@@ -410,14 +420,16 @@ class ZonkeyLayer(nn.Module):
                 is_real_doc_position_boolean,
                 original_position,
                 replacement_prob=0.2,
-                num_negatives=100
+                num_negatives=100,
+                fake_negatives=fake_negatives,
             )
         else:
             mlm_loss = torch.zeros(1, device=input_sequence.device).mean()
         
         if mlm_only:
-            return None, None, {"clean_mlm_loss": mlm_loss}, None
+            return None, None, {"clean_mlm_loss": mlm_loss}, None, None
         
+        original_is_real = is_real_inferred
         clean_compressed = self.compress(input_sequence, is_real_inferred)
         doc_ids = original_position[:,0,0]
         clean_compressed_sim = calculate_mean_similarity(clean_compressed, doc_ids)
@@ -432,7 +444,8 @@ class ZonkeyLayer(nn.Module):
             token_ids=token_ids,
             num_sentences_per_doc=num_sentences_per_doc,
             original_position=original_position,
-            clean=True
+            clean=True,
+            fake_negatives=fake_negatives,
         )
         
         
@@ -462,68 +475,51 @@ class ZonkeyLayer(nn.Module):
             token_ids=token_ids,
             num_sentences_per_doc=num_sentences_per_doc,
             previous_denoised=denoised,
-            original_position=original_position
+            original_position=original_position,
+            fake_negatives=fake_negatives,
         )
         
-        # Spherical uniformity loss for both clean and noisy compressed
-        # Exclude same-doc pairs and same-position pairs
-        # to be used if we want to ensure that meaningful texts are spread all across the space, conflicts with drifting loss objective
-        # positions = original_position[:, 0, 1]  # position within doc for each sequence
-        # clean_uniformity = calculate_spherical_uniformity_loss(clean_compressed, doc_ids, positions)
-        # noisy_uniformity = calculate_spherical_uniformity_loss(compressed, doc_ids, positions)
-        
-        # Drifting loss: pull compressed toward clean_compressed distribution
-        # Push current clean_compressed into FIFO queue for richer real targets across batches
-        with torch.no_grad():
-            batch_flat = clean_compressed.detach().view(clean_compressed.shape[0], -1)
-            batch_size_q = batch_flat.shape[0]
-            queue_size = self._drifting_queue.shape[0]
-            # Write into queue (wrap around)
-            space = queue_size - self._drifting_queue_ptr
-            if batch_size_q <= space:
-                self._drifting_queue[self._drifting_queue_ptr:self._drifting_queue_ptr + batch_size_q] = batch_flat
-            else:
-                self._drifting_queue[self._drifting_queue_ptr:] = batch_flat[:space]
-                self._drifting_queue[:batch_size_q - space] = batch_flat[space:]
-            self._drifting_queue_ptr = (self._drifting_queue_ptr + batch_size_q) % queue_size
-            self._drifting_queue_count = min(self._drifting_queue_count + batch_size_q, queue_size)
-            # Use queue contents as the real target distribution
-            real_targets = self._drifting_queue[:self._drifting_queue_count]
+        # Coverage loss: encourages uniform distribution of compressed vectors on the sphere
+        # Ensures real words spread across the entire latent space so any generated
+        # point is near a real word — no dead zones that decode to fake words.
+        positions = original_position[:, 0, 1]  # position within doc for each sequence
+        clean_uniformity = calculate_spherical_uniformity_loss(clean_compressed, doc_ids, positions)
+        noisy_uniformity = calculate_spherical_uniformity_loss(compressed, doc_ids, positions)
 
-        # Optionally include random-origin vectors to teach the model to handle OOD inputs
-        num_random = Config.DRIFTING_NUM_RANDOM[self.level]
-        if num_random > 0:
-            d_model = Config.D_MODEL[self.level]
-            compression_vectors = Config.COMPRESSION_VECTORS[self.level]
-            # Pure random noise on the sphere, conditioned as noise_level=1.0 (matches generation start)
-            rand_noise = torch.randn(num_random, compression_vectors, d_model, device=input_sequence.device)
-            rand_flat = rand_noise.view(num_random, -1)
-            rand_flat = F.normalize(rand_flat, p=2, dim=-1) * self.upwards_norm
-            rand_noise = rand_flat.view(num_random, compression_vectors, d_model)
-            rand_noise_levels = torch.ones(num_random, device=input_sequence.device)
-            rand_denoised, rand_is_real = self.compressed_to_denoised(rand_noise, rand_noise_levels)
-            rand_recompressed = self.compress(rand_denoised, rand_is_real)
-            # Concatenate noisy-path compressed + random-origin compressed as "generated"
-            all_generated = torch.cat([compressed, rand_recompressed], dim=0)
+        # Create fake negatives for the level above: shuffle input vectors across
+        # sequences at each position, then compress to get chimeric compressed vectors.
+        # E.g. at level 0 this shuffles chars to make fake words for level 1.
+        num_fake = Config.NUM_FAKE_NEGATIVES[self.level]
+        batch_size_c = input_sequence.shape[0]
+        if num_fake > 0 and batch_size_c > 1:
+            num_fake = min(num_fake, batch_size_c)
+            seq_len_c = input_sequence.shape[1]
+            device = input_sequence.device
+            pos_range = torch.arange(seq_len_c, device=device)
+            perm = torch.stack([torch.randperm(batch_size_c, device=device)[:num_fake] for _ in range(seq_len_c)], dim=1)
+            pos_expanded = pos_range.unsqueeze(0).expand(num_fake, -1)
+            chimeric_input = input_sequence[perm, pos_expanded]
+            with torch.no_grad():
+                chimeric_bos_probs = self.compute_bos_probability(chimeric_input)
+                chimeric_is_real = self.bos_probs_to_inferred_real_position(chimeric_bos_probs)
+                chimeric_compressed = self.compress(chimeric_input, chimeric_is_real)
+                fake_negatives_for_upper = chimeric_compressed.view(num_fake, -1).detach()
         else:
-            all_generated = compressed
-        drifting_loss = compute_drifting_loss(all_generated, real_targets, temperature=Config.DRIFTING_TEMPERATURE)
-        
+            fake_negatives_for_upper = None
+
         # Combine and rename losses
         losses = {
-            # "coverage_loss": (clean_uniformity + noisy_uniformity) * Config.COVERAGE_WEIGHT[self.level],
-            "collapse_loss": (clean_compressed_sim+noisy_compressed_sim).abs()*Config.COMPRESSED_SIM_WEIGHT[self.level],
-            "drifting_loss": drifting_loss * Config.DRIFTING_WEIGHT[self.level],
+            "coverage_loss": (clean_uniformity + noisy_uniformity) * Config.COVERAGE_WEIGHT[self.level],
             "clean_bos_loss": clean_losses["bos_loss"],
             "clean_mlm_loss": mlm_loss * Config.MLM_WEIGHT[self.level],
             "clean_reconstruction_loss": clean_losses["reconstruction_loss"],
             "clean_stitcher_position_loss": clean_losses["stitcher_position_loss"],
             "clean_stitcher_sequence_loss": clean_losses["stitcher_sequence_loss"],
             "dirty_bos_loss": dirty_losses["bos_loss"],
-            "dirty_reconstruction_loss": dirty_losses["reconstruction_loss"] * Config.DIRTY_RECONSTRUCTION_WEIGHT[self.level]
+            "dirty_reconstruction_loss": dirty_losses["reconstruction_loss"] * Config.DIRTY_RECONSTRUCTION_WEIGHT[self.level],
         }
 
-        return denoised2[:input_sequence.shape[0]], clean_compressed, losses, is_real_inferred
+        return denoised2[:input_sequence.shape[0]], clean_compressed, losses, is_real_inferred, fake_negatives_for_upper
     
     def bos_probs_to_inferred_real_position(self, bos_probs: torch.Tensor) -> torch.Tensor:
         # Clamp bos_probs to minimum to prevent float32 precision loss in cumsum
@@ -535,7 +531,8 @@ class ZonkeyLayer(nn.Module):
         return torch.clamp(is_real_inferred, min=Config.EPS, max=1-Config.EPS)
     
     def forward(self, input_sequence: torch.Tensor, is_real_doc_position_boolean: torch.Tensor, 
-                token_ids: Optional[torch.Tensor] = None, mlm_only: Optional[bool] = False) -> torch.Tensor:
+                token_ids: Optional[torch.Tensor] = None, mlm_only: Optional[bool] = False,
+                fake_negatives: Optional[torch.Tensor] = None) -> torch.Tensor:
         (
             all_sentence_vectors,
             all_sentence_bos_probs,
@@ -555,7 +552,7 @@ class ZonkeyLayer(nn.Module):
         
         is_real_inferred = self.bos_probs_to_inferred_real_position(all_sentence_bos_probs) #with learning on the bos probs
 
-        denoised, compressed, losses, denoised_is_real_inferred = self.training_forward(
+        denoised, compressed, losses, denoised_is_real_inferred, fake_negatives_for_upper = self.training_forward(
             all_sentence_vectors, 
             is_real_inferred, 
             all_sentence_bos_probs, 
@@ -565,9 +562,10 @@ class ZonkeyLayer(nn.Module):
             original_position=original_position,
             doc_sequences=input_sequence,
             is_real_doc_position_boolean=is_real_doc_position_boolean,
-            mlm_only=mlm_only)
+            mlm_only=mlm_only,
+            fake_negatives=fake_negatives)
         if mlm_only:
-            return None, None, None, losses, None, None
+            return None, None, None, losses, None, None, None
 
 
         num_actual_docs = torch.count_nonzero(num_sentences_per_doc) 
@@ -615,7 +613,7 @@ class ZonkeyLayer(nn.Module):
         compressed = compressed_out
         is_real = is_real_out
         
-        return denoised, is_real_inferred, compressed, losses, stitched_docs, is_real
+        return denoised, is_real_inferred, compressed, losses, stitched_docs, is_real, fake_negatives_for_upper
 
     @torch.no_grad()
     def generate(
