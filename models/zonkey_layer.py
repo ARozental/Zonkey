@@ -468,7 +468,7 @@ class ZonkeyLayer(nn.Module):
         # compressed vectors (matching what generation actually produces).
         recompressed = self.compress(denoised, is_real_inferred)
 
-        t2 = t1 * (torch.rand_like(t1)*self.noise_step_size+(1-self.noise_step_size))
+        t2 = self.noise_step_size * (self.beta_dist.sample((clean_compressed.shape[0],)) / self.beta_dist_mean)
         
         denoised2, dirty_losses, is_real_inferred = self.denoise_and_reconstruct(
             recompressed, input_sequence, all_sentence_bos_probs, t2, splitter_existence_share,
