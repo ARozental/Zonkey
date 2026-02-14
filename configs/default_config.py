@@ -48,6 +48,7 @@ class Config:
     PRINT_EVERY_N_STEPS = 10000
     GRAD_CLIP_VAL = 0 
     GRAD_ACCUMULATION_STEPS = 1  # Number of steps to accumulate gradients (1 = no accumulation)
+    PRECISION = "32-true"  # Lightning precision: "32-true", "16-mixed", "bf16-mixed"
     
 
     #losses

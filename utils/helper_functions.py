@@ -197,7 +197,7 @@ def make_trainer_config(time_now):
         "accelerator": accelerator,
         "devices": devices,
         "logger": False,
-        "precision": 32,
+        "precision": Config.PRECISION,
     }
     if Config.MAX_EPOCHS and Config.MAX_EPOCHS > 0 and not Config.MAX_STEPS:
         trainer_config["max_epochs"] = Config.MAX_EPOCHS

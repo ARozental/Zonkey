@@ -294,7 +294,7 @@ class PlZonkey(pl.LightningModule):
         
         if should_step:
             if Config.GRAD_CLIP_VAL > 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=Config.GRAD_CLIP_VAL)
+                self.clip_gradients(optimizer, gradient_clip_val=Config.GRAD_CLIP_VAL, gradient_clip_algorithm="norm")
             optimizer.step()
             optimizer.zero_grad()
         

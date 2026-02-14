@@ -122,8 +122,8 @@ class DecoderAttention(nn.Module):
         self.pos = POS(self.d_k, max_seq_len)
         self.q_pos = torch.arange(max_seq_len+5, device=Config.DEVICE) #+5 to time and compressed vectors, we can get it from config later
         self.k_pos = torch.arange(max_seq_len+5, device=Config.DEVICE)
-        self.ones = torch.ones(1,1,device=Config.DEVICE)
-        self.zeros = torch.zeros(1,1,device=Config.DEVICE)
+        self.register_buffer('ones', torch.ones(1,1,device=Config.DEVICE))
+        self.register_buffer('zeros', torch.zeros(1,1,device=Config.DEVICE))
 
         
         self.dropout = nn.Dropout(dropout)
@@ -190,7 +190,7 @@ class DecoderAttention(nn.Module):
             scores = scores + mask
         
         # Apply softmax and dropout
-        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = F.softmax(scores, dim=-1).to(scores.dtype)
         
         # attn_weights = torch.nan_to_num(attn_weights, 0.0)  # More efficient than where + isfinite
         # attn_weights = self.dropout(attn_weights)
@@ -228,8 +228,8 @@ class ProbabilisticAttention(nn.Module):
         self.pos = POS(self.d_k, max_seq_len)
         self.q_pos = torch.arange(max_seq_len+5, device=Config.DEVICE) #+5 to time and compressed vectors, we can get it from config later
         self.k_pos = torch.arange(max_seq_len+5, device=Config.DEVICE)
-        self.ones = torch.ones(1,1,device=Config.DEVICE)
-        self.zeros = torch.zeros(1,1,device=Config.DEVICE)
+        self.register_buffer('ones', torch.ones(1,1,device=Config.DEVICE))
+        self.register_buffer('zeros', torch.zeros(1,1,device=Config.DEVICE))
 
         
         self.dropout = nn.Dropout(dropout)
@@ -405,7 +405,7 @@ class ProbabilisticAttention(nn.Module):
             scores = scores + mask
         
         # Apply softmax and dropout
-        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = F.softmax(scores, dim=-1).to(scores.dtype)
         
         # Handle numerical issues
         q_invalid = ~(seq2_exist_probs > 0).view(batch_size, 1, seq_len2, 1)
@@ -536,7 +536,7 @@ class EfficientLocalAttention(nn.Module):
         attn_weights = torch.zeros_like(scores)
         non_masked = ~all_masked.squeeze(-1)
         if non_masked.any():
-            attn_weights[non_masked] = F.softmax(scores[non_masked], dim=-1)
+            attn_weights[non_masked] = F.softmax(scores[non_masked], dim=-1).to(scores.dtype)
         attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
         attn_weights = self.dropout(attn_weights)
         
@@ -560,7 +560,7 @@ class EfficientLocalAttention(nn.Module):
         
         # Apply mask to output (matches original)
         if mask is not None:
-            output = output * mask.unsqueeze(-1).float()
+            output = output * mask.unsqueeze(-1).to(dtype=output.dtype)
         
         return output
         

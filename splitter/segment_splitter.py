@@ -115,7 +115,8 @@ class SegmentSplitter(nn.Module):
             torch.Tensor: Scalar mean probability over all eligible starting positions
             in the entire batch.
         """
-        log_x = torch.log1p(-bos_probs)  # log(1 - p), shape (B, L)
+        # Force float32 for log1p+cumsum+exp to avoid float16 underflow
+        log_x = torch.log1p(-bos_probs.float().clamp(max=1-Config.EPS))  # log(1 - p), shape (B, L)
         B, L = log_x.shape
         pl = max_patch_length #patch length
         
@@ -167,7 +168,8 @@ class SegmentSplitter(nn.Module):
         Returns:
             torch.Tensor: Scalar mean probability over all eligible starting positions.
         """
-        log_x = torch.log1p(-bos_probs)  # log(1 - p), shape (B, L)
+        # Force float32 for log1p+cumsum+exp to avoid float16 underflow
+        log_x = torch.log1p(-bos_probs.float().clamp(max=1-Config.EPS))  # log(1 - p), shape (B, L)
         B, L = log_x.shape
 
         # We look at the next (min_sentence_length - 1) positions *after* a start,
@@ -408,7 +410,8 @@ class SegmentSplitter(nn.Module):
                 all_tokens_out[idx_slice] = sentence_tokens
             
             # Calculate p_exist in log space using temp variables
-            log_one_minus_probs = torch.log1p(-temp_bos_probs.clamp(max=0.9999, min=0.0001))
+            # Force float32 for log1p+cumsum+exp to avoid float16 underflow
+            log_one_minus_probs = torch.log1p(-temp_bos_probs.float().clamp(max=0.9999, min=0.0001))
             log_one_minus_probs[:, 0] = 0
             log_p_exist = torch.cumsum(log_one_minus_probs, dim=1)
             p_exist = torch.exp(log_p_exist)
