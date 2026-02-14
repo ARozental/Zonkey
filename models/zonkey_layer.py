@@ -132,16 +132,40 @@ class ZonkeyLayer(nn.Module):
         return t
     
     def add_noise(self, x: torch.Tensor, noise_level: torch.Tensor) -> torch.Tensor:
-        noise = torch.randn_like(x)
-        nl = noise_level.view(-1, 1, 1)
-        sqrt_t = torch.sqrt(nl)
-        sqrt_1mt = torch.sqrt(1 - nl)
-        res = sqrt_t * noise + sqrt_1mt * x
+        """
+        noise_level means "1 - expected cosine similarity".
+        So noise_level=0.1 → expected cosine ≈ 0.9
+        noise_level=0.04 → expected cosine ≈ 0.96
+        
+        Internally converts to signal_strength = (1 - noise_level)^2
+        to achieve approximately the desired expected cosine after renormalization.
+        """
+        # Clamp noise_level to valid range [0, 1]
+        nl = noise_level.clamp_(0.0, 1.0 - 1e-6)
+        
+        # Desired expected cosine similarity
+        target_cosine = 1.0 - nl
+        
+        # Convert to signal & noise strengths (variance-preserving)
+        # signal_strength = target_cosine ** 2   → gives E[cos] ≈ target_cosine
+        signal_strength = target_cosine * target_cosine
+        noise_strength = 1.0 - signal_strength
 
-        batch_size = res.shape[0]
-        res_flat = res.view(batch_size, -1)
-        res_flat = F.normalize(res_flat, p=2, dim=-1) * self.upwards_norm
-        return res_flat.view_as(res)
+        # Generate isotropic Gaussian noise
+        noise = torch.randn_like(x)
+
+        # Forward diffusion step
+        noisy = (
+            torch.sqrt(signal_strength).view(-1, 1, 1) * x +
+            torch.sqrt(noise_strength).view(-1, 1, 1) * noise
+        )
+
+        # Renormalize to your fixed expected norm
+        batch_size = noisy.shape[0]
+        noisy_flat = noisy.view(batch_size, -1)
+        noisy_flat = F.normalize(noisy_flat, p=2, dim=-1) * self.upwards_norm
+
+        return noisy_flat.view_as(noisy)
     
     def compress(self, x: torch.Tensor, existence_probs: torch.Tensor) -> torch.Tensor:
         x0 = x
@@ -429,10 +453,10 @@ class ZonkeyLayer(nn.Module):
         if mlm_only:
             return None, None, {"clean_mlm_loss": mlm_loss}, None, None
         
-        original_is_real = is_real_inferred
+        # original_is_real = is_real_inferred
         clean_compressed = self.compress(input_sequence, is_real_inferred)
         doc_ids = original_position[:,0,0]
-        clean_compressed_sim = calculate_mean_similarity(clean_compressed, doc_ids)
+        # clean_compressed_sim = calculate_mean_similarity(clean_compressed, doc_ids)
         
         # Per-sample noise level for the batch
         t0 = self.noise_last_step_size * (self.beta_dist.sample((clean_compressed.shape[0],)) / self.beta_dist_mean)
@@ -451,16 +475,14 @@ class ZonkeyLayer(nn.Module):
         
         # Compress with the soft mask from predicted EoS probabilities
         compressed = self.compress(denoised, is_real_inferred)
-        noisy_compressed_sim = calculate_mean_similarity(compressed, doc_ids)
+        # noisy_compressed_sim = calculate_mean_similarity(compressed, doc_ids)
         
         # Calculate mean cosine similarity between different batch elements
 
-        t1 = self.noise_schedule(torch.rand_like(t0))
+        # t1 = self.noise_schedule(torch.rand_like(t0))
+        t1 = self.noise_step_size + torch.rand_like(t0) * (1-self.noise_step_size)
         denoised , noisy_losses, is_real_inferred = self.denoise_and_reconstruct(
-            compressed, input_sequence, all_sentence_bos_probs, t1, splitter_existence_share,
-            token_ids=token_ids,
-            num_sentences_per_doc=num_sentences_per_doc,
-            original_position=original_position
+            compressed, noise_level=t1,
         )
 
         # Recompress the noisy denoised output — this chains through the

@@ -56,7 +56,7 @@ class Config:
     DRIFTING_TEMPERATURE = [0.05, 0.1, 0.5]
     DRIFTING_NUM_RANDOM = [128,32]
     DRIFTING_QUEUE_SIZE = [8192, 2048]
-    NUM_FAKE_NEGATIVES = [16, 0]  # chimeric compressed vectors created for the level above
+    NUM_FAKE_NEGATIVES = [8, 0]  # chimeric compressed vectors created for the level above
     NOISE_STEP_SIZE = [0.05,0.05]
     NOISE_LAST_STEP_SIZE = [0.05,0.05]
     DIRTY_RECONSTRUCTION_WEIGHT = [1.0,1.0]
