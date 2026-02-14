@@ -247,10 +247,11 @@ class ZonkeyLayer(nn.Module):
         if input_sequence is None:
             return denoised, None, is_real_inferred
         
-        reconstructed_docs, stitcher_position_loss, stitcher_sequence_loss = self.stitcher(
-            denoised, is_real_inferred, num_sentences_per_doc, original_position=original_position, 
-            original_input_sequences=input_sequence, all_p_exist_share=splitter_existence_share, all_tokens=token_ids,
-            previous_denoised=previous_denoised)
+        if clean:
+            reconstructed_docs, stitcher_position_loss, stitcher_sequence_loss = self.stitcher(
+                denoised, is_real_inferred, num_sentences_per_doc, original_position=original_position, 
+                original_input_sequences=input_sequence, all_p_exist_share=splitter_existence_share, all_tokens=token_ids,
+                previous_denoised=previous_denoised)
         
         losses = {}
         
@@ -294,11 +295,12 @@ class ZonkeyLayer(nn.Module):
 
 
             losses = {
-            "stitcher_position_loss": stitcher_position_loss,
-            "stitcher_sequence_loss": stitcher_sequence_loss * 0.01 * (1-noise_level).mean(),
             "reconstruction_loss": reconstruction_loss,
             "bos_loss": dbos_ce_loss*Config.EXISTS_WEIGHT[self.level]
         }
+            if clean:
+                losses["stitcher_position_loss"] = stitcher_position_loss
+                losses["stitcher_sequence_loss"] = stitcher_sequence_loss * 0.01 * (1-noise_level).mean()
         
         return denoised, losses, is_real_inferred
 
