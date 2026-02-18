@@ -86,7 +86,7 @@ class ZonkeyLayer(nn.Module):
         
 
 
-        self.register_buffer('ones', torch.ones(1,Config.COMPRESSION_VECTORS[level]+1,device=Config.DEVICE))
+        self.ones = torch.ones(1,Config.COMPRESSION_VECTORS[level]+1,device=Config.DEVICE)
         self.denoiser = TransformerEncoder(
             d_model = Config.D_MODEL[level],
             n_heads = Config.NUM_HEADS[level],
@@ -140,8 +140,6 @@ class ZonkeyLayer(nn.Module):
         Internally converts to signal_strength = (1 - noise_level)^2
         to achieve approximately the desired expected cosine after renormalization.
         """
-        # Cast noise_level to match x dtype (avoids float32 contamination in bf16)
-        noise_level = noise_level.to(dtype=x.dtype)
         # Clamp noise_level to valid range [0, 1]
         nl = noise_level.clamp_(0.0, 1.0 - 1e-6)
         
@@ -202,8 +200,6 @@ class ZonkeyLayer(nn.Module):
         return self.bos_layer(vectors).squeeze(-1)+Config.EOS_TARGET_BIAS[self.level]
     
     def compressed_to_denoised(self, compressed: torch.Tensor, noise_level: torch.Tensor) -> torch.Tensor:
-        # Cast noise_level to match compressed dtype (avoids float32 contamination in bf16)
-        noise_level = noise_level.to(dtype=compressed.dtype)
         time_vec = (1 - noise_level).unsqueeze(-1) * self.time_vec_clean + noise_level.unsqueeze(-1) * self.time_vec_noisy
         
         conditioned_compressed = compressed + time_vec.view(compressed.shape[0], 1, compressed.shape[2])
@@ -290,13 +286,9 @@ class ZonkeyLayer(nn.Module):
                 segment_label = t_exp * is_real_label + (1 - t_exp) * previous_is_real_label
                 
                 # Compute BCE loss with interpolated labels
-                # Clamp to [0,1] as safety net — bf16 precision loss can produce out-of-range values
-                # Disable autocast: F.binary_cross_entropy is not autocast-safe
-                with torch.amp.autocast('cuda', enabled=False):
-                    dbos_ce_loss = bce(is_real_inferred.float().clamp(0, 1), segment_label.float().clamp(0, 1), reduction='none')[:, 1:].mean()
+                dbos_ce_loss = bce(is_real_inferred, segment_label, reduction='none')[:, 1:].mean()
             else:
-                with torch.amp.autocast('cuda', enabled=False):
-                    dbos_ce_loss = bce(is_real_inferred.float().clamp(0, 1), is_real_label.float().clamp(0, 1), reduction='none')[:, 1:].mean()
+                dbos_ce_loss = bce(is_real_inferred, is_real_label, reduction='none')[:, 1:].mean()
 
             #not accounting for splitter_existence_share in this loss, if position K has 100% chance of being a new sequence it means the existance share will be 0, we do not want to multiply the need for a stop signal by 0
             # existence_loss = (is_real_inferred.sum(dim=1) - is_real_label.sum(dim=1)).abs().mean() / Config.MAX_SEQ_LENGTHS[self.level]
@@ -420,7 +412,7 @@ class ZonkeyLayer(nn.Module):
             fake_sim = torch.matmul(encoder_output_norm, fake_neg_norm.T)  # (N_queries, K)
             all_sim = torch.cat([all_sim, fake_sim], dim=1)
 
-        logits = 2 * torch.atanh(torch.clamp(all_sim.float(), min=Config.EPS-1, max=1-Config.EPS))
+        logits = 2 * torch.atanh(torch.clamp(all_sim, min=Config.EPS-1, max=1-Config.EPS))
         
         labels = torch.zeros(N_queries, dtype=torch.long, device=device)
         
@@ -554,20 +546,13 @@ class ZonkeyLayer(nn.Module):
         return denoised2[:input_sequence.shape[0]], clean_compressed, losses, is_real_inferred, fake_negatives_for_upper
     
     def bos_probs_to_inferred_real_position(self, bos_probs: torch.Tensor) -> torch.Tensor:
-        # Clamp bos_probs to minimum to prevent precision loss in cumsum
+        # Clamp bos_probs to minimum to prevent float32 precision loss in cumsum
         # When bos_prob is tiny (e.g. 1e-8), log1p(-bos_prob) ≈ -1e-8 which is smaller
         # than float32 precision can represent when added to cumsum values like -3.5
-        # Force float32 for log1p+cumsum+exp to avoid float16 underflow
-        orig_dtype = bos_probs.dtype
-        bos_probs = bos_probs.float()
-        # Replace NaN with 0.5 (neutral) — NaN can appear from bf16 precision loss
-        bos_probs = torch.nan_to_num(bos_probs, nan=0.5)
-        bos_probs_clamped = torch.clamp(bos_probs, min=Config.EPS, max=1-Config.EPS)
+        bos_probs_clamped = torch.clamp(bos_probs, min=Config.EPS)
         cum_not_bos = torch.exp(torch.cumsum(torch.log1p(-bos_probs_clamped), dim=1))
         is_real_inferred = cum_not_bos / cum_not_bos[:, 0].unsqueeze(1)
-        # nan_to_num handles any remaining NaN/inf from division
-        is_real_inferred = torch.nan_to_num(is_real_inferred, nan=0.5, posinf=1.0, neginf=0.0)
-        return torch.clamp(is_real_inferred, min=Config.EPS, max=1-Config.EPS).to(orig_dtype)
+        return torch.clamp(is_real_inferred, min=Config.EPS, max=1-Config.EPS)
     
     def forward(self, input_sequence: torch.Tensor, is_real_doc_position_boolean: torch.Tensor, 
                 token_ids: Optional[torch.Tensor] = None, mlm_only: Optional[bool] = False,

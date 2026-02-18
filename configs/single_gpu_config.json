@@ -1,6 +1,5 @@
 {
-    "MAX_DOC_LENGTH": 2048, 
-    "MAX_DOC_LENGTHS": [2048,256,64],
+    "MAX_DOC_LENGTHS": [1536,128,16],
     "MAX_SEQ_LENGTHS": [27,27],
     "BATCH_SIZE": 3,
     "NUM_UPWARD_LAYERS": [8,8],
@@ -9,7 +8,7 @@
     "NUM_DENOISER_LAYERS": [8,8],
     "COMPRESSION_VECTORS": [4,4],
     "D_MODEL": [256,1024],
-    "MAX_SEQUENCES_PER_BATCH": [256,64], 
+    "MAX_SEQUENCES_PER_BATCH": [384,48], 
     "NUM_HEADS": [8,8],
     "FF_DIM_RATIO": 4,
     "LEARNING_RATE": 1e-4,
@@ -26,5 +25,5 @@
     "NOISE_STEP_SIZE": [0.06,0.06],
     "NOISE_LAST_STEP_SIZE": [0.06,0.06],
     "USE_GRADIENT_CHECKPOINTING": false,
-    "PRECISION": "bf16-mixed"
+    "PRECISION": "32-true"
 }
