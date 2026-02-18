@@ -23,7 +23,7 @@ def calculate_token_loss(
     # Compute exact similarities for all tokens
     exact_sims = torch.matmul(E_norm, W_norm.t())  # (BL, V)
     
-    sims = 2 * torch.atanh(torch.clamp(exact_sims.float(), min=Config.EPS-1, max=1-Config.EPS))
+    sims = 2 * torch.atanh(torch.clamp(exact_sims, min=Config.EPS-1, max=1-Config.EPS))
     logits = sims
     
     loss = F.cross_entropy(logits, true_ids, reduction='none')
@@ -47,7 +47,7 @@ def calculate_reconstruction_loss(
     
     denoised_flat = denoised.reshape(-1, hidden)
     target_flat = target_sequences.reshape(-1, hidden)
-    is_real_flat = is_real_inferred.reshape(-1)
+    is_real_flat = torch.sigmoid(is_real_inferred).reshape(-1)
     
     N = batch * seq_len
     
@@ -151,7 +151,7 @@ def calculate_reconstruction_loss(
     
     all_sim = torch.cat([pos_sim.unsqueeze(1), neg_sim], dim=1)
 
-    logits = 2 * torch.atanh(torch.clamp(all_sim.float(), min=Config.EPS-1, max=1-Config.EPS))
+    logits = 2 * torch.atanh(torch.clamp(all_sim, min=Config.EPS-1, max=1-Config.EPS))
     
     labels = torch.zeros(N, dtype=torch.long, device=device)
     

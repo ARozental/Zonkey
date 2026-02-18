@@ -60,7 +60,8 @@ class Config:
     NUM_FAKE_NEGATIVES = [8, 0]  # chimeric compressed vectors created for the level above
     NOISE_STEP_SIZE = [0.05,0.05]
     NOISE_LAST_STEP_SIZE = [0.05,0.05]
-    DIRTY_RECONSTRUCTION_WEIGHT = [1.0,1.0]
+    DIRTY_RECONSTRUCTION_WEIGHT = [2.5,2.5]
+    CLEAN_RECONSTRUCTION_WEIGHT = [0.4,0.4]
     MLM_WEIGHT = [0.0,2.0] #0.0 for token level always 
     EXISTS_WEIGHT = [0.05,0.05] 
     

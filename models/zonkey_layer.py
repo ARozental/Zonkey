@@ -53,6 +53,7 @@ class ZonkeyLayer(nn.Module):
         self.eos_temprature = nn.Parameter(torch.zeros(1),requires_grad=True)
 
         self.bos_layer = nn.Linear(self.d_model, 1)
+        self.signal_coherence = nn.Linear(self.upwards_d_model, 1)
 
         self.mask_vector = nn.Parameter(torch.randn(d_model),requires_grad=True)
         self.classification_head = nn.Linear(d_model, 3)
@@ -86,6 +87,7 @@ class ZonkeyLayer(nn.Module):
         
 
 
+        # self.ones = torch.ones(1,Config.COMPRESSION_VECTORS[level],device=Config.DEVICE)
         self.ones = torch.ones(1,Config.COMPRESSION_VECTORS[level]+1,device=Config.DEVICE)
         self.denoiser = TransformerEncoder(
             d_model = Config.D_MODEL[level],
@@ -199,9 +201,12 @@ class ZonkeyLayer(nn.Module):
     def compute_bos_probability_logits(self, vectors: torch.Tensor) -> torch.Tensor:
         return self.bos_layer(vectors).squeeze(-1)+Config.EOS_TARGET_BIAS[self.level]
     
-    def compressed_to_denoised(self, compressed: torch.Tensor, noise_level: torch.Tensor) -> torch.Tensor:
-        time_vec = (1 - noise_level).unsqueeze(-1) * self.time_vec_clean + noise_level.unsqueeze(-1) * self.time_vec_noisy
-        
+    def compressed_to_denoised(self, compressed: torch.Tensor, noise_level: torch.Tensor,clean_compressed: torch.Tensor=None) -> torch.Tensor:
+        if clean_compressed is not None:
+            cosine_similarity = torch.nn.functional.cosine_similarity(clean_compressed.view(compressed.shape[0], -1), compressed.view(compressed.shape[0], -1), dim=-1)
+            time_vec = cosine_similarity.unsqueeze(-1) * self.time_vec_clean + (1-cosine_similarity).unsqueeze(-1) * self.time_vec_noisy
+        else:
+            time_vec = (1 - noise_level).unsqueeze(-1) * self.time_vec_clean + noise_level.unsqueeze(-1) * self.time_vec_noisy
         conditioned_compressed = compressed + time_vec.view(compressed.shape[0], 1, compressed.shape[2])
         
         prompt = torch.cat([
@@ -212,6 +217,7 @@ class ZonkeyLayer(nn.Module):
         decompressed = self.decompressor.generate(prompt, Config.MAX_SEQ_LENGTHS[self.level])
         
         vectors = decompressed[:, (1+Config.COMPRESSION_VECTORS[self.level]):]
+        # vectors = decompressed[:, Config.COMPRESSION_VECTORS[self.level]:]
         bos_probability = self.compute_bos_probability(vectors)
         is_real_inferred = self.bos_probs_to_inferred_real_position(bos_probability)
         
@@ -219,12 +225,119 @@ class ZonkeyLayer(nn.Module):
             self.ones.expand(decompressed.shape[0], -1), 
             is_real_inferred
         ], dim=1)
-        denoised = self.denoiser(decompressed, cum_not_eos_expanded)[:, (1+Config.COMPRESSION_VECTORS[self.level]):, :]
+        denoised = self.denoiser(decompressed, cum_not_eos_expanded)
+        denoised = denoised[:, (1+Config.COMPRESSION_VECTORS[self.level]):, :]
+        # denoised = denoised[:, Config.COMPRESSION_VECTORS[self.level]:, :]
         denoised = F.normalize(denoised, p=2, dim=-1) * self.dim_norm
         dbos_probability = self.compute_bos_probability(denoised)
         is_real_inferred = self.bos_probs_to_inferred_real_position(dbos_probability)
-
         return denoised, is_real_inferred
+
+
+
+    def calculated_coherence_score(self, compressed: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute coherence score (now as probability after sigmoid) and lower-level vectors.
+        Sigmoid moved inside as requested.
+        """
+
+        decompressed = self.decompressor.generate(compressed, Config.MAX_SEQ_LENGTHS[self.level])
+        vectors = decompressed[:, Config.COMPRESSION_VECTORS[self.level]:]
+
+        bos_probability = self.compute_bos_probability(vectors)
+        is_real_inferred = self.bos_probs_to_inferred_real_position(bos_probability)
+
+        cum_not_eos_expanded = torch.cat([
+            self.ones[:, :Config.COMPRESSION_VECTORS[self.level]].expand(decompressed.shape[0], -1),
+            is_real_inferred
+        ], dim=1)
+
+        denoised = self.denoiser(decompressed, cum_not_eos_expanded)
+
+        # Raw logit
+        signal = denoised[:, :Config.COMPRESSION_VECTORS[self.level], :].view(denoised.shape[0], -1)
+        raw_score = self.signal_coherence(signal / math.sqrt(self.upwards_d_model))
+        
+        # Sigmoid moved inside → now returns probability (as you requested)
+        coherence_prob = torch.sigmoid(raw_score)
+
+        lower_level_vectors = denoised[:, Config.COMPRESSION_VECTORS[self.level]:, :]
+
+        return coherence_prob, lower_level_vectors    
+    
+    def get_level_coherence_loss(self, compressed: torch.Tensor, N: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Coherence regularizer for compressed vectors at this level.
+        Uses your requested stop-gradient formula.
+        """
+        batch_size = compressed.shape[0]
+
+        device = compressed.device
+        dtype = compressed.dtype
+        num_samples = min(N, batch_size)
+
+        # === In-level coherence (real vs random) ===
+        sample_indices = torch.randint(0, batch_size, (num_samples,), device=device)
+        real_samples = compressed[sample_indices]
+
+        random_samples = torch.randn(
+            num_samples,
+            Config.COMPRESSION_VECTORS[self.level],
+            self.d_model,
+            device=device,
+            dtype=dtype,
+        )
+        random_samples_flat = random_samples.view(num_samples, -1)
+        random_samples_flat = F.normalize(random_samples_flat, p=2, dim=-1) * self.upwards_norm
+        random_samples = random_samples_flat.view(num_samples, Config.COMPRESSION_VECTORS[self.level], self.d_model)
+
+        real_scores, _ = self.calculated_coherence_score(real_samples.detach())
+        random_scores, random_lower_level_vectors = self.calculated_coherence_score(random_samples.detach())
+
+        # Now using regular BCE (since we get probabilities from the score function)
+        real_loss = F.binary_cross_entropy(real_scores, torch.ones_like(real_scores))
+        random_loss = F.binary_cross_entropy(random_scores, torch.zeros_like(random_scores))
+        in_level_coherence_loss = 0.5 * (real_loss + random_loss)
+
+        if self.level == 0:
+            return in_level_coherence_loss, compressed.new_zeros(())
+
+        # === Cross-level penalty ===
+        prev_comp = Config.COMPRESSION_VECTORS[self.level - 1]
+        prev_d_model = Config.D_MODEL[self.level - 1]
+
+        lower_bos_probs = self.compute_bos_probability(random_lower_level_vectors)
+        lower_is_real = self.bos_probs_to_inferred_real_position(lower_bos_probs)
+
+        sample_weights = lower_is_real.reshape(-1).clamp_min(Config.EPS)
+        sample_probs = sample_weights / sample_weights.sum()
+
+        num_selected = max(1, num_samples * Config.COMPRESSION_VECTORS[self.level])
+        sampled_indices = torch.multinomial(sample_probs, num_selected, replacement=True)
+
+        flat_lower_vectors = random_lower_level_vectors.reshape(-1, self.d_model)
+        selected_flat = flat_lower_vectors[sampled_indices]
+        selected_compressed = selected_flat.view(num_selected, prev_comp, prev_d_model)
+
+        # === YOUR REQUESTED STOP-GRADIENT TRICK ===
+        # Forward 1: full computation
+        lower_scores, _ = self.previous_layer.calculated_coherence_score(
+            selected_compressed
+        )
+
+        # Forward 2: detached only has grad on the lower layer
+        lower_scores_detached, _ = self.previous_layer.calculated_coherence_score(
+                selected_compressed.detach()
+            )
+
+        # Your exact formula (keeps meaningful loss value but removes all grad on the lower layer)
+        lower_scores = (lower_scores - lower_scores_detached) + lower_scores.detach()
+
+        lower_mean_coherence = lower_scores.mean()
+        cross_level_penalty = 1.0 - lower_mean_coherence
+
+        return in_level_coherence_loss, cross_level_penalty
+        
         
     
     def _denoise_and_reconstruct(
@@ -242,7 +355,7 @@ class ZonkeyLayer(nn.Module):
         fake_negatives: Optional[torch.Tensor] = None,
         ) -> Tuple[torch.Tensor, Optional[dict], torch.Tensor]:
         noisy_compressed = self.add_noise(compressed, noise_level)
-        denoised, is_real_inferred = self.compressed_to_denoised(noisy_compressed, noise_level)
+        denoised, is_real_inferred = self.compressed_to_denoised(noisy_compressed, noise_level, compressed)
 
         if input_sequence is None:
             return denoised, None, is_real_inferred
@@ -301,6 +414,10 @@ class ZonkeyLayer(nn.Module):
             if clean:
                 losses["stitcher_position_loss"] = stitcher_position_loss
                 losses["stitcher_sequence_loss"] = stitcher_sequence_loss * 0.01 * (1-noise_level).mean()
+
+            in_level_coherence_loss, cross_level_penalty = self.get_level_coherence_loss(compressed, 7)
+            losses["in_level_coherence_loss"] = in_level_coherence_loss
+            losses["cross_level_penalty"] = cross_level_penalty
         
         return denoised, losses, is_real_inferred
 
@@ -482,7 +599,7 @@ class ZonkeyLayer(nn.Module):
         # Calculate mean cosine similarity between different batch elements
 
         # t1 = self.noise_schedule(torch.rand_like(t0))
-        t1 = self.noise_step_size + torch.rand_like(t0) * (1-self.noise_step_size)
+        t1 = torch.rand_like(t0)
         denoised , noisy_losses, is_real_inferred = self.denoise_and_reconstruct(
             compressed, noise_level=t1,
         )
@@ -536,9 +653,11 @@ class ZonkeyLayer(nn.Module):
             "coverage_loss": (clean_uniformity + noisy_uniformity) * Config.COVERAGE_WEIGHT[self.level],
             "clean_bos_loss": clean_losses["bos_loss"],
             "clean_mlm_loss": mlm_loss * Config.MLM_WEIGHT[self.level],
-            "clean_reconstruction_loss": clean_losses["reconstruction_loss"],
+            "clean_reconstruction_loss": clean_losses["reconstruction_loss"] * Config.DIRTY_RECONSTRUCTION_WEIGHT[self.level] ,
             "clean_stitcher_position_loss": clean_losses["stitcher_position_loss"],
             "clean_stitcher_sequence_loss": clean_losses["stitcher_sequence_loss"],
+            "in_level_coherence_loss": clean_losses["in_level_coherence_loss"],
+            "cross_level_coherence_loss": clean_losses["cross_level_penalty"],
             "dirty_bos_loss": dirty_losses["bos_loss"],
             "dirty_reconstruction_loss": dirty_losses["reconstruction_loss"] * Config.DIRTY_RECONSTRUCTION_WEIGHT[self.level],
         }
