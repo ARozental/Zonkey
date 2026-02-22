@@ -11,7 +11,7 @@
     "MAX_SEQUENCES_PER_BATCH": [384,48], 
     "NUM_HEADS": [8,8],
     "FF_DIM_RATIO": 4,
-    "LEARNING_RATE": 1e-4,
+    "LEARNING_RATE": 2e-4,
     "USE_MUON": true,
     "POS": "sinusoidal",
     "EPS": 1e-7,

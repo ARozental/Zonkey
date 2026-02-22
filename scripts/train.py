@@ -52,6 +52,8 @@ def parse_args():
                         help='Parameter file in param_versions directory')
     parser.add_argument('--resume', type=str, default=None,
                         help='Resume from checkpoint file')
+    parser.add_argument('--load_weights_only', action='store_true',
+                        help='Load model weights with strict=False (keeps new params random)')
     parser.add_argument('--calibrate', action='store_true',
                         help='Run memory calibration (worst-case batch) before training')
     return parser.parse_args()

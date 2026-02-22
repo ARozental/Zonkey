@@ -114,6 +114,14 @@ class ZonkeyLayer(nn.Module):
             init_scale = 0.5,
             num_layers = Config.NUM_DECOMPRESSOR_LAYERS[level]
             )
+
+
+        if self.level != Config.AGENT_LEVELS - 1:
+            self.coherence_generator = nn.Sequential(
+                nn.Linear(self.upwards_d_model, self.d_model),
+                nn.GELU(),
+                nn.Linear(self.d_model, self.upwards_d_model)
+            )    
         
         # Drifting loss queue: FIFO of detached clean_compressed vectors from recent batches
         # persistent=False -> excluded from state_dict, no checkpoint mismatch
@@ -207,7 +215,7 @@ class ZonkeyLayer(nn.Module):
             time_vec = cosine_similarity.unsqueeze(-1) * self.time_vec_clean + (1-cosine_similarity).unsqueeze(-1) * self.time_vec_noisy
         else:
             time_vec = (1 - noise_level).unsqueeze(-1) * self.time_vec_clean + noise_level.unsqueeze(-1) * self.time_vec_noisy
-        conditioned_compressed = compressed + time_vec.view(compressed.shape[0], 1, compressed.shape[2])
+        conditioned_compressed = compressed #+ time_vec.view(compressed.shape[0], 1, compressed.shape[2]) # removed for coherence compatibility
         
         prompt = torch.cat([
             time_vec.view(compressed.shape[0], 1, compressed.shape[2]),
@@ -255,54 +263,283 @@ class ZonkeyLayer(nn.Module):
         denoised = self.denoiser(decompressed, cum_not_eos_expanded)
 
         # Raw logit
-        signal = denoised[:, :Config.COMPRESSION_VECTORS[self.level], :].view(denoised.shape[0], -1)
+        d1 = F.normalize(denoised[:, :Config.COMPRESSION_VECTORS[self.level], :].view(denoised.shape[0], -1), p=2, dim=-1) * self.upwards_norm
+        d2 = F.normalize(compressed.view(denoised.shape[0], -1), p=2, dim=-1) * self.upwards_norm #should alread be normalized like this
+        signal = d1-d2
         raw_score = self.signal_coherence(signal / math.sqrt(self.upwards_d_model))
         
         # Sigmoid moved inside → now returns probability (as you requested)
         coherence_prob = torch.sigmoid(raw_score)
 
         lower_level_vectors = denoised[:, Config.COMPRESSION_VECTORS[self.level]:, :]
+        lower_level_vectors = F.normalize(lower_level_vectors, p=2, dim=-1) * self.dim_norm
 
         return coherence_prob, lower_level_vectors    
     
+    # def get_level_coherence_loss(self, compressed: torch.Tensor, N: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    #     """
+    #     Coherence regularizer for compressed vectors at this level.
+    #     - In-level: regression predicting cleanliness (1.0 = clean / real-word-like vector)
+    #       • 25% pure noise → target = 0.0
+    #       • 25% clean compressed vectors → target = 1.0
+    #       • 50% clean + Uniform(0,1) added noise → target = 1.0 - noise_level
+    #     - Cross-level penalty: kept EXACTLY as in your current file (including your stop-gradient formula)
+    #       Goal remains: push lower_mean_coherence → 1.0 so level-1 produces vectors that level-0 sees as clean words.
+    #     """
+    #     batch_size = compressed.shape[0]
+    #     num_samples = min(N, batch_size)
+
+    #     # Level 1: skip in-level coherence loss entirely, only compute cross-level penalty
+    #     if self.level == Config.AGENT_LEVELS - 1:
+    #         in_level_coherence_loss = compressed.new_zeros(())
+    #         sample_indices = torch.randint(0, batch_size, (num_samples,), device=compressed.device)
+    #         _, random_lower_level_vectors = self.calculated_coherence_score(compressed[sample_indices])
+    #     else:
+    #         device = compressed.device
+    #         dtype = compressed.dtype
+
+    #         # 25% pure noise → target = 0.0
+    #         num_pure = max(1, int(num_samples * 0.25))
+    #         pure_noise = torch.randn(num_pure, Config.COMPRESSION_VECTORS[self.level], self.d_model,
+    #                                  device=device, dtype=dtype)
+    #         pure_noise = F.normalize(pure_noise.view(num_pure, -1), p=2, dim=-1) * self.upwards_norm
+    #         pure_noise = pure_noise.view(num_pure, Config.COMPRESSION_VECTORS[self.level], self.d_model)
+
+    #         # 25% clean → target = 1.0
+    #         num_clean = max(1, int(num_samples * 0.25))
+    #         clean_indices = torch.randint(0, batch_size, (num_clean,), device=device)
+    #         clean_part = compressed[clean_indices]
+
+    #         # 50% clean + Uniform(0,1) noise → target = 1.0 - noise_level
+    #         num_noisy = num_samples - num_pure - num_clean
+    #         noise_levels = torch.rand(num_noisy, device=device)   # Uniform[0,1]
+    #         noisy_indices = torch.randint(0, batch_size, (num_noisy,), device=device)
+    #         noisy_part = compressed[noisy_indices].clone()
+    #         noisy_part = self.add_noise(noisy_part, noise_levels)
+
+    #         # Concatenate for one forward pass
+    #         all_samples = torch.cat([pure_noise, clean_part, noisy_part], dim=0) #maybe todo later: have clean-clean_mean
+
+    #         # Target cleanliness (this is the label we want the head to predict accurately)
+    #         target_clean = torch.cat([
+    #             torch.zeros(num_pure, device=device),      # pure noise
+    #             torch.ones(num_clean, device=device),      # clean
+    #             1.0 - noise_levels                         # noisy-clean
+    #         ], dim=0)
+
+    #         # Forward through your existing calculated_coherence_score (returns probability after sigmoid)
+    #         pred_clean, random_lower_level_vectors = self.calculated_coherence_score(all_samples)
+
+    #         # LK loss
+    #         in_level_coherence_loss = F.binary_cross_entropy(pred_clean.squeeze(-1), target_clean) - F.binary_cross_entropy(target_clean, target_clean)
+
+    #         if self.level == 0:
+    #             return in_level_coherence_loss, compressed.new_zeros(())
+
+    #     # === CROSS-LEVEL PENALTY — EXACTLY as you have it now (unchanged) ===
+    #     prev_comp = Config.COMPRESSION_VECTORS[self.level - 1]
+    #     prev_d_model = Config.D_MODEL[self.level - 1]
+
+    #     lower_bos_probs = self.compute_bos_probability(random_lower_level_vectors)
+    #     lower_is_real = self.bos_probs_to_inferred_real_position(lower_bos_probs)
+
+    #     sample_weights = lower_is_real.reshape(-1).clamp_min(Config.EPS)
+    #     sample_probs = sample_weights / sample_weights.sum()
+
+    #     num_selected = max(1, num_samples * Config.COMPRESSION_VECTORS[self.level])
+    #     sampled_indices = torch.multinomial(sample_probs, num_selected, replacement=True)
+
+    #     flat_lower_vectors = random_lower_level_vectors.reshape(-1, self.d_model)
+    #     selected_flat = flat_lower_vectors[sampled_indices]
+    #     selected_compressed = selected_flat.view(num_selected, prev_comp, prev_d_model)
+
+    #     lower_scores, _ = self.previous_layer.calculated_coherence_score(selected_compressed)
+    #     lower_scores_detached, _ = self.previous_layer.calculated_coherence_score(selected_compressed.detach())
+    #     lower_scores = (lower_scores - lower_scores_detached) + lower_scores.detach()
+
+    #     lower_mean_coherence = lower_scores.mean()
+    #     cross_level_penalty = 1.0 - lower_mean_coherence
+
+    #     return in_level_coherence_loss, cross_level_penalty    
+
+    # def get_level_coherence_loss(self, compressed: torch.Tensor, N: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    #     """
+    #     In-level loss is now purely discriminator-based (optimized).
+    #     Returns (in_level_coherence_loss, cross_level_penalty)
+    #     - in_level_coherence_loss : value == full BCE loss
+    #                                 gradients: -d(full_loss)/d(generator/compressor/coherence_discriminator)
+    #                                            +d(full_loss)/d(discriminator)
+    #     """
+    #     batch_size = compressed.shape[0]
+    #     device = compressed.device
+    #     dtype = compressed.dtype
+    #     num_samples = min(N, batch_size)
+
+    #     if self.level == Config.AGENT_LEVELS - 1:
+    #         # Level 1: only cross-level (exactly as before)
+    #         in_level_coherence_loss = compressed.new_zeros(())
+    #         sample_indices = torch.randint(0, batch_size, (num_samples,), device=device)
+    #         _, random_lower_level_vectors = self.calculated_coherence_score(compressed[sample_indices])
+    #     else:
+    #         # Calculate counts (prefer clean division, reduce pure if necessary)
+    #         num_real = int(num_samples * 0.35)
+    #         num_hard = int(num_samples * 0.35)
+    #         num_pure = num_samples - num_real - num_hard   
+
+    #         real_indices = torch.randint(0, batch_size, (num_real,), device=device)
+    #         real_samples = compressed[real_indices]
+
+    #         pure_noise = torch.randn(num_pure, Config.COMPRESSION_VECTORS[self.level], self.d_model,
+    #                                  device=device, dtype=dtype)
+    #         pure_noise = F.normalize(pure_noise.view(num_pure, -1), p=2, dim=-1) * self.upwards_norm
+    #         pure_noise = pure_noise.view(num_pure, Config.COMPRESSION_VECTORS[self.level], self.d_model)
+
+    #         hard_base = torch.randn(num_hard, Config.COMPRESSION_VECTORS[self.level], self.d_model,
+    #                                 device=device, dtype=dtype)
+    #         hard_base = F.normalize(hard_base.view(num_hard, -1), p=2, dim=-1) * self.upwards_norm
+    #         hard_samples = F.normalize(hard_base + self.coherence_generator(hard_base), p=2, dim=-1) * self.upwards_norm
+    #         hard_samples = hard_samples.view(num_hard, Config.COMPRESSION_VECTORS[self.level], self.d_model)
+
+    #         # Concatenate all samples (once)
+    #         all_samples = torch.cat([real_samples, hard_samples, pure_noise], dim=0)
+
+    #         # Targets for discriminator loss (real = 1.0, fake = 0.0)
+    #         target = torch.cat([
+    #             torch.ones(num_real, device=device, dtype=dtype),
+    #             torch.zeros(num_hard + num_pure, device=device, dtype=dtype)
+    #         ], dim=0)
+
+    #         # === Full forward (gradients everywhere, needed for lower vectors + full_loss) ===
+    #         pred_full, random_lower_level_vectors = self.calculated_coherence_score(all_samples)
+    #         pred_full = pred_full.squeeze(-1)
+    #         full_loss = F.binary_cross_entropy(pred_full, target)
+
+    #         pred_hard_disc_only, _ = self.calculated_coherence_score(hard_samples.detach())
+    #         pred_hard_disc_only = pred_hard_disc_only.squeeze(-1)
+
+    #         pred_no_g_grad = torch.cat([
+    #             pred_full[:num_real],          # real: no generator grad
+    #             pred_hard_disc_only,                    # hard: discriminator-only grad
+    #             pred_full[num_real + num_hard:]  # pure: no generator grad
+    #         ], dim=0)
+
+    #         no_g_grad_loss = F.binary_cross_entropy(pred_no_g_grad, target)
+
+    #         in_level_coherence_loss = (2 * no_g_grad_loss - full_loss).mean()
+
+    #         if self.level == 0:
+    #             return in_level_coherence_loss, compressed.new_zeros(())
+
+    #     # === CROSS-LEVEL PENALTY — EXACTLY as you have it now (unchanged) ===
+    #     prev_comp = Config.COMPRESSION_VECTORS[self.level - 1]
+    #     prev_d_model = Config.D_MODEL[self.level - 1]
+
+    #     lower_bos_probs = self.compute_bos_probability(random_lower_level_vectors)
+    #     lower_is_real = self.bos_probs_to_inferred_real_position(lower_bos_probs)
+
+    #     sample_weights = lower_is_real.reshape(-1).clamp_min(Config.EPS)
+    #     sample_probs = sample_weights / sample_weights.sum()
+
+    #     num_selected = max(1, num_samples * Config.COMPRESSION_VECTORS[self.level])
+    #     sampled_indices = torch.multinomial(sample_probs, num_selected, replacement=True)
+
+    #     flat_lower_vectors = random_lower_level_vectors.reshape(-1, self.d_model)
+    #     selected_flat = flat_lower_vectors[sampled_indices]
+    #     selected_compressed = selected_flat.view(num_selected, prev_comp, prev_d_model)
+
+    #     lower_scores, _ = self.previous_layer.calculated_coherence_score(selected_compressed)
+    #     lower_scores_detached, _ = self.previous_layer.calculated_coherence_score(selected_compressed.detach())
+    #     lower_scores = (lower_scores - lower_scores_detached) + lower_scores.detach()
+
+    #     lower_mean_coherence = lower_scores.mean()
+    #     cross_level_penalty = 1.0 - lower_mean_coherence
+
+    #     return in_level_coherence_loss, cross_level_penalty    
+
     def get_level_coherence_loss(self, compressed: torch.Tensor, N: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Coherence regularizer for compressed vectors at this level.
-        Uses your requested stop-gradient formula.
+        Regression version (KL-style centering) with your mixed hard examples.
+        25% clean → target=1.0
+        25% pure noise → target=0.0
+        50% mixed: v1=noise, v2=v1+generator(v1), mixed=w*v1+(1-w)*v2, label=w (w~U(0,1))
+        Uses your detach trick for gradient separation.
         """
         batch_size = compressed.shape[0]
-
         device = compressed.device
         dtype = compressed.dtype
         num_samples = min(N, batch_size)
 
-        # === In-level coherence (real vs random) ===
-        sample_indices = torch.randint(0, batch_size, (num_samples,), device=device)
-        real_samples = compressed[sample_indices]
+        if self.level == Config.AGENT_LEVELS - 1:
+            # Level 1: only cross-level (exactly as you have it)
+            in_level_coherence_loss = compressed.new_zeros(())
+            sample_indices = torch.randint(0, batch_size, (num_samples,), device=device)
+            _, random_lower_level_vectors = self.calculated_coherence_score(compressed[sample_indices])
+        else:
+            # 25% clean
+            num_clean = int(num_samples * 0.25)
+            clean_indices = torch.randint(0, batch_size, (num_clean,), device=device)
+            clean_samples = compressed[clean_indices]
 
-        random_samples = torch.randn(
-            num_samples,
-            Config.COMPRESSION_VECTORS[self.level],
-            self.d_model,
-            device=device,
-            dtype=dtype,
-        )
-        random_samples_flat = random_samples.view(num_samples, -1)
-        random_samples_flat = F.normalize(random_samples_flat, p=2, dim=-1) * self.upwards_norm
-        random_samples = random_samples_flat.view(num_samples, Config.COMPRESSION_VECTORS[self.level], self.d_model)
+            # 25% pure noise
+            num_pure = int(num_samples * 0.25)
+            pure_noise = torch.randn(num_pure, Config.COMPRESSION_VECTORS[self.level], self.d_model,
+                                     device=device, dtype=dtype)
+            pure_noise = F.normalize(pure_noise.view(num_pure, -1), p=2, dim=-1) * self.upwards_norm
+            pure_noise = pure_noise.view(num_pure, Config.COMPRESSION_VECTORS[self.level], self.d_model)
 
-        real_scores, _ = self.calculated_coherence_score(real_samples.detach())
-        random_scores, random_lower_level_vectors = self.calculated_coherence_score(random_samples.detach())
+            # 50% mixed hard examples
+            num_mixed = num_samples - num_clean - num_pure
+            w = torch.rand(num_mixed, device=device)   # U(0,1)
 
-        # Now using regular BCE (since we get probabilities from the score function)
-        real_loss = F.binary_cross_entropy(real_scores, torch.ones_like(real_scores))
-        random_loss = F.binary_cross_entropy(random_scores, torch.zeros_like(random_scores))
-        in_level_coherence_loss = 0.5 * (real_loss + random_loss)
+            v1 = torch.randn(num_mixed, Config.COMPRESSION_VECTORS[self.level], self.d_model,
+                             device=device, dtype=dtype)
+            v1 = F.normalize(v1.view(num_mixed, -1), p=2, dim=-1) * self.upwards_norm
 
+            v2 = v1 + self.coherence_generator(v1)
+            v2 = F.normalize(v2, p=2, dim=-1) * self.upwards_norm
+
+            mixed_samples = w.unsqueeze(-1) * v1 + (1 - w.unsqueeze(-1)) * v2
+            mixed_samples = F.normalize(mixed_samples.view(num_mixed, -1), p=2, dim=-1) * self.upwards_norm
+            mixed_samples = mixed_samples.view(num_mixed, Config.COMPRESSION_VECTORS[self.level], self.d_model)
+
+            # Concatenate
+            all_samples = torch.cat([clean_samples, pure_noise, mixed_samples], dim=0)
+
+            # Targets for regression
+            target = torch.cat([
+                torch.ones(num_clean, device=device, dtype=dtype),
+                torch.zeros(num_pure, device=device, dtype=dtype),
+                w
+            ], dim=0)
+
+            # === Full forward ===
+            pred, random_lower_level_vectors = self.calculated_coherence_score(all_samples)
+            pred = pred.squeeze(-1)
+
+            full_loss = F.binary_cross_entropy(pred, target) - F.binary_cross_entropy(target, target)
+
+            # === Detached forward for the "hardener-only" part ===
+            # pred_no_g_grad, _ = self.calculated_coherence_score(all_samples.detach())
+            mixed_scores, no_grad_random_lower_level_vectors = self.calculated_coherence_score(mixed_samples.detach())
+            pred_no_g_grad = torch.cat([
+                pred[:num_clean + num_pure],
+                mixed_scores.squeeze(-1)
+            ], dim=0)
+            pred_no_g_grad = pred_no_g_grad
+            no_g_grad_loss = F.binary_cross_entropy(pred_no_g_grad, target) - F.binary_cross_entropy(target, target)
+
+            only_g_grad_loss = (full_loss - no_g_grad_loss)
+            only_d_grad_loss = (full_loss - only_g_grad_loss)
+            in_level_coherence_loss = (only_d_grad_loss - (0.1*only_g_grad_loss + 0.9*only_g_grad_loss.detach())).mean()
+            # same mangitude as full_loss, opposite grad sign on g, 0.1 of grad strength on g  
+
+            if self.level > 0:
+                random_lower_level_vectors = torch.cat([random_lower_level_vectors[:num_clean + num_pure], no_grad_random_lower_level_vectors[:num_mixed]], dim=0)
+
+        # === CROSS-LEVEL PENALTY — EXACTLY as in your current code (unchanged) ===
         if self.level == 0:
             return in_level_coherence_loss, compressed.new_zeros(())
 
-        # === Cross-level penalty ===
         prev_comp = Config.COMPRESSION_VECTORS[self.level - 1]
         prev_d_model = Config.D_MODEL[self.level - 1]
 
@@ -319,26 +556,15 @@ class ZonkeyLayer(nn.Module):
         selected_flat = flat_lower_vectors[sampled_indices]
         selected_compressed = selected_flat.view(num_selected, prev_comp, prev_d_model)
 
-        # === YOUR REQUESTED STOP-GRADIENT TRICK ===
-        # Forward 1: full computation
-        lower_scores, _ = self.previous_layer.calculated_coherence_score(
-            selected_compressed
-        )
-
-        # Forward 2: detached only has grad on the lower layer
-        lower_scores_detached, _ = self.previous_layer.calculated_coherence_score(
-                selected_compressed.detach()
-            )
-
-        # Your exact formula (keeps meaningful loss value but removes all grad on the lower layer)
+        lower_scores, _ = self.previous_layer.calculated_coherence_score(selected_compressed)
+        lower_scores_detached, _ = self.previous_layer.calculated_coherence_score(selected_compressed.detach())
         lower_scores = (lower_scores - lower_scores_detached) + lower_scores.detach()
 
         lower_mean_coherence = lower_scores.mean()
         cross_level_penalty = 1.0 - lower_mean_coherence
 
         return in_level_coherence_loss, cross_level_penalty
-        
-        
+    
     
     def _denoise_and_reconstruct(
         self, 
@@ -399,9 +625,10 @@ class ZonkeyLayer(nn.Module):
                 segment_label = t_exp * is_real_label + (1 - t_exp) * previous_is_real_label
                 
                 # Compute BCE loss with interpolated labels
-                dbos_ce_loss = bce(is_real_inferred, segment_label, reduction='none')[:, 1:].mean()
+                dbos_ce_loss = bce(is_real_inferred, segment_label, reduction='none')[:, 1:].mean() - bce(segment_label, segment_label, reduction='none')[:, 1:].mean()
             else:
-                dbos_ce_loss = bce(is_real_inferred, is_real_label, reduction='none')[:, 1:].mean()
+                dbos_ce_loss = bce(is_real_inferred, is_real_label, reduction='none')[:, 1:].mean() - bce(is_real_label, is_real_label, reduction='none')[:, 1:].mean()
+
 
             #not accounting for splitter_existence_share in this loss, if position K has 100% chance of being a new sequence it means the existance share will be 0, we do not want to multiply the need for a stop signal by 0
             # existence_loss = (is_real_inferred.sum(dim=1) - is_real_label.sum(dim=1)).abs().mean() / Config.MAX_SEQ_LENGTHS[self.level]
@@ -415,8 +642,8 @@ class ZonkeyLayer(nn.Module):
                 losses["stitcher_position_loss"] = stitcher_position_loss
                 losses["stitcher_sequence_loss"] = stitcher_sequence_loss * 0.01 * (1-noise_level).mean()
 
-            in_level_coherence_loss, cross_level_penalty = self.get_level_coherence_loss(compressed, 7)
-            losses["in_level_coherence_loss"] = in_level_coherence_loss
+            in_level_coherence_loss, cross_level_penalty = self.get_level_coherence_loss(compressed.detach(), 8)
+            losses["in_level_coherence_loss"] = in_level_coherence_loss * 0.3
             losses["cross_level_penalty"] = cross_level_penalty
         
         return denoised, losses, is_real_inferred
@@ -599,7 +826,7 @@ class ZonkeyLayer(nn.Module):
         # Calculate mean cosine similarity between different batch elements
 
         # t1 = self.noise_schedule(torch.rand_like(t0))
-        t1 = torch.rand_like(t0)
+        t1 = torch.sqrt(torch.rand_like(t0))
         denoised , noisy_losses, is_real_inferred = self.denoise_and_reconstruct(
             compressed, noise_level=t1,
         )

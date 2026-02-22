@@ -47,7 +47,7 @@ def calculate_reconstruction_loss(
     
     denoised_flat = denoised.reshape(-1, hidden)
     target_flat = target_sequences.reshape(-1, hidden)
-    is_real_flat = torch.sigmoid(is_real_inferred).reshape(-1)
+    is_real_flat = is_real_inferred.reshape(-1)
     
     N = batch * seq_len
     

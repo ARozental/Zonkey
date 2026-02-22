@@ -105,71 +105,62 @@ class Stitcher(nn.Module):
         res = denoised_input_sequence1 + self.refiner_portion * self.refiner.cross_encode(denoised_input_sequence1, denoised_input_sequence2, denoised_is_real_position1, denoised_is_real_position2)
         res = F.normalize(res,p=2,dim=-1) * self.dim_norm
         return res
+
     def get_position_loss(self, denoised2_start_position, inferred_denoised2_start_position, p_exist_share1):
         """
-        Compute position loss for batch of sequences.
-        The loss measures the total importance (sum of p_exist_share) in the ERROR range.
-        Being off by positions with high exist_share is more costly than positions with low exist_share.
-        Handles fractional positions correctly - goes to 0 when positions match exactly.
-        
-        Args:
-            denoised2_start_position: [batch] or [batch, 1] - true start position (float)
-            inferred_denoised2_start_position: [batch] - inferred start position (float)
-            p_exist_share1: [batch, seq_len] - importance weights for each position
-        Returns:
-            [batch] tensor of losses
+        Your original weighted interval loss + per-sentence normalization (your idea 1).
+        Sum before true start = 1, sum after true start = 1, then scale back by total A.
         """
         batch_size = p_exist_share1.shape[0]
         seq_len = p_exist_share1.shape[1]
         
-        start_pos = denoised2_start_position.float().view(batch_size)
-        inferred_pos = inferred_denoised2_start_position
+        true_pos = denoised2_start_position.float().view(batch_size)
+        inf_pos = inferred_denoised2_start_position.float().view(batch_size)
         
-        # Compute the range of the error
-        min_pos = torch.min(start_pos, inferred_pos)  # [batch]
-        max_pos = torch.max(start_pos, inferred_pos)  # [batch]
+        # A = total importance per sentence
+        A = p_exist_share1.sum(dim=1, keepdim=True)
         
-        # Integer position indices
-        indices = torch.arange(seq_len, dtype=torch.float32, device=p_exist_share1.device).unsqueeze(0)  # [1, seq_len]
-        indices_expanded = indices.expand(batch_size, -1)  # [batch, seq_len]
+        # Masks for before and after the true start position
+        indices = torch.arange(seq_len, dtype=torch.float32, device=p_exist_share1.device).unsqueeze(0).expand(batch_size, -1)
         
-        floor_min = torch.floor(min_pos).unsqueeze(1)  # [batch, 1]
-        floor_max = torch.floor(max_pos).unsqueeze(1)  # [batch, 1]
+        mask_before = (indices < true_pos.unsqueeze(1)).float()
+        mask_after  = (indices >= true_pos.unsqueeze(1)).float()
         
-        # Check if both positions are in the same integer bucket
-        same_bucket = (floor_min == floor_max)  # [batch, 1]
+        # Normalize before and after separately to sum to 1
+        sum_before = (p_exist_share1 * mask_before).sum(dim=1, keepdim=True) + Config.EPS
+        sum_after  = (p_exist_share1 * mask_after ).sum(dim=1, keepdim=True) + Config.EPS
         
-        # Fractional parts
-        frac_min = min_pos.unsqueeze(1) - floor_min  # [batch, 1]
-        frac_max = max_pos.unsqueeze(1) - floor_max  # [batch, 1]
+        normalized_p = p_exist_share1.clone()
+        normalized_p = normalized_p * mask_before / sum_before + normalized_p * mask_after / sum_after
         
-        # Initialize weights
-        weights = torch.zeros_like(indices_expanded)  # [batch, seq_len]
+        # Scale back by total A
+        normalized_p = normalized_p * A
         
-        # Case 1: Both positions in same integer bucket
-        # Weight = (max_pos - min_pos) for that bucket only
-        same_bucket_mask = same_bucket & (indices_expanded == floor_min)
+        # Now compute the error interval with the normalized weights (same logic as your original)
+        min_pos = torch.min(true_pos, inf_pos)
+        max_pos = torch.max(true_pos, inf_pos)
+        
+        weights = torch.zeros_like(indices)
+        
+        same_bucket = (torch.floor(min_pos).unsqueeze(1) == torch.floor(max_pos).unsqueeze(1))
+        
+        same_bucket_mask = same_bucket & (indices == torch.floor(min_pos).unsqueeze(1))
         weights = torch.where(same_bucket_mask, (max_pos - min_pos).unsqueeze(1), weights)
         
-        # Case 2: Positions span multiple buckets
-        # Full positions: completely within the error range (floor_min < i < floor_max)
-        mask_full = ~same_bucket & (indices_expanded > floor_min) & (indices_expanded < floor_max)
+        mask_full = ~same_bucket & (indices > torch.floor(min_pos).unsqueeze(1)) & (indices < torch.floor(max_pos).unsqueeze(1))
         weights = torch.where(mask_full, torch.ones_like(weights), weights)
         
-        # Fractional contribution from min_pos bucket (if not same bucket)
-        min_bucket_mask = ~same_bucket & (indices_expanded == floor_min)
-        weights = torch.where(min_bucket_mask, (1.0 - frac_min), weights)
+        min_bucket_mask = ~same_bucket & (indices == torch.floor(min_pos).unsqueeze(1))
+        weights = torch.where(min_bucket_mask, 1.0 - (min_pos.unsqueeze(1) - torch.floor(min_pos).unsqueeze(1)), weights)
         
-        # Fractional contribution from max_pos bucket (if not same bucket)
-        max_bucket_mask = ~same_bucket & (indices_expanded == floor_max)
-        weights = torch.where(max_bucket_mask, frac_max, weights)
+        max_bucket_mask = ~same_bucket & (indices == torch.floor(max_pos).unsqueeze(1))
+        weights = torch.where(max_bucket_mask, max_pos.unsqueeze(1) - torch.floor(max_pos).unsqueeze(1), weights)
         
-        # Sum the weighted importance in the error range
-        # This goes to 0 when positions match exactly (min_pos == max_pos => weights all 0)
-        position_sum = (p_exist_share1 * weights).sum(dim=1)
-                
-        return (position_sum / (p_exist_share1.sum(dim=1)+Config.EPS))
-
+        position_sum = (normalized_p * weights).sum(dim=1)
+        interval_loss = position_sum / (A.squeeze(1) + Config.EPS)
+        
+        return interval_loss
+    
     def get_sequence_loss(self, inferred_input_sequence1, original_input_sequence1, p_exist_share1, all_tokens=None, is_real_inferred1=None, previous_denoised1=None):
         """
         This works at a single doc level now. 
