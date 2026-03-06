@@ -238,8 +238,14 @@ class PlZonkey(pl.LightningModule):
                         print("-----")    
                         print(f"decompressing from level {level}: ")
                         self.model.generate_sequence_from_level_N(level,fixed_compressed_vectors=leveled_compressed[level][0][0:1])
+                        if len(leveled_compressed[level])>1 and level>0:
+                            print(f"decompressing from level {level} s2: ")
+                            self.model.generate_sequence_from_level_N(level,fixed_compressed_vectors=leveled_compressed[level][0][1:2])
+
                         print(f"decompressing from level {level} with {Config.NOISE_LAST_STEP_SIZE[level]} noise: ")
-                        self.model.generate_sequence_from_level_N(level,fixed_compressed_vectors=leveled_compressed[level][0][0:1],noise_level=Config.NOISE_LAST_STEP_SIZE[level])
+                        noise_level = torch.full((leveled_compressed[level].shape[0],), Config.NOISE_LAST_STEP_SIZE[level], device=leveled_compressed[level].device, dtype=leveled_compressed[level].dtype)
+                        leveled_compressed_temp = self.model.layers[level].add_noise(leveled_compressed[level],noise_level)
+                        self.model.generate_sequence_from_level_N(level,fixed_compressed_vectors=leveled_compressed_temp[0][0:1],noise_level=Config.NOISE_LAST_STEP_SIZE[level])
                         print(f"random seq from level {level}: ")
                         self.model.generate_sequence_from_level_N(level,num_diffusion_steps=50,noise_level=1.0)
 

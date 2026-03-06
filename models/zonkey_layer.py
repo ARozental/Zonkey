@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from configs.default_config import Config
-from models.transformer import TransformerDecoder,TransformerEncoder
+from models.transformer import TransformerDecoder,TransformerEncoder,AutoregressiveDecoder
 from typing import Tuple, Optional
 import math
 import torch.nn.functional as F
@@ -114,6 +114,8 @@ class ZonkeyLayer(nn.Module):
             init_scale = 0.5,
             num_layers = Config.NUM_DECOMPRESSOR_LAYERS[level]
             )
+        self.ar_decoder = AutoregressiveDecoder(decompressor=self.decompressor, denoiser=self.denoiser) #no new weights here
+
 
 
         if self.level != Config.AGENT_LEVELS - 1:
@@ -587,6 +589,28 @@ class ZonkeyLayer(nn.Module):
             return denoised, None, is_real_inferred
         
         if clean:
+            # === AR auxiliary loss using ONLY denoiser layers as causal decoder ===
+            ar_input = input_sequence[:, :-1, :].detach()
+
+            ar_output = self.ar_decoder(ar_input)
+            ar_output = F.normalize(ar_output, p=2, dim=-1) * self.dim_norm
+
+            ar_pred = ar_output
+            ar_is_real = self.bos_probs_to_inferred_real_position(all_sentence_bos_probs[:, 1:])
+            ar_exist = splitter_existence_share[:, 1:]
+
+            if self.level == 0:
+                autoregressive_loss, _ = calculate_token_loss(
+                    token_ids[:, 1:], ar_pred, ar_exist, self.previous_layer)
+            else:
+                autoregressive_loss, _ = calculate_reconstruction_loss(
+                    denoised=ar_pred,
+                    is_real_inferred=ar_is_real,
+                    target_sequences=input_sequence[:, 1:, :],
+                    splitter_existence_share=ar_exist,
+                    previous_denoised=None,
+                    fake_negatives=fake_negatives)
+
             reconstructed_docs, stitcher_position_loss, stitcher_sequence_loss = self.stitcher(
                 denoised, is_real_inferred, num_sentences_per_doc, original_position=original_position, 
                 original_input_sequences=input_sequence, all_p_exist_share=splitter_existence_share, all_tokens=token_ids,
@@ -602,9 +626,9 @@ class ZonkeyLayer(nn.Module):
                     previous_is_real_label = self.bos_probs_to_inferred_real_position(previous_bos_probability)
             
             if self.level == 0:
-                reconstruction_loss = calculate_token_loss(token_ids, denoised, splitter_existence_share, 
-                                                        self.previous_layer)
-                optimal_t = None
+                reconstruction_loss, optimal_t = calculate_token_loss(
+                    token_ids, denoised, splitter_existence_share, 
+                    self.previous_layer, previous_denoised=previous_denoised)
             else:
                 reconstruction_loss, optimal_t = calculate_reconstruction_loss(
                     denoised=denoised, 
@@ -636,15 +660,17 @@ class ZonkeyLayer(nn.Module):
 
             losses = {
             "reconstruction_loss": reconstruction_loss,
-            "bos_loss": dbos_ce_loss*Config.EXISTS_WEIGHT[self.level]
+            "bos_loss": dbos_ce_loss*Config.EXISTS_WEIGHT[self.level],
         }
             if clean:
+                losses["autoregressive_loss"] = autoregressive_loss
                 losses["stitcher_position_loss"] = stitcher_position_loss
                 losses["stitcher_sequence_loss"] = stitcher_sequence_loss * 0.01 * (1-noise_level).mean()
+                
 
-            in_level_coherence_loss, cross_level_penalty = self.get_level_coherence_loss(compressed.detach(), 8)
-            losses["in_level_coherence_loss"] = in_level_coherence_loss * 0.3
-            losses["cross_level_penalty"] = cross_level_penalty
+            # in_level_coherence_loss, cross_level_penalty = self.get_level_coherence_loss(compressed.detach(), 8)
+            # losses["in_level_coherence_loss"] = in_level_coherence_loss * 0.3
+            # losses["cross_level_penalty"] = cross_level_penalty
         
         return denoised, losses, is_real_inferred
 
@@ -883,10 +909,11 @@ class ZonkeyLayer(nn.Module):
             "clean_reconstruction_loss": clean_losses["reconstruction_loss"] * Config.DIRTY_RECONSTRUCTION_WEIGHT[self.level] ,
             "clean_stitcher_position_loss": clean_losses["stitcher_position_loss"],
             "clean_stitcher_sequence_loss": clean_losses["stitcher_sequence_loss"],
-            "in_level_coherence_loss": clean_losses["in_level_coherence_loss"],
-            "cross_level_coherence_loss": clean_losses["cross_level_penalty"],
+            # "in_level_coherence_loss": clean_losses["in_level_coherence_loss"],
+            # "cross_level_coherence_loss": clean_losses["cross_level_penalty"],
             "dirty_bos_loss": dirty_losses["bos_loss"],
             "dirty_reconstruction_loss": dirty_losses["reconstruction_loss"] * Config.DIRTY_RECONSTRUCTION_WEIGHT[self.level],
+            "clean_autoregressive_loss": clean_losses["autoregressive_loss"]
         }
 
         return denoised2[:input_sequence.shape[0]], clean_compressed, losses, is_real_inferred, fake_negatives_for_upper
@@ -946,6 +973,8 @@ class ZonkeyLayer(nn.Module):
         
         losses["avg_bos_prob"] = bos_per_position.detach()
         wanted_bos_prob = 1/Config.MAX_SEQ_LENGTHS[self.level]
+        if self.level == 1:
+            wanted_bos_prob = 0.1 #this is a hack as setting bos weight even as low as 0 doesn't make it jump up with the autoregressive loss that likes long texts
         bos_per_position = torch.maximum(bos_per_position, torch.tensor(wanted_bos_prob, device=bos_per_position.device))
         losses["average_bos_loss"] = ((bos_per_position+1-wanted_bos_prob)**2 - 1)*Config.COMPRESSION_PENALTY[self.level]
         
@@ -954,6 +983,7 @@ class ZonkeyLayer(nn.Module):
         losses["clean_stitcher_sequence_loss"] = losses["clean_stitcher_sequence_loss"] * (bos_per_position+0.1) / (wanted_bos_prob+0.1) 
         losses["dirty_bos_loss"] = losses["dirty_bos_loss"] * (bos_per_position+0.1) / (wanted_bos_prob+0.1) 
         losses["dirty_reconstruction_loss"] = losses["dirty_reconstruction_loss"] * (bos_per_position+0.1) / (wanted_bos_prob+0.1) 
+        losses["clean_autoregressive_loss"] = losses["clean_autoregressive_loss"] * (bos_per_position+0.1) / (wanted_bos_prob+0.1) 
 
         losses["patch_loss"] = patch_loss*10
         losses["short_sentence_loss"] = short_sentence_loss*10

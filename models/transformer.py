@@ -772,6 +772,10 @@ class Transformer(nn.Module):
         x = self.last_layer_norm(x)
         return x
     
+    def forward(self, x: torch.Tensor, existence_probs: torch.Tensor, is_linear: bool = False, noise_level: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Forward method - matches Transformer behavior exactly."""
+        return self.encode(x, existence_probs, is_linear=is_linear, noise_level=noise_level)
+    
     def decode(self, x: torch.Tensor) -> torch.Tensor:
         """Decode method - matches TransformerDecoder behavior exactly."""
         for i, layer in enumerate(self.layers):
@@ -831,6 +835,53 @@ class Transformer(nn.Module):
             count += 1
         
         return generated
+
+class AutoregressiveDecoder:
+    """Uses ONLY the denoiser layers in strict causal mode for the auxiliary AR loss.
+    Supports decompressor=None so we only train the denoiser autoregressively."""
+    
+    def __init__(self, decompressor, denoiser):
+        if decompressor is None:
+            self.all_layers = list(denoiser.layers)
+        else:
+            self.all_layers = list(decompressor.layers) + list(denoiser.layers)
+        self.last_norm = denoiser.last_layer_norm
+        self.num_layers = len(self.all_layers)
+    
+    def __call__(self, x):
+        return self.forward_full(x)
+    
+    def forward_full(self, x):
+        """Teacher-forced causal forward using only the selected layers."""
+        for layer in self.all_layers:
+            residual = x
+            normed = layer.norm1(x)
+            attn = layer.self_attn
+            B, L, D = normed.shape
+
+            qkv = attn.W_qkv(normed)
+            qkv = qkv.reshape(B, L, 3, attn.n_heads, attn.d_k).permute(2, 0, 3, 1, 4)
+            Q, K, V = qkv[0], qkv[1], qkv[2]
+            Q = attn.pos(Q, L)
+            K = attn.pos(K, L)
+
+            attn_out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
+
+            if hasattr(attn, 'gate_proj') and attn.gate_proj is not None:
+                gate = torch.sigmoid(
+                    attn.gate_proj(normed).view(B, L, attn.n_heads, attn.d_k).transpose(1, 2)
+                )
+                attn_out = attn_out * gate
+
+            attn_out = attn_out.transpose(1, 2).contiguous().view(B, L, D)
+            x = residual + attn.W_o(attn_out)
+
+            residual = x
+            x = layer.norm2(x)
+            x = layer.ff(x)
+            x = residual + x
+
+        return self.last_norm(x)
 
 # Backward compatibility classes that use the unified Transformer
 class TransformerEncoder(Transformer):

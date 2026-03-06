@@ -176,7 +176,7 @@ class Stitcher(nn.Module):
                 num_negatives=63
             )
         else:
-            loss = calculate_token_loss(all_tokens, inferred_input_sequence1, p_exist_share1, self.token_embedding_layer)
+            loss, _ = calculate_token_loss(all_tokens, inferred_input_sequence1, p_exist_share1, self.token_embedding_layer)
         
         return loss
 

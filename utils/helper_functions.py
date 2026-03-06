@@ -456,3 +456,93 @@ def start_tensorboard(logdir, port):
             break
     else:
         print(f"Warning: TensorBoard did not start within expected time. See {log_file} for details.")
+
+def slerp(a: torch.Tensor, b: torch.Tensor, t: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    Spherical Linear Interpolation (great-circle arc).
+    Clean, explicit broadcasting — no loops, no dynamic dim checks.
+    """
+    a_unit = F.normalize(a, p=2, dim=-1)
+    b_unit = F.normalize(b, p=2, dim=-1)
+
+    cos_omega = torch.sum(a_unit * b_unit, dim=-1, keepdim=True).clamp_(-1.0 + eps, 1.0 - eps)
+    omega = torch.acos(cos_omega)
+    sin_omega = torch.sin(omega) + eps
+
+    # Explicit broadcasting: add trailing singleton dimensions to match a.shape[:-1]
+    t = t.view(*t.shape, *[1] * (a.dim() - t.dim()))
+
+    sin_onem_t = torch.sin((1.0 - t) * omega)
+    sin_t      = torch.sin(t * omega)
+
+    result_unit = (sin_onem_t * a_unit + sin_t * b_unit) / sin_omega
+
+    # Safe radius extraction (works on expanded tensors)
+    radius = torch.norm(a.flatten(start_dim=0, end_dim=-2)[0], p=2)
+
+    return result_unit * radius
+
+
+def arc_cosine_similarity_seq(input_sequence, high_noise_input, low_noise_input, splitter_existence_share):
+    """
+    Exact same API and return shapes as segment_cosine_similarity_seq,
+    but uses the true great-circle arc (SLERP) instead of the chord.
+    """
+    eps = 1e-6
+    batch, seq_len, hidden_dim = input_sequence.shape
+
+    weights = splitter_existence_share / (splitter_existence_share.sum(dim=1, keepdim=True) + eps)
+
+    # Fast chord-based candidates (excellent heuristic for the arc)
+    d = low_noise_input - input_sequence
+    h_dot_a = torch.sum(high_noise_input * input_sequence, dim=-1)
+    h_dot_d = torch.sum(high_noise_input * d, dim=-1)
+    a_dot_a = torch.sum(input_sequence * input_sequence, dim=-1)
+    a_dot_d = torch.sum(input_sequence * d, dim=-1)
+    d_dot_d = torch.sum(d * d, dim=-1)
+
+    numerator = h_dot_d * a_dot_a - h_dot_a * a_dot_d
+    denominator = h_dot_a * d_dot_d - h_dot_d * a_dot_d
+    t_per_position = numerator / (denominator + eps)
+    t_per_position = torch.nan_to_num(t_per_position, nan=0.5, posinf=0.5, neginf=0.5)
+    t_per_position = torch.clamp(t_per_position, 0.0, 1.0)
+
+    combined_weights = weights * (torch.abs(h_dot_d) + eps)
+    combined_weights = combined_weights / (combined_weights.sum(dim=1, keepdim=True) + eps)
+    t_interior = (t_per_position * combined_weights).sum(dim=1)
+    t_interior = torch.clamp(t_interior, 0.0, 1.0)
+
+    t_candidates = torch.stack([
+        torch.zeros(batch, device=input_sequence.device),
+        torch.ones(batch, device=input_sequence.device),
+        t_interior
+    ], dim=0)  # (3, batch)
+
+    # === Candidates on the arc ===
+    t_exp = t_candidates.view(3, batch, 1).expand(3, batch, seq_len)   # explicit (3, batch, seq_len)
+    arc_points = slerp(
+        input_sequence.unsqueeze(0).expand(3, -1, -1, -1),
+        low_noise_input.unsqueeze(0).expand(3, -1, -1, -1),
+        t_exp
+    )
+
+    cos_sims = F.cosine_similarity(
+        high_noise_input.unsqueeze(0).expand(3, -1, -1, -1),
+        arc_points,
+        dim=-1
+    )
+
+    weights_exp = weights.unsqueeze(0)
+    mean_sims = (cos_sims * weights_exp).sum(dim=2)  # (3, batch)
+
+    best_idx = torch.argmax(mean_sims, dim=0)
+    best_t = t_candidates[best_idx, torch.arange(batch, device=input_sequence.device)]
+
+    # === Final optimal point ===
+    best_t_exp = best_t.view(batch, 1, 1)   # explicit (batch, 1, 1)
+    optimal_point = slerp(input_sequence, low_noise_input, best_t_exp)
+
+    final_cos_sim = F.cosine_similarity(high_noise_input, optimal_point, dim=-1)
+    final_cos_sim = torch.clamp(final_cos_sim, -1.0, 1.0)
+
+    return final_cos_sim, optimal_point, best_t
