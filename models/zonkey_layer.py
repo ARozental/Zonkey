@@ -143,40 +143,52 @@ class ZonkeyLayer(nn.Module):
     def noise_schedule(self, t: torch.Tensor) -> torch.Tensor:
         return t
     
+    # def add_noise(self, x: torch.Tensor, noise_level: torch.Tensor) -> torch.Tensor:
+    #     """
+    #     noise_level means "1 - expected cosine similarity".
+    #     So noise_level=0.1 → expected cosine ≈ 0.9
+    #     noise_level=0.04 → expected cosine ≈ 0.96
+        
+    #     Internally converts to signal_strength = (1 - noise_level)^2
+    #     to achieve approximately the desired expected cosine after renormalization.
+    #     """
+    #     # Clamp noise_level to valid range [0, 1]
+    #     nl = noise_level.clamp_(0.0, 1.0 - 1e-6)
+        
+    #     # Desired expected cosine similarity
+    #     target_cosine = 1.0 - nl
+        
+    #     # Convert to signal & noise strengths (variance-preserving)
+    #     # signal_strength = target_cosine ** 2   → gives E[cos] ≈ target_cosine
+    #     signal_strength = target_cosine * target_cosine
+    #     noise_strength = 1.0 - signal_strength
+
+    #     # Generate isotropic Gaussian noise
+    #     noise = torch.randn_like(x)
+
+    #     # Forward diffusion step
+    #     noisy = (
+    #         torch.sqrt(signal_strength).view(-1, 1, 1) * x +
+    #         torch.sqrt(noise_strength).view(-1, 1, 1) * noise
+    #     )
+
+    #     # Renormalize to your fixed expected norm
+    #     batch_size = noisy.shape[0]
+    #     noisy_flat = noisy.view(batch_size, -1)
+    #     noisy_flat = F.normalize(noisy_flat, p=2, dim=-1) * self.upwards_norm
+
+    #     return noisy_flat.view_as(noisy)
+    
     def add_noise(self, x: torch.Tensor, noise_level: torch.Tensor) -> torch.Tensor:
-        """
-        noise_level means "1 - expected cosine similarity".
-        So noise_level=0.1 → expected cosine ≈ 0.9
-        noise_level=0.04 → expected cosine ≈ 0.96
-        
-        Internally converts to signal_strength = (1 - noise_level)^2
-        to achieve approximately the desired expected cosine after renormalization.
-        """
-        # Clamp noise_level to valid range [0, 1]
-        nl = noise_level.clamp_(0.0, 1.0 - 1e-6)
-        
-        # Desired expected cosine similarity
-        target_cosine = 1.0 - nl
-        
-        # Convert to signal & noise strengths (variance-preserving)
-        # signal_strength = target_cosine ** 2   → gives E[cos] ≈ target_cosine
-        signal_strength = target_cosine * target_cosine
-        noise_strength = 1.0 - signal_strength
-
-        # Generate isotropic Gaussian noise
-        noise = torch.randn_like(x)
-
-        # Forward diffusion step
-        noisy = (
-            torch.sqrt(signal_strength).view(-1, 1, 1) * x +
-            torch.sqrt(noise_strength).view(-1, 1, 1) * noise
-        )
-
-        # Renormalize to your fixed expected norm
-        batch_size = noisy.shape[0]
-        noisy_flat = noisy.view(batch_size, -1)
+        nl = torch.clamp(noise_level, min=0.0, max=1.0)
+        beta = Config.BETA[self.level]
+        target_cosine = torch.exp(-beta * nl)
+        signal = target_cosine.view(-1, 1, 1)
+        noise_std = torch.sqrt(1.0 - target_cosine**2 + 1e-8).view(-1, 1, 1)
+        noisy = signal * x + noise_std * torch.randn_like(x)
+        # Same pattern as original: flatten → normalize → reshape back
+        noisy_flat = noisy.view(noisy.shape[0], -1)
         noisy_flat = F.normalize(noisy_flat, p=2, dim=-1) * self.upwards_norm
-
         return noisy_flat.view_as(noisy)
     
     def compress(self, x: torch.Tensor, existence_probs: torch.Tensor) -> torch.Tensor:
@@ -599,17 +611,18 @@ class ZonkeyLayer(nn.Module):
             ar_is_real = self.bos_probs_to_inferred_real_position(all_sentence_bos_probs[:, 1:])
             ar_exist = splitter_existence_share[:, 1:]
 
-            if self.level == 0:
-                autoregressive_loss, _ = calculate_token_loss(
-                    token_ids[:, 1:], ar_pred, ar_exist, self.previous_layer)
-            else:
-                autoregressive_loss, _ = calculate_reconstruction_loss(
-                    denoised=ar_pred,
-                    is_real_inferred=ar_is_real,
-                    target_sequences=input_sequence[:, 1:, :],
-                    splitter_existence_share=ar_exist,
-                    previous_denoised=None,
-                    fake_negatives=fake_negatives)
+            #clipping only for Autoregressive at 0.2 to disrupt mode collapse on tail
+            # if self.level == 0:
+            #     autoregressive_loss, _ = calculate_token_loss(
+            #         token_ids[:, 1:], ar_pred, ar_exist.clip(min=0.2), self.previous_layer)
+            # else:
+            #     autoregressive_loss, _ = calculate_reconstruction_loss(
+            #         denoised=ar_pred,
+            #         is_real_inferred=ar_is_real.clip(min=0.2),
+            #         target_sequences=input_sequence[:, 1:, :],
+            #         splitter_existence_share=ar_exist.clip(min=0.2),
+            #         previous_denoised=None,
+            #         fake_negatives=fake_negatives)
 
             reconstructed_docs, stitcher_position_loss, stitcher_sequence_loss = self.stitcher(
                 denoised, is_real_inferred, num_sentences_per_doc, original_position=original_position, 
@@ -663,7 +676,7 @@ class ZonkeyLayer(nn.Module):
             "bos_loss": dbos_ce_loss*Config.EXISTS_WEIGHT[self.level],
         }
             if clean:
-                losses["autoregressive_loss"] = autoregressive_loss
+                # losses["autoregressive_loss"] = autoregressive_loss
                 losses["stitcher_position_loss"] = stitcher_position_loss
                 losses["stitcher_sequence_loss"] = stitcher_sequence_loss * 0.01 * (1-noise_level).mean()
                 
@@ -807,8 +820,8 @@ class ZonkeyLayer(nn.Module):
                          ) -> torch.Tensor:
         input_sequence = F.normalize(input_sequence, p=2, dim=-1) * self.dim_norm
 
-        if token_ids is None:
-            mlm_loss = self.calculate_mlm_loss(
+        
+        mlm_loss = self.calculate_mlm_loss(
                 input_sequence,
                 is_real_inferred,
                 splitter_existence_share,
@@ -819,8 +832,22 @@ class ZonkeyLayer(nn.Module):
                 num_negatives=100,
                 fake_negatives=fake_negatives,
             )
-        else:
-            mlm_loss = torch.zeros(1, device=input_sequence.device).mean()
+
+        
+        # if token_ids is None:
+        #     mlm_loss = self.calculate_mlm_loss(
+        #         input_sequence,
+        #         is_real_inferred,
+        #         splitter_existence_share,
+        #         doc_sequences,
+        #         is_real_doc_position_boolean,
+        #         original_position,
+        #         replacement_prob=0.2,
+        #         num_negatives=100,
+        #         fake_negatives=fake_negatives,
+        #     )
+        # else:
+        #     mlm_loss = torch.zeros(1, device=input_sequence.device).mean()
         
         if mlm_only:
             return None, None, {"clean_mlm_loss": mlm_loss}, None, None
@@ -852,7 +879,8 @@ class ZonkeyLayer(nn.Module):
         # Calculate mean cosine similarity between different batch elements
 
         # t1 = self.noise_schedule(torch.rand_like(t0))
-        t1 = torch.sqrt(torch.rand_like(t0))
+        # t1 = torch.sqrt(torch.rand_like(t0))
+        t1 = 1 - torch.exp(-Config.BETA[self.level] * torch.rand_like(t0))
         denoised , noisy_losses, is_real_inferred = self.denoise_and_reconstruct(
             compressed, noise_level=t1,
         )
@@ -913,7 +941,7 @@ class ZonkeyLayer(nn.Module):
             # "cross_level_coherence_loss": clean_losses["cross_level_penalty"],
             "dirty_bos_loss": dirty_losses["bos_loss"],
             "dirty_reconstruction_loss": dirty_losses["reconstruction_loss"] * Config.DIRTY_RECONSTRUCTION_WEIGHT[self.level],
-            "clean_autoregressive_loss": clean_losses["autoregressive_loss"]
+            # "clean_autoregressive_loss": clean_losses["autoregressive_loss"]
         }
 
         return denoised2[:input_sequence.shape[0]], clean_compressed, losses, is_real_inferred, fake_negatives_for_upper
@@ -972,18 +1000,15 @@ class ZonkeyLayer(nn.Module):
         stitched_docs, total_position_loss, total_sequence_loss = self.stitcher(all_sentence_vectors, is_real_inferred, num_sentences_per_doc, original_position=original_position, original_input_sequences=all_sentence_vectors,all_p_exist_share=all_p_exist_share,all_tokens=all_tokens)
         
         losses["avg_bos_prob"] = bos_per_position.detach()
-        wanted_bos_prob = 1/Config.MAX_SEQ_LENGTHS[self.level]
-        if self.level == 1:
-            wanted_bos_prob = 0.1 #this is a hack as setting bos weight even as low as 0 doesn't make it jump up with the autoregressive loss that likes long texts
+        wanted_bos_prob = 2/Config.MAX_SEQ_LENGTHS[self.level]
         bos_per_position = torch.maximum(bos_per_position, torch.tensor(wanted_bos_prob, device=bos_per_position.device))
         losses["average_bos_loss"] = ((bos_per_position+1-wanted_bos_prob)**2 - 1)*Config.COMPRESSION_PENALTY[self.level]
         
-        losses["clean_reconstruction_loss"] = losses["clean_reconstruction_loss"] * (bos_per_position+0.1) / (wanted_bos_prob+0.1) 
+        losses["clean_reconstruction_loss"] = losses["clean_reconstruction_loss"] * (bos_per_position+0.1) / (wanted_bos_prob+0.1) * (2*Config.NOISE_STEP_SIZE[self.level])
         losses["clean_stitcher_position_loss"] = losses["clean_stitcher_position_loss"] * (bos_per_position+0.1) / (wanted_bos_prob+0.1) 
         losses["clean_stitcher_sequence_loss"] = losses["clean_stitcher_sequence_loss"] * (bos_per_position+0.1) / (wanted_bos_prob+0.1) 
         losses["dirty_bos_loss"] = losses["dirty_bos_loss"] * (bos_per_position+0.1) / (wanted_bos_prob+0.1) 
         losses["dirty_reconstruction_loss"] = losses["dirty_reconstruction_loss"] * (bos_per_position+0.1) / (wanted_bos_prob+0.1) 
-        losses["clean_autoregressive_loss"] = losses["clean_autoregressive_loss"] * (bos_per_position+0.1) / (wanted_bos_prob+0.1) 
 
         losses["patch_loss"] = patch_loss*10
         losses["short_sentence_loss"] = short_sentence_loss*10
@@ -1098,4 +1123,27 @@ class ZonkeyLayer(nn.Module):
         existence_mask = (is_real_inferred_final > existance_cutoff).float()
 
         return denoised, existence_mask, is_real_inferred_final
-        
+
+    @torch.no_grad()
+    def ar_generate(self, max_length=None, existance_cutoff=0.1):
+        if max_length is None:
+            max_length = Config.MAX_SEQ_LENGTHS[self.level]
+
+        device = Config.DEVICE
+
+        # Start with a random normalized vector as seed
+        seed = torch.randn(1, 1, self.d_model, device=device)
+        seed = F.normalize(seed, p=2, dim=-1) * self.dim_norm
+
+        generated = seed
+        for _ in range(max_length - 1):
+            output = self.ar_decoder(generated)
+            output = F.normalize(output, p=2, dim=-1) * self.dim_norm
+            next_vec = output[:, -1:, :]
+            generated = torch.cat([generated, next_vec], dim=1)
+
+        bos_probability = self.compute_bos_probability(generated)
+        is_real_inferred = self.bos_probs_to_inferred_real_position(bos_probability)
+        existence_mask = (is_real_inferred > existance_cutoff).float()
+
+        return generated, existence_mask, is_real_inferred

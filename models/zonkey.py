@@ -60,9 +60,9 @@ class PlZonkey(pl.LightningModule):
 
             # Replicate the same loss aggregation as training_step
             total_loss = torch.zeros(1, device=device)
-            for l in range(len(leveled_losses) - 1):
-                leveled_losses[l]["clean_mlm_loss"] = leveled_losses[l + 1]["clean_mlm_loss"]
-            del leveled_losses[len(leveled_losses) - 1]["clean_mlm_loss"]
+            # for l in range(len(leveled_losses) - 1):
+            #     leveled_losses[l]["clean_mlm_loss"] = leveled_losses[l + 1]["clean_mlm_loss"]
+            # del leveled_losses[len(leveled_losses) - 1]["clean_mlm_loss"]
 
             for l in range(len(leveled_losses)):
                 vals = []
@@ -247,7 +247,9 @@ class PlZonkey(pl.LightningModule):
                         leveled_compressed_temp = self.model.layers[level].add_noise(leveled_compressed[level],noise_level)
                         self.model.generate_sequence_from_level_N(level,fixed_compressed_vectors=leveled_compressed_temp[0][0:1],noise_level=Config.NOISE_LAST_STEP_SIZE[level])
                         print(f"random seq from level {level}: ")
-                        self.model.generate_sequence_from_level_N(level,num_diffusion_steps=50,noise_level=1.0)
+                        self.model.generate_sequence_from_level_N(level,num_diffusion_steps=250,noise_level=1.0)
+                        print(f"ar random seq from level {level}: ")
+                        self.model.ar_generate_sequence_from_level_N(level)
 
                 
                     # Clean up generation artifacts to free GPU memory
@@ -268,9 +270,9 @@ class PlZonkey(pl.LightningModule):
         total_loss = 0
         
         # Moving the MLM down a level for leveled weight calculations
-        for l in range(len(leveled_losses)-1):
-            leveled_losses[l]["clean_mlm_loss"] = leveled_losses[l+1]["clean_mlm_loss"]
-        del leveled_losses[len(leveled_losses)-1]["clean_mlm_loss"]
+        # for l in range(len(leveled_losses)-1):
+        #     leveled_losses[l]["clean_mlm_loss"] = leveled_losses[l+1]["clean_mlm_loss"]
+        # del leveled_losses[len(leveled_losses)-1]["clean_mlm_loss"]
 
         # Compute total loss from all levels equally
         for l in range(len(leveled_losses)):
@@ -410,7 +412,7 @@ class Zonkey(nn.Module):
             seq, existence_mask, is_real_inferred = self.layers[N].generate(
                 fixed_compressed_vectors=doc,
                 noise_level=torch.zeros(doc.shape[0], dtype=torch.float32, device=Config.DEVICE), #just use the denoiser, no actual diffusion done
-                num_diffusion_steps=lower_diffusion_steps, #not sure if this should be 1 or 0, lets try 1 for using the autoencoder
+                num_diffusion_steps=lower_diffusion_steps, # zero here for no refinement by lower layers
                 existance_cutoff=existance_cutoff #can remove this, no need to hard code it here
                 )
             doc,_,_ = self.layers[N].stitcher(seq, is_real_inferred, torch.tensor([seq.shape[0]], dtype=torch.long, device=seq.device))
@@ -419,9 +421,25 @@ class Zonkey(nn.Module):
             doc = doc.squeeze(0)
         self.print_char_sequence(doc[:100])
         return doc
-        
-        
-    
+
+    def ar_generate_sequence_from_level_N(self, N, existance_cutoff=0.5):
+        initial_seq, existence_mask, is_real_inferred_final = self.layers[N].ar_generate()
+        doc = initial_seq.squeeze(0)[0:existence_mask.bool().sum().item(), :]
+        level = N
+        while level > 0:
+            level -= 1
+            seq, existence_mask, is_real_inferred = self.layers[level].generate(
+                fixed_compressed_vectors=doc,
+                noise_level=torch.zeros(doc.shape[0], dtype=torch.float32, device=Config.DEVICE),
+                num_diffusion_steps=0,
+                existance_cutoff=existance_cutoff
+            )
+            doc, _, _ = self.layers[level].stitcher(seq, is_real_inferred, torch.tensor([seq.shape[0]], dtype=torch.long, device=seq.device))
+            doc = self._clip_tail_by_existence(doc, level, existance_cutoff)
+            doc = doc.squeeze(0)
+        self.print_char_sequence(doc[:100])
+        return doc
+
     def forward(self, batch):
         texts = batch["full_texts"]
         token_embeddings = self.token_embedding_layer(texts)

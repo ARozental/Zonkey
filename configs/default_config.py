@@ -54,7 +54,8 @@ class Config:
     #losses
     COMPRESSED_SIM_WEIGHT = [1,1] #anti mode collapse loss weight
     DRIFTING_WEIGHT = [1.0,1.0]
-    DRIFTING_TEMPERATURE = [0.05, 0.1, 0.5]
+    DRIFTING_TEMPERATURE = [0.05, 0.1, 0.5] #remove later
+    BETA = [2.5, 3.2] #for noise schedule
     DRIFTING_NUM_RANDOM = [128,32]
     DRIFTING_QUEUE_SIZE = [8192, 2048]
     NUM_FAKE_NEGATIVES = [0, 0]  # chimeric compressed vectors created for the level above
