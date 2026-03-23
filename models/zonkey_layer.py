@@ -735,7 +735,8 @@ class ZonkeyLayer(nn.Module):
         x = torch.cat([self.compressor_cls_emd.expand(x.shape[0], -1, -1), x], dim=1)
         is_real_inferred = torch.cat([self.compressor_cls_existence_probs.expand(x.shape[0], -1), is_real_inferred], dim=1)
 
-        x = self.compressor(x, is_real_inferred)
+        # x = self.compressor(x, is_real_inferred) is replacing this good??
+        x = self.denoiser(x, is_real_inferred)
         x = x[:,Config.COMPRESSION_VECTORS[self.level]:]
         encoder_output = F.normalize(x, p=2, dim=-1) * self.dim_norm
 
@@ -1004,7 +1005,7 @@ class ZonkeyLayer(nn.Module):
         bos_per_position = torch.maximum(bos_per_position, torch.tensor(wanted_bos_prob, device=bos_per_position.device))
         losses["average_bos_loss"] = ((bos_per_position+1-wanted_bos_prob)**2 - 1)*Config.COMPRESSION_PENALTY[self.level]
         
-        losses["clean_reconstruction_loss"] = losses["clean_reconstruction_loss"] * (bos_per_position+0.1) / (wanted_bos_prob+0.1) * (2*Config.NOISE_STEP_SIZE[self.level])
+        losses["clean_reconstruction_loss"] = losses["clean_reconstruction_loss"] * (bos_per_position+0.1) / (wanted_bos_prob+0.1) * (4*Config.NOISE_STEP_SIZE[self.level])
         losses["clean_stitcher_position_loss"] = losses["clean_stitcher_position_loss"] * (bos_per_position+0.1) / (wanted_bos_prob+0.1) 
         losses["clean_stitcher_sequence_loss"] = losses["clean_stitcher_sequence_loss"] * (bos_per_position+0.1) / (wanted_bos_prob+0.1) 
         losses["dirty_bos_loss"] = losses["dirty_bos_loss"] * (bos_per_position+0.1) / (wanted_bos_prob+0.1) 
