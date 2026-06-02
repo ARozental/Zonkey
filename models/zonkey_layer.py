@@ -6,7 +6,7 @@ from typing import Tuple, Optional
 import math
 import torch.nn.functional as F
 from losses.reconstruction import calculate_reconstruction_loss,calculate_token_loss
-from utils.helper_functions import calculate_mean_similarity,expected_l2_norm,calculate_spherical_uniformity_loss,compute_drifting_loss
+from utils.helper_functions import calculate_mean_similarity,expected_l2_norm,calculate_spherical_uniformity_loss,compute_improved_coverage_loss,arc_cosine_similarity_seq
 from splitter.segment_splitter import SegmentSplitter
 from splitter.stitcher import Stitcher
 from torch.distributions import Beta
@@ -699,7 +699,12 @@ class ZonkeyLayer(nn.Module):
         replacement_prob=0.25,
         num_negatives=63,
         fake_negatives=None,
+        previous_denoised=None,
+        full_reconstruction_ratio=0.85,
+        use_compressor=False
         ):
+        if self.level == 1: #move to config, keep compatible with reconstruction
+            full_reconstruction_ratio = 0.85
         batch_size, seq_len, hidden_dim = input_sequence.shape
         doc_batch, doc_seq_len, _ = doc_sequences.shape
         device = input_sequence.device
@@ -709,16 +714,13 @@ class ZonkeyLayer(nn.Module):
         
         replace_probs = torch.rand(batch_size, seq_len, device=device)
         
-        mask_vector_expanded = self.mask_vector.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_len, hidden_dim)
-        random_vectors = torch.randn(batch_size, seq_len, hidden_dim, device=device)
-        random_vectors = F.normalize(random_vectors, p=2, dim=-1) * self.dim_norm
-        
         use_mask = replace_mask & (replace_probs < 0.8)
         use_random = replace_mask & (replace_probs >= 0.8) & (replace_probs < 0.9)
                 
-        corrupted_input = input_sequence.clone()
+        corrupted_input = input_sequence
         
         if use_mask.any():
+            mask_vector_expanded = self.mask_vector.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_len, hidden_dim)
             corrupted_input = torch.where(
                 use_mask.unsqueeze(-1),
                 mask_vector_expanded,
@@ -726,6 +728,8 @@ class ZonkeyLayer(nn.Module):
             )
         
         if use_random.any():
+            random_vectors = torch.randn(batch_size, seq_len, hidden_dim, device=device)
+            random_vectors = F.normalize(random_vectors, p=2, dim=-1) * self.dim_norm
             corrupted_input = torch.where(
                 use_random.unsqueeze(-1),
                 random_vectors,
@@ -735,8 +739,10 @@ class ZonkeyLayer(nn.Module):
         x = torch.cat([self.compressor_cls_emd.expand(x.shape[0], -1, -1), x], dim=1)
         is_real_inferred = torch.cat([self.compressor_cls_existence_probs.expand(x.shape[0], -1), is_real_inferred], dim=1)
 
-        # x = self.compressor(x, is_real_inferred) is replacing this good??
-        x = self.denoiser(x, is_real_inferred)
+        if use_compressor:
+            x = self.compressor(x, is_real_inferred)
+        else:
+            x = self.denoiser(x, is_real_inferred)
         x = x[:,Config.COMPRESSION_VECTORS[self.level]:]
         encoder_output = F.normalize(x, p=2, dim=-1) * self.dim_norm
 
@@ -760,18 +766,13 @@ class ZonkeyLayer(nn.Module):
         pos_idx = original_position_flat[:, 1]
         positive_indices = doc_idx * doc_seq_len + pos_idx
         
-        positive_targets = targets_norm[positive_indices]
-        
-        pos_sim = torch.sum(encoder_output_norm * positive_targets, dim=-1)
-        
         sample_probs = doc_mask.float()
         sample_probs = sample_probs / (sample_probs.sum() + Config.EPS)
         
+        # Draw all negatives as a flat batch (avoids expanding sample_probs to N_queries x doc_total)
         sampled_indices = torch.multinomial(
-            sample_probs.unsqueeze(0).expand(N_queries, -1),
-            num_negatives,
-            replacement=True
-        )
+            sample_probs, N_queries * num_negatives, replacement=True
+        ).reshape(N_queries, num_negatives)
         
         # Fix collisions where negative == positive (loop until none remain)
         positive_indices_exp = positive_indices.unsqueeze(1)
@@ -780,19 +781,63 @@ class ZonkeyLayer(nn.Module):
             num_collisions = collision_mask.sum().item()
             sampled_indices[collision_mask] = torch.multinomial(sample_probs, num_collisions, replacement=True)
             collision_mask = (sampled_indices == positive_indices_exp)
-        
-        neg_targets = targets_norm[sampled_indices]
-        
-        neg_sim = torch.sum(
-            encoder_output_norm.unsqueeze(1) * neg_targets,
-            dim=-1
-        )
-        
-        all_sim = torch.cat([pos_sim.unsqueeze(1), neg_sim], dim=1)
 
-        # Append fake negatives (chimeric compressed vectors from lower level)
+        # Compute full similarity matrix: (N_queries, doc_total) — much smaller than
+        # gathering (N_queries, num_neg, hidden) and doing elementwise multiply+sum.
+        full_sim = torch.matmul(encoder_output_norm, targets_norm.T)
+        pos_sim = full_sim[torch.arange(N_queries, device=device), positive_indices]
+        neg_sim = torch.gather(full_sim, 1, sampled_indices)
+        del full_sim
+
+        # Pre-normalize fake negatives if present (used in both dirty and clean paths)
+        fake_neg_norm = None
         if fake_negatives is not None and fake_negatives.shape[0] > 0:
             fake_neg_norm = F.normalize(fake_negatives, p=2, dim=-1)
+
+        if previous_denoised is not None:
+            # === Segment-based dirty MLM loss (analogous to dirty reconstruction) ===
+            # previous_denoised is sentence-level (batch_size, seq_len, hidden_dim),
+            # same shape as input_sequence / encoder_output.
+            # Use arc_cosine_similarity_seq for the positive similarity (segment-aware),
+            # direct cosine for negatives (they come from doc-level, no matching previous).
+
+            # Segment positive similarity via optimal interpolation
+            pos_sim_arc, _, optimal_t = arc_cosine_similarity_seq(
+                previous_denoised,
+                encoder_output,
+                input_sequence,
+                splitter_existence_share
+            )
+            pos_sim_arc = pos_sim_arc.reshape(-1)  # (N_queries,)
+
+            # Segment contrastive loss (segment pos + direct neg)
+            all_sim_seg = torch.cat([pos_sim_arc.unsqueeze(1), neg_sim], dim=1)
+            if fake_neg_norm is not None:
+                fake_sim = torch.matmul(encoder_output_norm, fake_neg_norm.T)
+                all_sim_seg = torch.cat([all_sim_seg, fake_sim], dim=1)
+            logits_seg = 2 * torch.atanh(torch.clamp(all_sim_seg, min=Config.EPS-1, max=1-Config.EPS))
+            labels = torch.zeros(N_queries, dtype=torch.long, device=device)
+            ce_seg = F.cross_entropy(logits_seg, labels, reduction='none')
+
+            # Direct contrastive loss (direct pos + direct neg)
+            all_sim_direct = torch.cat([pos_sim.unsqueeze(1), neg_sim], dim=1)
+            if fake_neg_norm is not None:
+                all_sim_direct = torch.cat([all_sim_direct, fake_sim], dim=1)
+            logits_direct = 2 * torch.atanh(torch.clamp(all_sim_direct, min=Config.EPS-1, max=1-Config.EPS))
+            ce_direct = F.cross_entropy(logits_direct, labels, reduction='none')
+
+            # Blend segment and direct losses
+            ce_loss = (1.0 - full_reconstruction_ratio) * ce_seg + full_reconstruction_ratio * ce_direct
+            ce_loss = ce_loss.reshape(batch_size, seq_len)
+            ce_loss = ce_loss * splitter_existence_share
+            weighted_loss = ce_loss * replace_mask.float()
+            total_loss = weighted_loss.sum() / (replace_mask.float().sum() + Config.EPS)
+            return total_loss
+
+        # === Clean MLM path (no previous_denoised) ===
+        all_sim = torch.cat([pos_sim.unsqueeze(1), neg_sim], dim=1)
+
+        if fake_neg_norm is not None:
             fake_sim = torch.matmul(encoder_output_norm, fake_neg_norm.T)  # (N_queries, K)
             all_sim = torch.cat([all_sim, fake_sim], dim=1)
 
@@ -831,8 +876,21 @@ class ZonkeyLayer(nn.Module):
                 original_position,
                 replacement_prob=0.2,
                 num_negatives=100,
-                fake_negatives=fake_negatives,
+                fake_negatives=fake_negatives
             )
+        mlm_loss_c = self.calculate_mlm_loss(
+                input_sequence,
+                is_real_inferred,
+                splitter_existence_share,
+                doc_sequences,
+                is_real_doc_position_boolean,
+                original_position,
+                replacement_prob=0.2,
+                num_negatives=100,
+                fake_negatives=fake_negatives,
+                use_compressor=True
+            )
+        mlm_loss = (mlm_loss + mlm_loss_c) / 2
 
         
         # if token_ids is None:
@@ -850,8 +908,8 @@ class ZonkeyLayer(nn.Module):
         # else:
         #     mlm_loss = torch.zeros(1, device=input_sequence.device).mean()
         
-        if mlm_only:
-            return None, None, {"clean_mlm_loss": mlm_loss}, None, None
+        # if mlm_only:
+        #     return None, None, {"clean_mlm_loss": mlm_loss}, None, None
         
         # original_is_real = is_real_inferred
         clean_compressed = self.compress(input_sequence, is_real_inferred)
@@ -901,13 +959,39 @@ class ZonkeyLayer(nn.Module):
             original_position=original_position,
             fake_negatives=fake_negatives,
         )
+
+        dirty_mlm_loss = self.calculate_mlm_loss(
+            denoised2,
+            is_real_inferred,
+            splitter_existence_share,
+            doc_sequences,
+            is_real_doc_position_boolean,
+            original_position,
+            replacement_prob=0.2,
+            num_negatives=100,
+            fake_negatives=fake_negatives,
+            previous_denoised=denoised,
+        )
         
         # Coverage loss: encourages uniform distribution of compressed vectors on the sphere
         # Ensures real words spread across the entire latent space so any generated
         # point is near a real word — no dead zones that decode to fake words.
-        positions = original_position[:, 0, 1]  # position within doc for each sequence
-        clean_uniformity = calculate_spherical_uniformity_loss(clean_compressed, doc_ids, positions)
-        noisy_uniformity = calculate_spherical_uniformity_loss(compressed, doc_ids, positions)
+        
+        # positions = original_position[:, 0, 1]  # position within doc for each sequence
+        # clean_uniformity = calculate_spherical_uniformity_loss(clean_compressed, doc_ids, positions)
+        # noisy_uniformity = calculate_spherical_uniformity_loss(compressed, doc_ids, positions)
+
+        # coverage loss v2
+        # clean_uniformity = compute_improved_coverage_loss(clean_compressed)
+        # noisy_uniformity = compute_improved_coverage_loss(compressed)
+
+        # Compute losses (queue provides global nearest-neighbor signal)
+        clean_uniformity = compute_improved_coverage_loss(
+            clean_compressed, doc_ids=doc_ids, memory_queue=self._drifting_queue
+        )
+        noisy_uniformity = compute_improved_coverage_loss(
+            compressed, doc_ids=doc_ids, memory_queue=self._drifting_queue
+        )
 
         # Create fake negatives for the level above: shuffle input vectors across
         # sequences at each position, then compress to get chimeric compressed vectors.
@@ -935,13 +1019,14 @@ class ZonkeyLayer(nn.Module):
             "coverage_loss": (clean_uniformity + noisy_uniformity) * Config.COVERAGE_WEIGHT[self.level],
             "clean_bos_loss": clean_losses["bos_loss"],
             "clean_mlm_loss": mlm_loss * Config.MLM_WEIGHT[self.level],
-            "clean_reconstruction_loss": clean_losses["reconstruction_loss"] * Config.DIRTY_RECONSTRUCTION_WEIGHT[self.level] ,
+            "clean_reconstruction_loss": clean_losses["reconstruction_loss"] * Config.CLEAN_RECONSTRUCTION_WEIGHT[self.level] ,
             "clean_stitcher_position_loss": clean_losses["stitcher_position_loss"],
             "clean_stitcher_sequence_loss": clean_losses["stitcher_sequence_loss"],
             # "in_level_coherence_loss": clean_losses["in_level_coherence_loss"],
             # "cross_level_coherence_loss": clean_losses["cross_level_penalty"],
             "dirty_bos_loss": dirty_losses["bos_loss"],
             "dirty_reconstruction_loss": dirty_losses["reconstruction_loss"] * Config.DIRTY_RECONSTRUCTION_WEIGHT[self.level],
+            "dirty_mlm_loss": dirty_mlm_loss * Config.DIRTY_MLM_WEIGHT[self.level],
             # "clean_autoregressive_loss": clean_losses["autoregressive_loss"]
         }
 
@@ -1001,15 +1086,20 @@ class ZonkeyLayer(nn.Module):
         stitched_docs, total_position_loss, total_sequence_loss = self.stitcher(all_sentence_vectors, is_real_inferred, num_sentences_per_doc, original_position=original_position, original_input_sequences=all_sentence_vectors,all_p_exist_share=all_p_exist_share,all_tokens=all_tokens)
         
         losses["avg_bos_prob"] = bos_per_position.detach()
-        wanted_bos_prob = 2/Config.MAX_SEQ_LENGTHS[self.level]
+        wanted_bos_prob = Config.COMPRESSION_VECTORS[self.level]/Config.MAX_SEQ_LENGTHS[self.level]
         bos_per_position = torch.maximum(bos_per_position, torch.tensor(wanted_bos_prob, device=bos_per_position.device))
         losses["average_bos_loss"] = ((bos_per_position+1-wanted_bos_prob)**2 - 1)*Config.COMPRESSION_PENALTY[self.level]
         
-        losses["clean_reconstruction_loss"] = losses["clean_reconstruction_loss"] * (bos_per_position+0.1) / (wanted_bos_prob+0.1) * (4*Config.NOISE_STEP_SIZE[self.level])
+        losses["clean_reconstruction_loss"] = losses["clean_reconstruction_loss"] * (bos_per_position+0.1) / (wanted_bos_prob+0.1) 
         losses["clean_stitcher_position_loss"] = losses["clean_stitcher_position_loss"] * (bos_per_position+0.1) / (wanted_bos_prob+0.1) 
         losses["clean_stitcher_sequence_loss"] = losses["clean_stitcher_sequence_loss"] * (bos_per_position+0.1) / (wanted_bos_prob+0.1) 
         losses["dirty_bos_loss"] = losses["dirty_bos_loss"] * (bos_per_position+0.1) / (wanted_bos_prob+0.1) 
         losses["dirty_reconstruction_loss"] = losses["dirty_reconstruction_loss"] * (bos_per_position+0.1) / (wanted_bos_prob+0.1) 
+        losses["dirty_mlm_loss"] = losses["dirty_mlm_loss"] * (bos_per_position+0.1) / (wanted_bos_prob+0.1) 
+
+        losses["clean_reconstruction_loss"] = losses["clean_reconstruction_loss"]* (4*Config.NOISE_STEP_SIZE[self.level])
+        losses["clean_mlm_loss"] = losses["clean_mlm_loss"]* (4*Config.NOISE_STEP_SIZE[self.level])
+        losses["clean_bos_loss"] = losses["clean_bos_loss"]* (4*Config.NOISE_STEP_SIZE[self.level])
 
         losses["patch_loss"] = patch_loss*10
         losses["short_sentence_loss"] = short_sentence_loss*10

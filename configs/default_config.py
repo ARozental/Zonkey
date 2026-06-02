@@ -64,6 +64,7 @@ class Config:
     DIRTY_RECONSTRUCTION_WEIGHT = [2.5,2.5]
     CLEAN_RECONSTRUCTION_WEIGHT = [0.4,0.4]
     MLM_WEIGHT = [0.0,2.0] #0.0 for token level always 
+    DIRTY_MLM_WEIGHT = [1.0, 1.0] #mirrors MLM_WEIGHT; 0.0 for token level
     DECODER_MLM_WEIGHT = [0.6, 0.4]
     EXISTS_WEIGHT = [0.05,0.05] 
     

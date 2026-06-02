@@ -98,6 +98,7 @@ class SinusoidalPositionalEncoding(nn.Module):
         
         # Add positional encodings to input
         return x + pos_enc
+
 if Config.POS == "rope":
     POS = RotaryPositionalEncoding
 else:
@@ -198,6 +199,12 @@ class DecoderAttention(nn.Module):
         # Apply attention to values
         attn_output = torch.matmul(attn_weights, V)
         
+        # === XSA: main trick from https://arxiv.org/abs/2603.09078 (Exclusive Self-Attention) ===
+        # Make attention output orthogonal to the token's own value vector (2 lines, drop-in)
+        Vn = F.normalize(V[:, :, -seq_len:, :] if kv_cache is not None else V, dim=-1)
+        attn_output = attn_output - (attn_output * Vn).sum(dim=-1, keepdim=True) * Vn
+        # =============================================================================
+
         # Transpose back and reshape
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(batch_size, -1, self.d_model)
@@ -295,6 +302,12 @@ class ProbabilisticAttention(nn.Module):
             dropout_p=self.dropout.p if self.training else 0.0,
             scale=self.scale
         )
+
+        # === XSA: main trick from https://arxiv.org/abs/2603.09078 (Exclusive Self-Attention) ===
+        # Make attention output orthogonal to the token's own value vector (2 lines, drop-in)
+        Vn = F.normalize(V, dim=-1)
+        attn_output = attn_output - (attn_output * Vn).sum(dim=-1, keepdim=True) * Vn
+        # =============================================================================
 
         # Zero out attention output for invalid queries (rows)
         # We do this post-hoc to avoid NaN issues from masking rows with -inf in SDPA
@@ -543,6 +556,12 @@ class EfficientLocalAttention(nn.Module):
         # Output
         attn_output = torch.einsum('bhqw,bhqdw->bhqd', attn_weights, v_unfolded)
         
+        # === XSA: main trick from https://arxiv.org/abs/2603.09078 (Exclusive Self-Attention) ===
+        # Make attention output orthogonal to the token's own value vector (2 lines, drop-in)
+        Vn = F.normalize(v, dim=-1)
+        attn_output = attn_output - (attn_output * Vn).sum(dim=-1, keepdim=True) * Vn
+        # =============================================================================
+
         if Config.GATED_ATTENTION:
             Y_heads = attn_output  # [B, nhead, T, d_head] : SDPA output per head
 
@@ -866,6 +885,12 @@ class AutoregressiveDecoder:
             K = attn.pos(K, L)
 
             attn_out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
+
+            # === XSA: main trick from https://arxiv.org/abs/2603.09078 (Exclusive Self-Attention) ===
+            # Make attention output orthogonal to the token's own value vector (2 lines, drop-in)
+            Vn = F.normalize(V, dim=-1)
+            attn_out = attn_out - (attn_out * Vn).sum(dim=-1, keepdim=True) * Vn
+            # =============================================================================
 
             if hasattr(attn, 'gate_proj') and attn.gate_proj is not None:
                 gate = torch.sigmoid(

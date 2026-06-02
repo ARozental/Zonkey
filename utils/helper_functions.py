@@ -264,6 +264,93 @@ def calculate_spherical_uniformity_loss(
     
     return mean_loss + off_diag_loss
 
+# def compute_improved_coverage_loss(
+#     z: torch.Tensor,
+#     use_koleo: bool = True          # set False to use pure atanh version
+# ) -> torch.Tensor:
+#     """SOTA 2025 coverage loss: KoLeo (entropy maximization) + optional temperature-free uniformity.
+#     Much stronger and more stable than the original Wang & Isola version.
+#     """
+#     # Flatten and normalize to unit sphere (same as your old loss)
+#     z_flat = z.view(z.shape[0], -1)
+#     z_norm = F.normalize(z_flat, dim=-1)
+
+#     if not use_koleo:
+#         # Pure atanh version (your MLM trick applied to uniformity)
+#         sim = torch.mm(z_norm, z_norm.t())
+#         mask = ~torch.eye(z_norm.shape[0], dtype=torch.bool, device=z.device)
+#         scaled = 2 * torch.atanh(torch.clamp(sim[mask], min=Config.EPS - 1, max=1 - Config.EPS))
+#         return torch.log(torch.mean(torch.exp(scaled)))   # temperature-free
+
+#     # === KoLeo (the main upgrade used in DINOv2 and 2025 FMs) ===
+#     dist = torch.cdist(z_norm, z_norm, p=2) ** 2
+#     mask = ~torch.eye(z_norm.shape[0], dtype=torch.bool, device=z.device)
+#     min_dist = torch.min(dist + (~mask).float() * 1e9, dim=1)[0]  # nearest neighbor (exclude self)
+
+#     koleo = torch.mean(torch.logsumexp(-0.5 * min_dist, dim=0))
+#     return koleo
+
+
+def compute_improved_coverage_loss(
+    z: torch.Tensor,
+    doc_ids: Optional[torch.Tensor] = None,
+    memory_queue: Optional[torch.Tensor] = None,   # (Q, flat_dim) — already flattened + normalized
+) -> torch.Tensor:
+    """Document-aware KoLeo coverage loss (SOTA 2025 style).
+    
+    - z shape: (B, C, D) → flattened to (B, flat_dim = C*D) exactly as you already do
+    - Nearest-neighbor search **only across different documents** (same-doc vectors are ignored)
+    - Optional memory queue (_drifting_queue) for global coverage on small batches
+    - Pure dot-product on the sphere, no cdist, no extra arguments
+    """
+    B = z.shape[0]
+    z_flat = z.view(B, -1)                                      # (B, flat_dim)
+    z_norm = F.normalize(z_flat, dim=-1)                        # unit sphere
+
+    # === Build candidates: current batch + memory queue ===
+    if memory_queue is not None and memory_queue.shape[0] > 0:
+        candidates = torch.cat([memory_queue, z_norm], dim=0)   # (Q + B, flat_dim)
+        mem_size = memory_queue.shape[0]
+    else:
+        candidates = z_norm
+        mem_size = 0
+
+    # Cosine similarity: every current vector vs all candidates
+    sim = torch.matmul(z_norm, candidates.T)                    # (B, Q + B)
+
+    # === Build mask for invalid neighbors (same doc or self) ===
+    invalid = torch.zeros_like(sim, dtype=torch.bool, device=z.device)
+
+    # 1. Self-similarity within the current batch
+    if mem_size > 0:
+        eye = torch.eye(B, dtype=torch.bool, device=z.device)
+        invalid[:, mem_size:] = eye
+    else:
+        invalid |= torch.eye(B, dtype=torch.bool, device=z.device)
+
+    # 2. Same-document vectors (only applied to the current-batch portion)
+    if doc_ids is not None:
+        doc_ids = doc_ids.view(-1)                              # (B,)
+        same_doc = doc_ids.unsqueeze(1) == doc_ids.unsqueeze(0) # (B, B)
+        if mem_size > 0:
+            # queue part is always valid (previous batches = different docs)
+            same_doc_mask = torch.cat([
+                torch.zeros((B, mem_size), dtype=torch.bool, device=z.device),
+                same_doc
+            ], dim=1)
+            invalid |= same_doc_mask
+        else:
+            invalid |= same_doc
+
+    # Apply mask
+    sim = sim.masked_fill(invalid, -1e9)
+
+    # === KoLeo surrogate: soft-max of the worst (largest) cosine ===
+    max_sim_nn = torch.max(sim, dim=1)[0]                       # largest cosine = smallest angle
+    koleo = torch.mean(torch.logsumexp(max_sim_nn, dim=0))
+
+    return koleo
+
 
 def compute_drifting_loss(
     generated: torch.Tensor,

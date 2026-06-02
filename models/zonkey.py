@@ -248,8 +248,8 @@ class PlZonkey(pl.LightningModule):
                         self.model.generate_sequence_from_level_N(level,fixed_compressed_vectors=leveled_compressed_temp[0][0:1],noise_level=Config.NOISE_LAST_STEP_SIZE[level])
                         print(f"random seq from level {level}: ")
                         self.model.generate_sequence_from_level_N(level,num_diffusion_steps=250,noise_level=1.0)
-                        print(f"ar random seq from level {level}: ")
-                        self.model.ar_generate_sequence_from_level_N(level)
+                        # print(f"ar random seq from level {level}: ") #not doing ar loss now
+                        # self.model.ar_generate_sequence_from_level_N(level)
 
                 
                     # Clean up generation artifacts to free GPU memory
