@@ -24,6 +24,10 @@ class Config:
     #learning
     BATCH_SIZE = 3
     LEARNING_RATE = 3e-4
+    # LR schedule (manual optimization → applied per optimizer step by PlZonkey).
+    WARMUP_STEPS = 1000          # linear warmup over this many optimizer steps
+    LR_DECAY_STEPS = 300000      # cosine-decay horizon in optimizer steps (gentle if large)
+    MIN_LR_RATIO = 0.1           # final LR = LEARNING_RATE * MIN_LR_RATIO
     DROPOUT = 0.0
     MAX_SEQ_LENGTHS = [16,32]
     COMPRESSION_PENALTY = [3,3] #trades off compression and quality
@@ -45,7 +49,9 @@ class Config:
     MAX_STEPS = None
     MAX_EPOCHS = 1
     SAVE_EVERY_N_STEPS = 10000
+    SAVE_TOP_K = -1  # -1 keeps every checkpoint; set to e.g. 3 to keep only the latest few
     PRINT_EVERY_N_STEPS = 10000
+    EVAL_DIFFUSION_STEPS = 30  # ODE sampling steps for the debug/print generation block
     GRAD_CLIP_VAL = 0 
     GRAD_ACCUMULATION_STEPS = 1  # Number of steps to accumulate gradients (1 = no accumulation)
     PRECISION = "32-true"  # Lightning precision: "32-true", "16-mixed", "bf16-mixed"

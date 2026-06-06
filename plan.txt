@@ -1,0 +1,15 @@
+Add coherence loss:
+
+Use the first vectors at the end of the decoder to tell if the vector that created the sequence is a real word or random. Maybe can do real+noise but then it's hard to tell.
+
+
+
+CoherenceChecker.forward(seq4); it should run over True/Fake/Shuffled lower level
+Loss only applies to the decoder/decompressor.
+lets try without the time vector; why would anything be coherent with it??
+
+Given output words from sentence (level-1 layer) each word needs to be coherent
+
+
+1. remove the time vector from compressed_to_denoised I don't want to use it anywhere.
+2. write is coherent function

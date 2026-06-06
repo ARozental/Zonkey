@@ -31,6 +31,38 @@ class ResidualConv1d(nn.Module):
         x = self.norm(x)
         return x + residual
 
+
+class TimeEmbedding(nn.Module):
+    """Sinusoidal time/flow-position embedding + MLP.
+
+    Flow matching samples the flow time t densely over [0, 1], so the
+    conditioning signal must vary smoothly and expressively across the whole
+    continuum. The old 2-vector lerp could only represent a 1-D family of
+    conditioning vectors; this gives the network a proper time embedding.
+    """
+    def __init__(self, d_model: int, max_period: float = 10000.0):
+        super().__init__()
+        self.d_model = d_model
+        self.max_period = max_period
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, d_model),
+        )
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        # t: (B,) in [0, 1]
+        t = t.view(-1).float()
+        half = self.d_model // 2
+        freqs = torch.exp(
+            -math.log(self.max_period) * torch.arange(half, device=t.device, dtype=torch.float32) / max(half, 1)
+        )
+        args = t[:, None] * freqs[None] * 1000.0  # spread t over the embedding's useful range
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+        if emb.shape[-1] < self.d_model:
+            emb = F.pad(emb, (0, self.d_model - emb.shape[-1]))
+        return self.mlp(emb)
+
 class ZonkeyLayer(nn.Module):
     def __init__(self, level: int, previous_layer: Optional[nn.Module] = None):
         super().__init__()
@@ -81,9 +113,8 @@ class ZonkeyLayer(nn.Module):
         self.stitcher = Stitcher(level=level,token_embedding_layer=self.previous_layer)
 
 
-        # Two learned time vectors for interpolation
-        self.time_vec_clean = nn.Parameter(torch.randn(d_model))
-        self.time_vec_noisy = nn.Parameter(torch.randn(d_model))
+        # Flow-time conditioning embedding (replaces the old 2-vector lerp).
+        self.time_embedding = TimeEmbedding(d_model)
         
 
 
@@ -179,17 +210,48 @@ class ZonkeyLayer(nn.Module):
 
     #     return noisy_flat.view_as(noisy)
     
+    @staticmethod
+    def _slerp(a: torch.Tensor, b: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Spherical linear interpolation between unit vectors a and b.
+
+        a, b: (B, D) unit vectors. t: (B,) or scalar in [0, 1].
+        Returns unit vectors: t=0 -> a, t=1 -> b. Falls back to (renormalized)
+        linear interp when a and b are nearly colinear (sin(omega) ~ 0).
+        """
+        if not torch.is_tensor(t):
+            t = torch.tensor(t, device=a.device, dtype=a.dtype)
+        t = t.reshape(-1, 1).to(a.dtype)
+        dot = (a * b).sum(-1, keepdim=True).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+        omega = torch.acos(dot)
+        sin_omega = torch.sin(omega)
+        small = sin_omega.abs() < 1e-4
+        coef_a = torch.sin((1.0 - t) * omega) / sin_omega
+        coef_b = torch.sin(t * omega) / sin_omega
+        out = coef_a * a + coef_b * b
+        lerp = (1.0 - t) * a + t * b
+        out = torch.where(small, lerp, out)
+        return F.normalize(out, p=2, dim=-1)
+
+    def flow_interpolate(self, x: torch.Tensor, noise_level: torch.Tensor,
+                         noise: Optional[torch.Tensor] = None):
+        """Flow-matching interpolation along the geodesic from data (noise_level=0)
+        toward a random noise sample (noise_level=1), on the sphere of radius
+        ``upwards_norm``. Returns (x_t, noise) so callers can reuse the noise sample.
+        """
+        batch = x.shape[0]
+        x_flat = x.reshape(batch, -1)
+        x_unit = F.normalize(x_flat, p=2, dim=-1)
+        if noise is None:
+            noise = torch.randn_like(x_flat)
+        noise_unit = F.normalize(noise.reshape(batch, -1), p=2, dim=-1)
+        nl = torch.clamp(noise_level, min=0.0, max=1.0) if torch.is_tensor(noise_level) else noise_level
+        x_t = self._slerp(x_unit, noise_unit, nl) * self.upwards_norm
+        return x_t.view_as(x), (noise_unit * self.upwards_norm).view_as(x)
+
     def add_noise(self, x: torch.Tensor, noise_level: torch.Tensor) -> torch.Tensor:
-        nl = torch.clamp(noise_level, min=0.0, max=1.0)
-        beta = Config.BETA[self.level]
-        target_cosine = torch.exp(-beta * nl)
-        signal = target_cosine.view(-1, 1, 1)
-        noise_std = torch.sqrt(1.0 - target_cosine**2 + 1e-8).view(-1, 1, 1)
-        noisy = signal * x + noise_std * torch.randn_like(x)
-        # Same pattern as original: flatten → normalize → reshape back
-        noisy_flat = noisy.view(noisy.shape[0], -1)
-        noisy_flat = F.normalize(noisy_flat, p=2, dim=-1) * self.upwards_norm
-        return noisy_flat.view_as(noisy)
+        """Interpolate x toward a fresh random noise sample by ``noise_level`` along
+        the geodesic (noise_level=0 -> x, noise_level=1 -> noise). Stays on the sphere."""
+        return self.flow_interpolate(x, noise_level)[0]
     
     def compress(self, x: torch.Tensor, existence_probs: torch.Tensor) -> torch.Tensor:
         x0 = x
@@ -223,19 +285,20 @@ class ZonkeyLayer(nn.Module):
     def compute_bos_probability_logits(self, vectors: torch.Tensor) -> torch.Tensor:
         return self.bos_layer(vectors).squeeze(-1)+Config.EOS_TARGET_BIAS[self.level]
     
-    def compressed_to_denoised(self, compressed: torch.Tensor, noise_level: torch.Tensor,clean_compressed: torch.Tensor=None) -> torch.Tensor:
-        if clean_compressed is not None:
-            cosine_similarity = torch.nn.functional.cosine_similarity(clean_compressed.view(compressed.shape[0], -1), compressed.view(compressed.shape[0], -1), dim=-1)
-            time_vec = cosine_similarity.unsqueeze(-1) * self.time_vec_clean + (1-cosine_similarity).unsqueeze(-1) * self.time_vec_noisy
-        else:
-            time_vec = (1 - noise_level).unsqueeze(-1) * self.time_vec_clean + noise_level.unsqueeze(-1) * self.time_vec_noisy
-        conditioned_compressed = compressed #+ time_vec.view(compressed.shape[0], 1, compressed.shape[2]) # removed for coherence compatibility
-        
+    def compressed_to_denoised(self, compressed: torch.Tensor, noise_level: torch.Tensor) -> torch.Tensor:
+        batch_size = compressed.shape[0]
+        # Explicit flow-time conditioning (no cosine inference; t is always known under FM).
+        if not torch.is_tensor(noise_level):
+            noise_level = torch.full((batch_size,), float(noise_level), device=compressed.device, dtype=compressed.dtype)
+        elif noise_level.dim() == 0:
+            noise_level = noise_level.expand(batch_size)
+        time_vec = self.time_embedding(noise_level).to(compressed.dtype)
+
         prompt = torch.cat([
-            time_vec.view(compressed.shape[0], 1, compressed.shape[2]),
-            conditioned_compressed
+            time_vec.view(batch_size, 1, compressed.shape[2]),
+            compressed
         ], dim=1)
-        
+
         decompressed = self.decompressor.generate(prompt, Config.MAX_SEQ_LENGTHS[self.level])
         
         vectors = decompressed[:, (1+Config.COMPRESSION_VECTORS[self.level]):]
@@ -594,97 +657,45 @@ class ZonkeyLayer(nn.Module):
         clean=False,
         fake_negatives: Optional[torch.Tensor] = None,
         ) -> Tuple[torch.Tensor, Optional[dict], torch.Tensor]:
+        # Flow-matching corruption: interpolate the clean compressed vector toward
+        # noise along the geodesic by fraction `noise_level` (0 = clean, 1 = noise).
         noisy_compressed = self.add_noise(compressed, noise_level)
-        denoised, is_real_inferred = self.compressed_to_denoised(noisy_compressed, noise_level, compressed)
+        denoised, is_real_inferred = self.compressed_to_denoised(noisy_compressed, noise_level)
 
         if input_sequence is None:
             return denoised, None, is_real_inferred
-        
-        if clean:
-            # === AR auxiliary loss using ONLY denoiser layers as causal decoder ===
-            ar_input = input_sequence[:, :-1, :].detach()
 
-            ar_output = self.ar_decoder(ar_input)
-            ar_output = F.normalize(ar_output, p=2, dim=-1) * self.dim_norm
+        # === Data-prediction (x0) reconstruction + BOS loss, supervised at every flow-time t ===
+        with torch.no_grad():
+            is_real_label = self.bos_probs_to_inferred_real_position(all_sentence_bos_probs)
 
-            ar_pred = ar_output
-            ar_is_real = self.bos_probs_to_inferred_real_position(all_sentence_bos_probs[:, 1:])
-            ar_exist = splitter_existence_share[:, 1:]
+        if self.level == 0:
+            reconstruction_loss, _ = calculate_token_loss(
+                token_ids, denoised, splitter_existence_share, self.previous_layer)
+        else:
+            reconstruction_loss, _ = calculate_reconstruction_loss(
+                denoised=denoised,
+                is_real_inferred=is_real_inferred,
+                target_sequences=input_sequence,
+                splitter_existence_share=splitter_existence_share,
+                fake_negatives=fake_negatives)
 
-            #clipping only for Autoregressive at 0.2 to disrupt mode collapse on tail
-            # if self.level == 0:
-            #     autoregressive_loss, _ = calculate_token_loss(
-            #         token_ids[:, 1:], ar_pred, ar_exist.clip(min=0.2), self.previous_layer)
-            # else:
-            #     autoregressive_loss, _ = calculate_reconstruction_loss(
-            #         denoised=ar_pred,
-            #         is_real_inferred=ar_is_real.clip(min=0.2),
-            #         target_sequences=input_sequence[:, 1:, :],
-            #         splitter_existence_share=ar_exist.clip(min=0.2),
-            #         previous_denoised=None,
-            #         fake_negatives=fake_negatives)
+        dbos_ce_loss = bce(is_real_inferred, is_real_label, reduction='none')[:, 1:].mean() - bce(is_real_label, is_real_label, reduction='none')[:, 1:].mean()
 
-            reconstructed_docs, stitcher_position_loss, stitcher_sequence_loss = self.stitcher(
-                denoised, is_real_inferred, num_sentences_per_doc, original_position=original_position, 
-                original_input_sequences=input_sequence, all_p_exist_share=splitter_existence_share, all_tokens=token_ids,
-                previous_denoised=previous_denoised)
-        
-        losses = {}
-        
-        if clean or previous_denoised is not None:
-            with torch.no_grad():
-                is_real_label =  self.bos_probs_to_inferred_real_position(all_sentence_bos_probs)
-                if previous_denoised is not None:
-                    previous_bos_probability = self.compute_bos_probability(previous_denoised)
-                    previous_is_real_label = self.bos_probs_to_inferred_real_position(previous_bos_probability)
-            
-            if self.level == 0:
-                reconstruction_loss, optimal_t = calculate_token_loss(
-                    token_ids, denoised, splitter_existence_share, 
-                    self.previous_layer, previous_denoised=previous_denoised)
-            else:
-                reconstruction_loss, optimal_t = calculate_reconstruction_loss(
-                    denoised=denoised, 
-                    is_real_inferred=is_real_inferred, 
-                    target_sequences=input_sequence, 
-                    splitter_existence_share=splitter_existence_share, 
-                    previous_denoised=previous_denoised,
-                    fake_negatives=fake_negatives)
-            
-            # Compute BOS loss using same interpolation parameter as reconstruction loss
-            if previous_denoised is not None and optimal_t is not None:
-                # Use optimal_t from reconstruction loss to interpolate BOS labels
-                # optimal_t: (batch,) - one value per sequence
-                # Expand to match sequence dimension
-                t_exp = optimal_t.unsqueeze(1)  # (batch, 1)
-                
-                # Interpolate labels: segment_label = t * is_real_label + (1-t) * previous_is_real_label
-                segment_label = t_exp * is_real_label + (1 - t_exp) * previous_is_real_label
-                
-                # Compute BCE loss with interpolated labels
-                dbos_ce_loss = bce(is_real_inferred, segment_label, reduction='none')[:, 1:].mean() - bce(segment_label, segment_label, reduction='none')[:, 1:].mean()
-            else:
-                dbos_ce_loss = bce(is_real_inferred, is_real_label, reduction='none')[:, 1:].mean() - bce(is_real_label, is_real_label, reduction='none')[:, 1:].mean()
-
-
-            #not accounting for splitter_existence_share in this loss, if position K has 100% chance of being a new sequence it means the existance share will be 0, we do not want to multiply the need for a stop signal by 0
-            # existence_loss = (is_real_inferred.sum(dim=1) - is_real_label.sum(dim=1)).abs().mean() / Config.MAX_SEQ_LENGTHS[self.level]
-
-
-            losses = {
+        losses = {
             "reconstruction_loss": reconstruction_loss,
-            "bos_loss": dbos_ce_loss*Config.EXISTS_WEIGHT[self.level],
+            "bos_loss": dbos_ce_loss * Config.EXISTS_WEIGHT[self.level],
         }
-            if clean:
-                # losses["autoregressive_loss"] = autoregressive_loss
-                losses["stitcher_position_loss"] = stitcher_position_loss
-                losses["stitcher_sequence_loss"] = stitcher_sequence_loss * 0.01 * (1-noise_level).mean()
-                
 
-            # in_level_coherence_loss, cross_level_penalty = self.get_level_coherence_loss(compressed.detach(), 8)
-            # losses["in_level_coherence_loss"] = in_level_coherence_loss * 0.3
-            # losses["cross_level_penalty"] = cross_level_penalty
-        
+        # Stitcher / document-reassembly losses only make sense near the data
+        # manifold, so they are computed only on the clean (t~0) structural pass.
+        if clean:
+            reconstructed_docs, stitcher_position_loss, stitcher_sequence_loss = self.stitcher(
+                denoised, is_real_inferred, num_sentences_per_doc, original_position=original_position,
+                original_input_sequences=input_sequence, all_p_exist_share=splitter_existence_share, all_tokens=token_ids)
+            losses["stitcher_position_loss"] = stitcher_position_loss
+            losses["stitcher_sequence_loss"] = stitcher_sequence_loss * 0.01
+
         return denoised, losses, is_real_inferred
 
     
@@ -914,54 +925,38 @@ class ZonkeyLayer(nn.Module):
         # original_is_real = is_real_inferred
         clean_compressed = self.compress(input_sequence, is_real_inferred)
         doc_ids = original_position[:,0,0]
-        # clean_compressed_sim = calculate_mean_similarity(clean_compressed, doc_ids)
-        
-        # Per-sample noise level for the batch
-        t0 = self.noise_last_step_size * (self.beta_dist.sample((clean_compressed.shape[0],)) / self.beta_dist_mean)
-        # t0 = self.noise_schedule(torch.zeros(input_sequence.shape[0], device=clean_compressed.device))
-        
-        # First pass: clean compression, we have a redundent op with calculating is_real_inferred twice
-        denoised, clean_losses, is_real_inferred = self.denoise_and_reconstruct(
-            clean_compressed, input_sequence, all_sentence_bos_probs, t0, splitter_existence_share, 
+        batch = clean_compressed.shape[0]
+
+        # === Pass 1: structural anchor at t~0 (clean) ===
+        # Trains the decode-at-t=0 regime (the ODE's final step) plus the
+        # near-data-only structural losses (stitcher).
+        t_clean = torch.zeros(batch, device=clean_compressed.device, dtype=clean_compressed.dtype)
+        denoised_clean, clean_losses, is_real_inferred = self.denoise_and_reconstruct(
+            clean_compressed, input_sequence, all_sentence_bos_probs, t_clean, splitter_existence_share,
             token_ids=token_ids,
             num_sentences_per_doc=num_sentences_per_doc,
             original_position=original_position,
             clean=True,
             fake_negatives=fake_negatives,
         )
-        
-        
-        # Compress with the soft mask from predicted EoS probabilities
-        compressed = self.compress(denoised, is_real_inferred)
-        # noisy_compressed_sim = calculate_mean_similarity(compressed, doc_ids)
-        
-        # Calculate mean cosine similarity between different batch elements
 
-        # t1 = self.noise_schedule(torch.rand_like(t0))
-        # t1 = torch.sqrt(torch.rand_like(t0))
-        t1 = 1 - torch.exp(-Config.BETA[self.level] * torch.rand_like(t0))
-        denoised , noisy_losses, is_real_inferred = self.denoise_and_reconstruct(
-            compressed, noise_level=t1,
-        )
-
-        # Recompress the noisy denoised output — this chains through the
-        # compress error so the dirty pass trains on realistic intermediate
-        # compressed vectors (matching what generation actually produces).
-        recompressed = self.compress(denoised, is_real_inferred)
-
-        t2 = self.noise_step_size * (self.beta_dist.sample((clean_compressed.shape[0],)) / self.beta_dist_mean)
-        
-        denoised2, dirty_losses, is_real_inferred = self.denoise_and_reconstruct(
-            recompressed, input_sequence, all_sentence_bos_probs, t2, splitter_existence_share,
+        # === Pass 2: flow-matching denoiser across the whole path, t ~ U(0,1) ===
+        # Single pass: the slerp interpolation *is* the intermediate, so the
+        # DDMM noisy+dirty passes (which only manufactured realistic intermediates)
+        # are no longer needed.
+        t_fm = torch.rand(batch, device=clean_compressed.device, dtype=clean_compressed.dtype)
+        denoised_fm, fm_losses, is_real_inferred_fm = self.denoise_and_reconstruct(
+            clean_compressed, input_sequence, all_sentence_bos_probs, t_fm, splitter_existence_share,
             token_ids=token_ids,
             num_sentences_per_doc=num_sentences_per_doc,
-            previous_denoised=denoised,
             original_position=original_position,
+            clean=False,
             fake_negatives=fake_negatives,
         )
 
-        dirty_mlm_loss = self.calculate_mlm_loss(
-            denoised2,
+        # MLM robustness on the (near-clean) denoised reconstruction.
+        denoised_mlm_loss = self.calculate_mlm_loss(
+            denoised_clean,
             is_real_inferred,
             splitter_existence_share,
             doc_sequences,
@@ -970,27 +965,14 @@ class ZonkeyLayer(nn.Module):
             replacement_prob=0.2,
             num_negatives=100,
             fake_negatives=fake_negatives,
-            previous_denoised=denoised,
         )
-        
-        # Coverage loss: encourages uniform distribution of compressed vectors on the sphere
-        # Ensures real words spread across the entire latent space so any generated
-        # point is near a real word — no dead zones that decode to fake words.
-        
-        # positions = original_position[:, 0, 1]  # position within doc for each sequence
-        # clean_uniformity = calculate_spherical_uniformity_loss(clean_compressed, doc_ids, positions)
-        # noisy_uniformity = calculate_spherical_uniformity_loss(compressed, doc_ids, positions)
 
-        # coverage loss v2
-        # clean_uniformity = compute_improved_coverage_loss(clean_compressed)
-        # noisy_uniformity = compute_improved_coverage_loss(compressed)
-
-        # Compute losses (queue provides global nearest-neighbor signal)
+        # Coverage loss: encourages uniform distribution of compressed vectors on the
+        # sphere. Under flow matching this is load-bearing: the ODE integrates from a
+        # uniform-on-sphere noise prior, so the data marginal must cover the sphere or
+        # the velocity field has to extrapolate into dead zones.
         clean_uniformity = compute_improved_coverage_loss(
             clean_compressed, doc_ids=doc_ids, memory_queue=self._drifting_queue
-        )
-        noisy_uniformity = compute_improved_coverage_loss(
-            compressed, doc_ids=doc_ids, memory_queue=self._drifting_queue
         )
 
         # Create fake negatives for the level above: shuffle input vectors across
@@ -1014,23 +996,22 @@ class ZonkeyLayer(nn.Module):
         else:
             fake_negatives_for_upper = None
 
-        # Combine and rename losses
+        # Combine and rename losses. The "fm_*" terms (the flow-matching denoiser
+        # pass) reuse the old DIRTY_* config weights so existing config files keep
+        # working unchanged.
         losses = {
-            "coverage_loss": (clean_uniformity + noisy_uniformity) * Config.COVERAGE_WEIGHT[self.level],
+            "coverage_loss": clean_uniformity * Config.COVERAGE_WEIGHT[self.level],
             "clean_bos_loss": clean_losses["bos_loss"],
             "clean_mlm_loss": mlm_loss * Config.MLM_WEIGHT[self.level],
-            "clean_reconstruction_loss": clean_losses["reconstruction_loss"] * Config.CLEAN_RECONSTRUCTION_WEIGHT[self.level] ,
+            "clean_reconstruction_loss": clean_losses["reconstruction_loss"] * Config.CLEAN_RECONSTRUCTION_WEIGHT[self.level],
             "clean_stitcher_position_loss": clean_losses["stitcher_position_loss"],
             "clean_stitcher_sequence_loss": clean_losses["stitcher_sequence_loss"],
-            # "in_level_coherence_loss": clean_losses["in_level_coherence_loss"],
-            # "cross_level_coherence_loss": clean_losses["cross_level_penalty"],
-            "dirty_bos_loss": dirty_losses["bos_loss"],
-            "dirty_reconstruction_loss": dirty_losses["reconstruction_loss"] * Config.DIRTY_RECONSTRUCTION_WEIGHT[self.level],
-            "dirty_mlm_loss": dirty_mlm_loss * Config.DIRTY_MLM_WEIGHT[self.level],
-            # "clean_autoregressive_loss": clean_losses["autoregressive_loss"]
+            "fm_bos_loss": fm_losses["bos_loss"],
+            "fm_reconstruction_loss": fm_losses["reconstruction_loss"] * Config.DIRTY_RECONSTRUCTION_WEIGHT[self.level],
+            "fm_mlm_loss": denoised_mlm_loss * Config.DIRTY_MLM_WEIGHT[self.level],
         }
 
-        return denoised2[:input_sequence.shape[0]], clean_compressed, losses, is_real_inferred, fake_negatives_for_upper
+        return denoised_clean[:input_sequence.shape[0]], clean_compressed, losses, is_real_inferred, fake_negatives_for_upper
     
     def bos_probs_to_inferred_real_position(self, bos_probs: torch.Tensor) -> torch.Tensor:
         # Clamp bos_probs to minimum to prevent float32 precision loss in cumsum
@@ -1090,16 +1071,14 @@ class ZonkeyLayer(nn.Module):
         bos_per_position = torch.maximum(bos_per_position, torch.tensor(wanted_bos_prob, device=bos_per_position.device))
         losses["average_bos_loss"] = ((bos_per_position+1-wanted_bos_prob)**2 - 1)*Config.COMPRESSION_PENALTY[self.level]
         
-        losses["clean_reconstruction_loss"] = losses["clean_reconstruction_loss"] * (bos_per_position+0.1) / (wanted_bos_prob+0.1) 
-        losses["clean_stitcher_position_loss"] = losses["clean_stitcher_position_loss"] * (bos_per_position+0.1) / (wanted_bos_prob+0.1) 
-        losses["clean_stitcher_sequence_loss"] = losses["clean_stitcher_sequence_loss"] * (bos_per_position+0.1) / (wanted_bos_prob+0.1) 
-        losses["dirty_bos_loss"] = losses["dirty_bos_loss"] * (bos_per_position+0.1) / (wanted_bos_prob+0.1) 
-        losses["dirty_reconstruction_loss"] = losses["dirty_reconstruction_loss"] * (bos_per_position+0.1) / (wanted_bos_prob+0.1) 
-        losses["dirty_mlm_loss"] = losses["dirty_mlm_loss"] * (bos_per_position+0.1) / (wanted_bos_prob+0.1) 
-
-        losses["clean_reconstruction_loss"] = losses["clean_reconstruction_loss"]* (4*Config.NOISE_STEP_SIZE[self.level])
-        losses["clean_mlm_loss"] = losses["clean_mlm_loss"]* (4*Config.NOISE_STEP_SIZE[self.level])
-        losses["clean_bos_loss"] = losses["clean_bos_loss"]* (4*Config.NOISE_STEP_SIZE[self.level])
+        # Reweight quality losses by realized compression rate (unchanged intent).
+        compression_reweight = (bos_per_position + 0.1) / (wanted_bos_prob + 0.1)
+        losses["clean_reconstruction_loss"] = losses["clean_reconstruction_loss"] * compression_reweight
+        losses["clean_stitcher_position_loss"] = losses["clean_stitcher_position_loss"] * compression_reweight
+        losses["clean_stitcher_sequence_loss"] = losses["clean_stitcher_sequence_loss"] * compression_reweight
+        losses["fm_bos_loss"] = losses["fm_bos_loss"] * compression_reweight
+        losses["fm_reconstruction_loss"] = losses["fm_reconstruction_loss"] * compression_reweight
+        losses["fm_mlm_loss"] = losses["fm_mlm_loss"] * compression_reweight
 
         losses["patch_loss"] = patch_loss*10
         losses["short_sentence_loss"] = short_sentence_loss*10
@@ -1158,55 +1137,57 @@ class ZonkeyLayer(nn.Module):
         
         if max_length is None:
             max_length = Config.MAX_SEQ_LENGTHS[self.level]
-        
-        if fixed_vectors is not None:
-            fixed_vectors = fixed_vectors[:batch_size,:,:]
-            fixed_vectors = F.normalize(fixed_vectors, p=2, dim=-1) * self.dim_norm
-            is_real_position = is_real_position[:batch_size,:]
-            compressed = self.compress(fixed_vectors, is_real_position)
-        else:
-            compressed = torch.randn(batch_size, compression_vectors, d_model, device=device)
-            compressed_flat = compressed.view(batch_size, -1)
-            compressed_flat = F.normalize(compressed_flat, p=2, dim=-1) * self.upwards_norm
-            compressed = compressed_flat.view(batch_size, Config.COMPRESSION_VECTORS[self.level], d_model)
-            initial_noise_level = torch.full((batch_size,), noise_level_scalar, device=device, dtype=compressed.dtype)
-            noisy_compressed = self.add_noise(compressed, initial_noise_level)
-            fixed_vectors, is_real_inferred = self.compressed_to_denoised(noisy_compressed, initial_noise_level)
 
-        
+        # === Establish the starting point x_t and starting flow-time t_start ===
+        # Convention: t = noise fraction (t=0 data, t=1 noise). The ODE integrates
+        # t_start -> 0. `noise_level` is the starting noise fraction.
         if fixed_compressed_vectors is not None:
             compressed = fixed_compressed_vectors
             if compressed.dim() == 2:
-                compressed_flat = compressed
-                batch_size = compressed_flat.shape[0]
-                compressed = compressed_flat.view(batch_size, Config.COMPRESSION_VECTORS[self.level], d_model)
+                batch_size = compressed.shape[0]
+                compressed = compressed.view(batch_size, compression_vectors, d_model)
             else:
                 batch_size = compressed.shape[0]
-                compressed_flat = compressed.view(batch_size, -1)
+            compressed_flat = F.normalize(compressed.reshape(batch_size, -1), p=2, dim=-1) * self.upwards_norm
+            compressed = compressed_flat.view(batch_size, compression_vectors, d_model)
+            t_start = torch.full((batch_size,), noise_level_scalar, device=device, dtype=compressed.dtype)
+            x_t = self.add_noise(compressed, t_start) if noise_level_scalar > 0 else compressed
+        elif fixed_vectors is not None:
+            fixed_vectors = fixed_vectors[:batch_size, :, :]
+            fixed_vectors = F.normalize(fixed_vectors, p=2, dim=-1) * self.dim_norm
+            is_real_position = is_real_position[:batch_size, :]
+            compressed = self.compress(fixed_vectors, is_real_position)
+            t_start = torch.full((batch_size,), noise_level_scalar, device=device, dtype=compressed.dtype)
+            x_t = self.add_noise(compressed, t_start) if noise_level_scalar > 0 else compressed
+        else:
+            # Pure generation: start from uniform-on-sphere noise at t_start = noise_level.
+            noise = torch.randn(batch_size, compression_vectors, d_model, device=device)
+            noise_flat = F.normalize(noise.view(batch_size, -1), p=2, dim=-1) * self.upwards_norm
+            x_t = noise_flat.view(batch_size, compression_vectors, d_model)
+            t_start = torch.full((batch_size,), noise_level_scalar, device=device, dtype=x_t.dtype)
 
-            compressed_flat = F.normalize(compressed_flat, p=2, dim=-1) * self.upwards_norm
-            compressed = compressed_flat.view(batch_size, Config.COMPRESSION_VECTORS[self.level], d_model)
-            initial_noise_level = torch.full((batch_size,), noise_level_scalar, device=device, dtype=compressed.dtype)
-            noisy_compressed = self.add_noise(compressed, initial_noise_level)
-            fixed_vectors, is_real_inferred = self.compressed_to_denoised(noisy_compressed, initial_noise_level)
-        
-        t_schedule = torch.linspace(1.0, 0.0, num_diffusion_steps+1, device=device) * noise_level_scalar
-        
-        noise_levels = self.noise_schedule(t_schedule)
-        denoised = fixed_vectors
-        is_real_inferred = None
-        for step in range(num_diffusion_steps):
-            current_noise_level = noise_levels[step].expand(batch_size)
-            noisy_compressed = self.add_noise(compressed, current_noise_level)
-            denoised, is_real_inferred = self.compressed_to_denoised(noisy_compressed, current_noise_level)
-            compressed = self.compress(denoised, is_real_inferred)
-
-        # Final clean decode: the model is trained with a clean pass at noise_level≈0
-        # which produces the sharpest token vectors. Without this, the last step
-        # decodes at noise_level=1/num_steps which is noisier than the clean regime.
-        if num_diffusion_steps > 0:
-            final_noise = torch.zeros(batch_size, device=device)
-            denoised, is_real_inferred = self.compressed_to_denoised(compressed, final_noise)
+        # === Integrate the probability-flow ODE (data-prediction / DDIM-on-sphere) ===
+        if num_diffusion_steps <= 0:
+            # Single denoiser evaluation at t_start (used to decode a known compressed
+            # vector, optionally with a little noise).
+            denoised, is_real_inferred = self.compressed_to_denoised(x_t, t_start)
+        else:
+            ts = torch.linspace(noise_level_scalar, 0.0, num_diffusion_steps + 1, device=device)
+            for step in range(num_diffusion_steps):
+                t_cur = ts[step]
+                t_next = ts[step + 1]
+                t_cur_b = t_cur.expand(batch_size)
+                denoised, is_real_inferred = self.compressed_to_denoised(x_t, t_cur_b)
+                # Data prediction: re-compress the predicted clean sequence to get x1_hat.
+                x1_hat = self.compress(denoised, is_real_inferred)
+                # Move along the geodesic toward x1_hat so that we land exactly on it at t=0.
+                frac = ((t_cur - t_next) / t_cur.clamp(min=Config.EPS)).clamp(0.0, 1.0)
+                x_t_unit = F.normalize(x_t.reshape(batch_size, -1), p=2, dim=-1)
+                x1_unit = F.normalize(x1_hat.reshape(batch_size, -1), p=2, dim=-1)
+                x_t = (self._slerp(x_t_unit, x1_unit, frac) * self.upwards_norm).view(batch_size, compression_vectors, d_model)
+            # Final clean decode at t=0 for the sharpest token vectors.
+            final_t = torch.zeros(batch_size, device=device)
+            denoised, is_real_inferred = self.compressed_to_denoised(x_t, final_t)
 
         bos_probability_final = self.compute_bos_probability(denoised)
         is_real_inferred_final = self.bos_probs_to_inferred_real_position(bos_probability_final)

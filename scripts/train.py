@@ -6,6 +6,32 @@ from pathlib import Path
 import torch
 torch.set_float32_matmul_precision("high")
 
+# --- Diagnostics: make progress visible and let us capture a hang ---
+# Line-buffer stdout/stderr so prints appear in real time even under nohup/redirect
+# (block-buffering is what makes a slow-but-running job look frozen).
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
+# faulthandler: if the process ever hangs, run `kill -USR1 <pid>` to dump the full
+# Python stack of every thread to stderr WITHOUT killing it — shows exactly where
+# it's stuck (generation / torch.save / dataloader / CUDA). Also dumps on real faults.
+import faulthandler, signal
+faulthandler.enable()
+try:
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
+except (AttributeError, ValueError):
+    pass
+# Optional auto-dump: set ZONKEY_HANG_DUMP_SECONDS=300 to print stacks every N s
+# (useful for an unattended run — a hang shows the same frame on every dump).
+_hang = os.environ.get("ZONKEY_HANG_DUMP_SECONDS")
+if _hang:
+    try:
+        faulthandler.dump_traceback_later(int(_hang), repeat=True)
+    except Exception:
+        pass
+
 # Add the project root to the Python path FIRST
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ['TRANSFORMERS_OFFLINE'] = '1'

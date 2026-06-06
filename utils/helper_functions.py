@@ -1,7 +1,28 @@
 from configs.default_config import Config
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.plugins.io import TorchCheckpointIO
 from torch.utils.tensorboard import SummaryWriter
+import os as _os
+
+
+class SameDirCheckpointIO(TorchCheckpointIO):
+    """Write a checkpoint to a temp file in the SAME directory as the target,
+    then atomically rename it into place.
+
+    The default Lightning/fsspec path stages the entire checkpoint via
+    tempfile.mkstemp() in the system temp dir (/tmp) and then shutil.move()s it.
+    On WSL that means a multi-GB write to a small tmpfs /tmp plus a cross-device
+    move to /mnt/c — which both leaks /tmp and can stall. torch.save() here
+    streams straight to a sibling .tmp on the destination filesystem, then
+    os.replace() is an atomic same-device rename. No /tmp, no cross-device copy.
+    """
+    def save_checkpoint(self, checkpoint, path, storage_options=None):
+        path = str(path)
+        _os.makedirs(_os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp.{_os.getpid()}"
+        torch.save(checkpoint, tmp)
+        _os.replace(tmp, path)
 import torch
 import torch.nn.functional as F
 from typing import Dict, Optional
@@ -172,13 +193,17 @@ def segment_cosine_similarity(input_sequence, high_noise_input, low_noise_input)
 
 def make_trainer_config(time_now):
     project_root = Path(__file__).resolve().parents[1]
-    root_log_dir = project_root / "checkpoints"
+    # Checkpoints land in <repo>/checkpoints by default (override with ZONKEY_CKPT_DIR).
+    # Reliable writes are handled by SameDirCheckpointIO below (no /tmp, no cross-device copy).
+    ckpt_root = os.environ.get("ZONKEY_CKPT_DIR")
+    root_log_dir = Path(ckpt_root).expanduser() if ckpt_root else (project_root / "checkpoints")
     run_id = time_now.strftime("%Y%m%d-%H%M%S")
     run_root = root_log_dir / run_id
     run_root.mkdir(parents=True, exist_ok=True)
+
     checkpoint_callback = ModelCheckpoint(
         every_n_train_steps=Config.SAVE_EVERY_N_STEPS,
-        save_top_k=-1,
+        save_top_k=getattr(Config, "SAVE_TOP_K", -1),
         dirpath=str(run_root),
     )
     # Map Config.DEVICE to Lightning accelerator/devices
@@ -198,6 +223,7 @@ def make_trainer_config(time_now):
         "devices": devices,
         "logger": False,
         "precision": Config.PRECISION,
+        "plugins": [SameDirCheckpointIO()],
     }
     if Config.MAX_EPOCHS and Config.MAX_EPOCHS > 0 and not Config.MAX_STEPS:
         trainer_config["max_epochs"] = Config.MAX_EPOCHS

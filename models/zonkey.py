@@ -5,6 +5,7 @@ import pytorch_lightning as pl
 import sys
 import os
 import io
+import math
 import contextlib
 from torch.utils.checkpoint import checkpoint
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -115,6 +116,21 @@ class PlZonkey(pl.LightningModule):
         for opt in self.trainer.optimizers:
             for group in opt.param_groups:
                 group["lr"] = Config.LEARNING_RATE
+
+    def _scheduled_lr(self):
+        """Linear warmup then cosine decay, keyed off global_step (resume-aware).
+        Manual optimization → we set this on the param groups each optimizer step."""
+        base = Config.LEARNING_RATE
+        warmup = max(1, int(getattr(Config, "WARMUP_STEPS", 0)))
+        decay = int(getattr(Config, "LR_DECAY_STEPS", 0))
+        min_lr = base * float(getattr(Config, "MIN_LR_RATIO", 0.1))
+        step = int(self.global_step)
+        if step < warmup:
+            return base * (step + 1) / warmup
+        if decay <= warmup:
+            return base
+        progress = min(1.0, (step - warmup) / max(1, decay - warmup))
+        return min_lr + 0.5 * (base - min_lr) * (1.0 + math.cos(math.pi * progress))
 
     def on_load_checkpoint(self, checkpoint):
         """
@@ -247,7 +263,7 @@ class PlZonkey(pl.LightningModule):
                         leveled_compressed_temp = self.model.layers[level].add_noise(leveled_compressed[level],noise_level)
                         self.model.generate_sequence_from_level_N(level,fixed_compressed_vectors=leveled_compressed_temp[0][0:1],noise_level=Config.NOISE_LAST_STEP_SIZE[level])
                         print(f"random seq from level {level}: ")
-                        self.model.generate_sequence_from_level_N(level,num_diffusion_steps=250,noise_level=1.0)
+                        self.model.generate_sequence_from_level_N(level,num_diffusion_steps=Config.EVAL_DIFFUSION_STEPS,noise_level=1.0)
                         # print(f"ar random seq from level {level}: ") #not doing ar loss now
                         # self.model.ar_generate_sequence_from_level_N(level)
 
@@ -301,6 +317,9 @@ class PlZonkey(pl.LightningModule):
         should_step = (batch_idx + 1) % Config.GRAD_ACCUMULATION_STEPS == 0
         
         if should_step:
+            lr = self._scheduled_lr()
+            for group in optimizer.param_groups:
+                group["lr"] = lr
             if Config.GRAD_CLIP_VAL > 0:
                 self.clip_gradients(optimizer, gradient_clip_val=Config.GRAD_CLIP_VAL, gradient_clip_algorithm="norm")
             optimizer.step()
