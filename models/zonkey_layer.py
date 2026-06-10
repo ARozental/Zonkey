@@ -671,14 +671,16 @@ class ZonkeyLayer(nn.Module):
 
         if self.level == 0:
             reconstruction_loss, _ = calculate_token_loss(
-                token_ids, denoised, splitter_existence_share, self.previous_layer)
+                token_ids, denoised, splitter_existence_share, self.previous_layer,
+                noise_level=noise_level, regression_power=Config.REGRESSION_T_POWER)
         else:
             reconstruction_loss, _ = calculate_reconstruction_loss(
                 denoised=denoised,
                 is_real_inferred=is_real_inferred,
                 target_sequences=input_sequence,
                 splitter_existence_share=splitter_existence_share,
-                fake_negatives=fake_negatives)
+                fake_negatives=fake_negatives,
+                noise_level=noise_level, regression_power=Config.REGRESSION_T_POWER)
 
         dbos_ce_loss = bce(is_real_inferred, is_real_label, reduction='none')[:, 1:].mean() - bce(is_real_label, is_real_label, reduction='none')[:, 1:].mean()
 
@@ -941,12 +943,30 @@ class ZonkeyLayer(nn.Module):
         )
 
         # === Pass 2: flow-matching denoiser across the whole path, t ~ U(0,1) ===
-        # Single pass: the slerp interpolation *is* the intermediate, so the
-        # DDMM noisy+dirty passes (which only manufactured realistic intermediates)
-        # are no longer needed.
+        # The slerp interpolation gives the smooth global velocity field.
         t_fm = torch.rand(batch, device=clean_compressed.device, dtype=clean_compressed.dtype)
         denoised_fm, fm_losses, is_real_inferred_fm = self.denoise_and_reconstruct(
             clean_compressed, input_sequence, all_sentence_bos_probs, t_fm, splitter_existence_share,
+            token_ids=token_ids,
+            num_sentences_per_doc=num_sentences_per_doc,
+            original_position=original_position,
+            clean=False,
+            fake_negatives=fake_negatives,
+        )
+
+        # === Pass 3: DDMM "dirty" denoiser on a self-generated intermediate ===
+        # Build a realistic off-path state the sampler actually visits (denoise a
+        # noised vector, then re-compress — same as the generation loop), then train
+        # the denoiser to refine it. Closes the train/sample gap that pure-interpolation
+        # FM misses. The intermediate is produced under no_grad; only the final
+        # denoise+reconstruct carries gradient.
+        with torch.no_grad():
+            t_mid = torch.rand(batch, device=clean_compressed.device, dtype=clean_compressed.dtype)
+            denoised_mid, _, is_real_mid = self.denoise_and_reconstruct(clean_compressed, noise_level=t_mid)
+            recompressed = self.compress(denoised_mid, is_real_mid)
+        t_dirty = self.noise_step_size * torch.rand(batch, device=clean_compressed.device, dtype=clean_compressed.dtype)
+        denoised_dirty, dirty_losses, is_real_inferred_dirty = self.denoise_and_reconstruct(
+            recompressed, input_sequence, all_sentence_bos_probs, t_dirty, splitter_existence_share,
             token_ids=token_ids,
             num_sentences_per_doc=num_sentences_per_doc,
             original_position=original_position,
@@ -1009,6 +1029,8 @@ class ZonkeyLayer(nn.Module):
             "fm_bos_loss": fm_losses["bos_loss"],
             "fm_reconstruction_loss": fm_losses["reconstruction_loss"] * Config.DIRTY_RECONSTRUCTION_WEIGHT[self.level],
             "fm_mlm_loss": denoised_mlm_loss * Config.DIRTY_MLM_WEIGHT[self.level],
+            "dirty_bos_loss": dirty_losses["bos_loss"],
+            "dirty_reconstruction_loss": dirty_losses["reconstruction_loss"] * Config.DIRTY_RECONSTRUCTION_WEIGHT[self.level],
         }
 
         return denoised_clean[:input_sequence.shape[0]], clean_compressed, losses, is_real_inferred, fake_negatives_for_upper
@@ -1079,6 +1101,8 @@ class ZonkeyLayer(nn.Module):
         losses["fm_bos_loss"] = losses["fm_bos_loss"] * compression_reweight
         losses["fm_reconstruction_loss"] = losses["fm_reconstruction_loss"] * compression_reweight
         losses["fm_mlm_loss"] = losses["fm_mlm_loss"] * compression_reweight
+        losses["dirty_bos_loss"] = losses["dirty_bos_loss"] * compression_reweight
+        losses["dirty_reconstruction_loss"] = losses["dirty_reconstruction_loss"] * compression_reweight
 
         losses["patch_loss"] = patch_loss*10
         losses["short_sentence_loss"] = short_sentence_loss*10

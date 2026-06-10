@@ -21,6 +21,44 @@ class PlZonkey(pl.LightningModule):
         self.model = Zonkey()
         self.model.compile()
         self.tb_writer = writer
+        # EMA of weights (generation samples from the EMA copy). Stored on CPU to
+        # keep GPU memory free; updated in place (one persistent buffer, not realloc).
+        self.use_ema = bool(getattr(Config, "USE_EMA", False))
+        self.ema_decay = float(getattr(Config, "EMA_DECAY", 0.999))
+        self.ema_update_every = max(1, int(getattr(Config, "EMA_UPDATE_EVERY", 1)))
+        self._ema = None  # lazily initialized list parallel to trainable params
+
+    def _ema_params(self):
+        return [p for p in self.model.parameters() if p.requires_grad]
+
+    @torch.no_grad()
+    def _ema_update(self):
+        if self._ema is None:
+            self._ema = [p.detach().float().cpu().clone() for p in self._ema_params()]
+            return
+        d = self.ema_decay
+        for e, p in zip(self._ema, self._ema_params()):
+            e.mul_(d).add_(p.detach().float().cpu(), alpha=1.0 - d)
+
+    @contextlib.contextmanager
+    def _ema_swapped(self):
+        """Temporarily load EMA weights into the model (for generation), then restore."""
+        if not self.use_ema or self._ema is None:
+            yield
+            return
+        params = self._ema_params()
+        backup = [p.detach().clone() for p in params]
+        try:
+            for p, e in zip(params, self._ema):
+                p.data.copy_(e.to(device=p.device, dtype=p.dtype))
+            yield
+        finally:
+            for p, b in zip(params, backup):
+                p.data.copy_(b)
+
+    def on_save_checkpoint(self, checkpoint):
+        if self.use_ema and self._ema is not None:
+            checkpoint["ema_state"] = [e.clone() for e in self._ema]
 
     def calibrate_memory(self):
         """Run a worst-case forward+backward pass to measure peak GPU memory.
@@ -118,19 +156,15 @@ class PlZonkey(pl.LightningModule):
                 group["lr"] = Config.LEARNING_RATE
 
     def _scheduled_lr(self):
-        """Linear warmup then cosine decay, keyed off global_step (resume-aware).
-        Manual optimization → we set this on the param groups each optimizer step."""
+        """Linear warmup, then hold constant. Keyed off global_step so it resumes
+        correctly across checkpoint restarts and needs no knowledge of total steps
+        or a fixed horizon (decay intentionally omitted for now)."""
         base = Config.LEARNING_RATE
         warmup = max(1, int(getattr(Config, "WARMUP_STEPS", 0)))
-        decay = int(getattr(Config, "LR_DECAY_STEPS", 0))
-        min_lr = base * float(getattr(Config, "MIN_LR_RATIO", 0.1))
         step = int(self.global_step)
         if step < warmup:
             return base * (step + 1) / warmup
-        if decay <= warmup:
-            return base
-        progress = min(1.0, (step - warmup) / max(1, decay - warmup))
-        return min_lr + 0.5 * (base - min_lr) * (1.0 + math.cos(math.pi * progress))
+        return base
 
     def on_load_checkpoint(self, checkpoint):
         """
@@ -162,7 +196,11 @@ class PlZonkey(pl.LightningModule):
                 del checkpoint['optimizer_states']
             if 'lr_schedulers' in checkpoint:
                 del checkpoint['lr_schedulers']
-    
+
+        # Restore EMA weights if present (so EMA survives stop/resume).
+        if self.use_ema and checkpoint.get("ema_state") is not None:
+            self._ema = [e.clone() for e in checkpoint["ema_state"]]
+
     def forward(self, x):
         return self.model(x)
 
@@ -197,11 +235,12 @@ class PlZonkey(pl.LightningModule):
                                 if hasattr(s, "flush"):
                                     s.flush()
 
-                    _tb_redirect = contextlib.redirect_stdout(_Tee(sys.stdout, _tb_text_buf))
+                    _real_stdout = sys.__stdout__ if sys.__stdout__ is not None else sys.stdout
+                    _tb_redirect = contextlib.redirect_stdout(_Tee(_real_stdout, _tb_text_buf))
                 else:
                     _tb_redirect = contextlib.nullcontext()
 
-                with _tb_redirect:
+                with _tb_redirect, self._ema_swapped():
                     sample_indices = torch.randperm(Config.TOKENIZER_VOCAB_SIZE_CHARS,device=Config.DEVICE)[:100]
                     sample_embeddings = self.model.token_embedding_layer(sample_indices)
                     normalized = F.normalize(sample_embeddings, p=2, dim=1)
@@ -324,7 +363,9 @@ class PlZonkey(pl.LightningModule):
                 self.clip_gradients(optimizer, gradient_clip_val=Config.GRAD_CLIP_VAL, gradient_clip_algorithm="norm")
             optimizer.step()
             optimizer.zero_grad()
-        
+            if self.use_ema and (int(self.global_step) % self.ema_update_every == 0):
+                self._ema_update()
+
         if should_log and self.tb_writer is not None:
             self.tb_writer.add_scalar("loss/total", float(total_loss.item()), self.global_step)
             # Log current learning rate

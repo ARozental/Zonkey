@@ -4,6 +4,18 @@ from configs.default_config import Config
 from utils.helper_functions import arc_cosine_similarity_seq
 
 
+def _regression_blend(ce_per_pos, pos_cos, noise_level, regression_power):
+    """Blend the contrastive CE with a direct cosine-regression target, weighted by
+    t^power per sample. Negligible at low noise, dominant near t=1 (where contrastive
+    is ~chance). ce_per_pos, pos_cos: (B, L); noise_level: (B,). Returns (B, L)."""
+    if noise_level is None or regression_power is None:
+        return ce_per_pos
+    nl = noise_level.clamp(0.0, 1.0).reshape(-1, 1)
+    w = nl ** float(regression_power)
+    reg = 1.0 - pos_cos  # 0 when prediction points exactly at the target
+    return (1.0 - w) * ce_per_pos + w * reg
+
+
 def calculate_token_loss(
     original_tokens,
     encoded_sequences,
@@ -11,6 +23,8 @@ def calculate_token_loss(
     token_embedding_layer,
     previous_denoised=None,
     full_reconstruction_ratio=0.85,
+    noise_level=None,
+    regression_power=None,
 ):
     B, L, D = encoded_sequences.shape
     V = token_embedding_layer.weight.shape[0]
@@ -80,8 +94,10 @@ def calculate_token_loss(
         exact_sims = torch.matmul(E_norm, W_norm.t())
         sims = 2 * torch.atanh(torch.clamp(exact_sims, min=Config.EPS-1, max=1-Config.EPS))
         logits = sims
-        loss = F.cross_entropy(logits, true_ids, reduction='none')
-        loss = (loss.reshape(B, L) * splitter_existence_share).sum() / (splitter_existence_share.sum() + Config.EPS)
+        loss = F.cross_entropy(logits, true_ids, reduction='none').reshape(B, L)
+        pos_cos = exact_sims.gather(1, true_ids.view(BL, 1)).squeeze(1).reshape(B, L)
+        loss = _regression_blend(loss, pos_cos, noise_level, regression_power)
+        loss = (loss * splitter_existence_share).sum() / (splitter_existence_share.sum() + Config.EPS)
         return loss, None
 
 
@@ -95,6 +111,8 @@ def calculate_reconstruction_loss(
     num_negatives=63,
     fake_negatives=None,
     full_reconstruction_ratio=0.85,
+    noise_level=None,
+    regression_power=None,
 ):
     batch, seq_len, hidden = denoised.shape
     device = denoised.device
@@ -238,7 +256,9 @@ def calculate_reconstruction_loss(
         
         ce_loss = F.cross_entropy(logits, torch.zeros(N, dtype=torch.long, device=device), reduction='none')
         ce_loss = ce_loss.reshape(batch, seq_len)
+        pos_cos = pos_sim.reshape(batch, seq_len)
+        ce_loss = _regression_blend(ce_loss, pos_cos, noise_level, regression_power)
         weighted_loss = ce_loss * splitter_existence_share * sequence_weight
         total_loss = weighted_loss.sum() / (splitter_existence_share.sum() + Config.EPS)
-        
+
         return total_loss, None

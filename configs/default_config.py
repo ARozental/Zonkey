@@ -40,6 +40,11 @@ class Config:
     MUON_MOMENTUM = 0.95  # Momentum for Muon optimizer
     USE_OPTIMIZER_CHECKPOINT = True #use checkpoint when available to restore optimizer state
 
+    # EMA of weights — generation samples from the EMA copy (much more coherent).
+    USE_EMA = True
+    EMA_DECAY = 0.999
+    EMA_UPDATE_EVERY = 1   # update EMA every N optimizer steps (raise to cut CPU<->GPU copies)
+
 
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -69,6 +74,9 @@ class Config:
     NOISE_LAST_STEP_SIZE = [0.05,0.05]
     DIRTY_RECONSTRUCTION_WEIGHT = [2.5,2.5]
     CLEAN_RECONSTRUCTION_WEIGHT = [0.4,0.4]
+    # High-noise regression blend: loss = (1-t^p)*contrastive + (t^p)*(1-cos_to_target).
+    # p≈4 makes it negligible at low noise and dominant near t=1; set p>=10 to disable.
+    REGRESSION_T_POWER = 4.0
     MLM_WEIGHT = [0.0,2.0] #0.0 for token level always 
     DIRTY_MLM_WEIGHT = [1.0, 1.0] #mirrors MLM_WEIGHT; 0.0 for token level
     DECODER_MLM_WEIGHT = [0.6, 0.4]
