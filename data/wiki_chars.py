@@ -39,7 +39,7 @@ class WikipediaCharsDataset(Dataset):
         article = self.wiki_dataset[idx]
         text = article["text"]
         
-        tokens = [ord(x) % Config.TOKENIZER_VOCAB_SIZE_CHARS for x in text] 
+        tokens = [ord(x) % Config.TOKENIZER_VOCAB_SIZE_CHARS for x in text]
         
         if len(tokens) == Config.MAX_DOC_LENGTHS[0] - 1:
             tokens.append(1)

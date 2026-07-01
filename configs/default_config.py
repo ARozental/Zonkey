@@ -37,6 +37,10 @@ class Config:
     EPS = 1e-7
     EOS_TARGET_BIAS = [-2.0,-2.0,-2.0] #this is a hyperparameter, for slightly better initialization
     USE_MUON = False  # Use Muon optimizer for hidden layers, otherwise use AdamW for all parameters
+    # Muon lr is in SPECTRAL-NORM units (muon.py default 0.02, reference setups 0.02-0.05).
+    # Passing the Adam-scale LEARNING_RATE here froze every hidden matrix ~100x too slow.
+    # Conservative value given tiny batches; only the Adam group uses LEARNING_RATE.
+    MUON_LR = 0.005
     MUON_MOMENTUM = 0.95  # Momentum for Muon optimizer
     USE_OPTIMIZER_CHECKPOINT = True #use checkpoint when available to restore optimizer state
 
@@ -77,6 +81,21 @@ class Config:
     # High-noise regression blend: loss = (1-t^p)*contrastive + (t^p)*(1-cos_to_target).
     # p≈4 makes it negligible at low noise and dominant near t=1; set p>=10 to disable.
     REGRESSION_T_POWER = 4.0
+    # FM-pass t sampling: t = U(0,1)^T_FM_EXPONENT. Slerp keeps cos(x_t,x1)=cos(t*pi/2),
+    # so uniform t spends half of training above 0.71 cosine (too easy). Exponent<1
+    # shifts mass toward high noise (0.5 -> density 2t, median t~0.71).
+    T_FM_EXPONENT = 0.5
+    # Dirty pass: t_mid ~ Beta(1,3) (informative intermediates), t_dirty ~ U(0,DIRTY_T_MAX)
+    # so self-conditioned refinement is trained across the whole noise range.
+    DIRTY_T_MAX = 1.0
+    # Hierarchical generation: decode upper-level outputs at this truthful flow-time
+    # instead of pretending they're clean t=0 vectors (they're slightly off-manifold,
+    # which is exactly the regime the dirty pass trains).
+    CROSS_LEVEL_DECODE_T = 0.1
+    # Self-conditioning: feed the model's previous x1 estimate as an extra prompt token
+    # (dirty pass during training, previous ODE step at sampling). Arch token always
+    # exists; this flag only controls whether real estimates are fed (vs the null token).
+    USE_SELF_COND = True
     MLM_WEIGHT = [0.0,2.0] #0.0 for token level always 
     DIRTY_MLM_WEIGHT = [1.0, 1.0] #mirrors MLM_WEIGHT; 0.0 for token level
     DECODER_MLM_WEIGHT = [0.6, 0.4]

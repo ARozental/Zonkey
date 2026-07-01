@@ -12,9 +12,16 @@ pl = types.ModuleType("pytorch_lightning")
 pl.LightningModule = type("LightningModule", (object,), {})
 cb = types.ModuleType("pytorch_lightning.callbacks")
 cb.ModelCheckpoint = type("ModelCheckpoint", (object,), {})
+pio = types.ModuleType("pytorch_lightning.plugins.io")
+pio.TorchCheckpointIO = type("TorchCheckpointIO", (object,), {})
+ppl = types.ModuleType("pytorch_lightning.plugins")
+ppl.io = pio
 pl.callbacks = cb
+pl.plugins = ppl
 sys.modules["pytorch_lightning"] = pl
 sys.modules["pytorch_lightning.callbacks"] = cb
+sys.modules["pytorch_lightning.plugins"] = ppl
+sys.modules["pytorch_lightning.plugins.io"] = pio
 try:
     import torch.utils.tensorboard  # noqa
 except Exception:

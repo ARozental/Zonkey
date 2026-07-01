@@ -151,20 +151,22 @@ class PlZonkey(pl.LightningModule):
             return True
 
     def on_train_start(self):
+        # Warmup restarts on EVERY run start (fresh or resumed): a resume often comes
+        # with changed hyperparameters, so easing the LR back in is the safe default.
+        self._run_start_step = int(self.global_step)
+        factor = self._warmup_factor()
         for opt in self.trainer.optimizers:
             for group in opt.param_groups:
-                group["lr"] = Config.LEARNING_RATE
+                group["lr"] = group.get("base_lr", Config.LEARNING_RATE) * factor
 
-    def _scheduled_lr(self):
-        """Linear warmup, then hold constant. Keyed off global_step so it resumes
-        correctly across checkpoint restarts and needs no knowledge of total steps
-        or a fixed horizon (decay intentionally omitted for now)."""
-        base = Config.LEARNING_RATE
+    def _warmup_factor(self):
+        """Linear warmup factor in [0,1], then 1.0 forever. Keyed off steps since THIS
+        run started (not absolute global_step), so resuming from a checkpoint warms up
+        again. Multiplies each group's base_lr (Muon and Adam groups have different
+        scales — never overwrite with one value)."""
         warmup = max(1, int(getattr(Config, "WARMUP_STEPS", 0)))
-        step = int(self.global_step)
-        if step < warmup:
-            return base * (step + 1) / warmup
-        return base
+        step = int(self.global_step) - int(getattr(self, "_run_start_step", 0))
+        return min(1.0, (step + 1) / warmup)
 
     def on_load_checkpoint(self, checkpoint):
         """
@@ -298,9 +300,14 @@ class PlZonkey(pl.LightningModule):
                             self.model.generate_sequence_from_level_N(level,fixed_compressed_vectors=leveled_compressed[level][0][1:2])
 
                         print(f"decompressing from level {level} with {Config.NOISE_LAST_STEP_SIZE[level]} noise: ")
-                        noise_level = torch.full((leveled_compressed[level].shape[0],), Config.NOISE_LAST_STEP_SIZE[level], device=leveled_compressed[level].device, dtype=leveled_compressed[level].dtype)
-                        leveled_compressed_temp = self.model.layers[level].add_noise(leveled_compressed[level],noise_level)
-                        self.model.generate_sequence_from_level_N(level,fixed_compressed_vectors=leveled_compressed_temp[0][0:1],noise_level=Config.NOISE_LAST_STEP_SIZE[level])
+                        # Noise exactly the one vector we decode, reshaped to (1, CV, d) so
+                        # flow_interpolate normalizes on the right sphere (noising the whole
+                        # (docs, sentences, feat) tensor flattened per-doc was wrong).
+                        _cv = Config.COMPRESSION_VECTORS[level]
+                        _one_vec = leveled_compressed[level][0][0:1].view(1, _cv, -1)
+                        noise_level = torch.full((1,), Config.NOISE_LAST_STEP_SIZE[level], device=_one_vec.device, dtype=_one_vec.dtype)
+                        _one_vec_noisy = self.model.layers[level].add_noise(_one_vec, noise_level)
+                        self.model.generate_sequence_from_level_N(level,fixed_compressed_vectors=_one_vec_noisy.view(1, -1),noise_level=Config.NOISE_LAST_STEP_SIZE[level])
                         print(f"random seq from level {level}: ")
                         self.model.generate_sequence_from_level_N(level,num_diffusion_steps=Config.EVAL_DIFFUSION_STEPS,noise_level=1.0)
                         # print(f"ar random seq from level {level}: ") #not doing ar loss now
@@ -351,14 +358,20 @@ class PlZonkey(pl.LightningModule):
         # Scale loss for gradient accumulation
         scaled_loss = total_loss / Config.GRAD_ACCUMULATION_STEPS
         self.manual_backward(scaled_loss)
-        
+
+        # Push this batch's clean vectors into each layer's coverage queue AFTER backward,
+        # so the queue is never mutated inside the gradient-checkpointed forward (which is
+        # recomputed during backward and would otherwise see a changed count -> shape error).
+        for layer in self.model.layers:
+            layer.push_clean_to_queue()
+
         # Determine if we should step the optimizer (every N accumulation steps)
         should_step = (batch_idx + 1) % Config.GRAD_ACCUMULATION_STEPS == 0
         
         if should_step:
-            lr = self._scheduled_lr()
+            factor = self._warmup_factor()
             for group in optimizer.param_groups:
-                group["lr"] = lr
+                group["lr"] = group.get("base_lr", Config.LEARNING_RATE) * factor
             if Config.GRAD_CLIP_VAL > 0:
                 self.clip_gradients(optimizer, gradient_clip_val=Config.GRAD_CLIP_VAL, gradient_clip_algorithm="norm")
             optimizer.step()
@@ -390,13 +403,16 @@ class PlZonkey(pl.LightningModule):
                     else:
                         other_params.append(p)
             
-            # Create parameter groups for MuonWithAuxAdam
+            # Create parameter groups for MuonWithAuxAdam.
+            # NOTE: Muon's lr is in spectral-norm units (~0.005-0.05), NOT Adam scale.
+            # base_lr is stored per group; the warmup schedule multiplies it instead of
+            # overwriting every group with the Adam-scale LEARNING_RATE.
             param_groups = []
             if hidden_matrix_params:
-                param_groups.append(dict(params=hidden_matrix_params, lr=Config.LEARNING_RATE, 
+                param_groups.append(dict(params=hidden_matrix_params, lr=Config.MUON_LR,
                                         momentum=Config.MUON_MOMENTUM, use_muon=True))
             if other_params:
-                param_groups.append(dict(params=other_params, lr=Config.LEARNING_RATE, 
+                param_groups.append(dict(params=other_params, lr=Config.LEARNING_RATE,
                                         eps=Config.EPS, use_muon=False))
             
             # Detect if we're in distributed training mode
@@ -406,10 +422,17 @@ class PlZonkey(pl.LightningModule):
                 optimizer = MuonWithAuxAdam(param_groups)
             else:
                 optimizer = SingleDeviceMuonWithAuxAdam(param_groups)
+            # Muon's __init__ asserts exact group keys, so base_lr is attached after
+            # construction. The warmup schedule multiplies base_lr per group instead of
+            # overwriting every group with the (Adam-scale) LEARNING_RATE.
+            for group in optimizer.param_groups:
+                group["base_lr"] = Config.MUON_LR if group.get("use_muon") else Config.LEARNING_RATE
         else:
             # Use standard AdamW for all parameters
             params = [p for p in self.model.parameters() if p.requires_grad]
             optimizer = torch.optim.AdamW(params, lr=Config.LEARNING_RATE, eps=Config.EPS)
+            for group in optimizer.param_groups:
+                group["base_lr"] = Config.LEARNING_RATE
 
         return {"optimizer": optimizer}
 
@@ -469,14 +492,19 @@ class Zonkey(nn.Module):
         doc = initial_seq.squeeze(0)[0:existence_mask.bool().sum().item(),:] # <actual_len,d_model>
         while N>0:
             N-=1
+            # Truthful-t decode: upper-level outputs are slightly off the lower level's
+            # manifold, so decode them at CROSS_LEVEL_DECODE_T (the regime the dirty pass
+            # trains) instead of pretending they're clean t=0 vectors. treat_as_noisy
+            # passes the vectors through as-is — no fresh noise is added.
             seq, existence_mask, is_real_inferred = self.layers[N].generate(
                 fixed_compressed_vectors=doc,
-                noise_level=torch.zeros(doc.shape[0], dtype=torch.float32, device=Config.DEVICE), #just use the denoiser, no actual diffusion done
+                noise_level=torch.full((doc.shape[0],), Config.CROSS_LEVEL_DECODE_T, dtype=torch.float32, device=Config.DEVICE),
+                treat_as_noisy=True,
                 num_diffusion_steps=lower_diffusion_steps, # zero here for no refinement by lower layers
                 existance_cutoff=existance_cutoff #can remove this, no need to hard code it here
                 )
             doc,_,_ = self.layers[N].stitcher(seq, is_real_inferred, torch.tensor([seq.shape[0]], dtype=torch.long, device=seq.device))
-            
+
             doc = self._clip_tail_by_existence(doc, N, existance_cutoff)
             doc = doc.squeeze(0)
         self.print_char_sequence(doc[:100])

@@ -115,16 +115,23 @@ class ZonkeyLayer(nn.Module):
 
         # Flow-time conditioning embedding (replaces the old 2-vector lerp).
         self.time_embedding = TimeEmbedding(d_model)
+
+        # Self-conditioning: the model's previous x1 estimate (compressed space,
+        # flattened) is projected to ONE extra prompt token. When no estimate exists
+        # (clean/FM passes, first sampler step) the learned null token is used, so the
+        # architecture is identical with or without an estimate.
+        self.self_cond_proj = nn.Linear(self.upwards_d_model, d_model)
+        self.null_self_cond = nn.Parameter(torch.zeros(d_model), requires_grad=True)
         
 
 
-        # self.ones = torch.ones(1,Config.COMPRESSION_VECTORS[level],device=Config.DEVICE)
-        self.ones = torch.ones(1,Config.COMPRESSION_VECTORS[level]+1,device=Config.DEVICE)
+        # Prompt mask: [time, self_cond, compressed x CV] -> CV+2 always-real positions.
+        self.ones = torch.ones(1,Config.COMPRESSION_VECTORS[level]+2,device=Config.DEVICE)
         self.denoiser = TransformerEncoder(
             d_model = Config.D_MODEL[level],
             n_heads = Config.NUM_HEADS[level],
             d_ff = Config.D_MODEL[level]*Config.FF_DIM_RATIO,
-            max_seq_len = self.max_seq_len+Config.COMPRESSION_VECTORS[level]+1,
+            max_seq_len = self.max_seq_len+Config.COMPRESSION_VECTORS[level]+2,
             dropout = Config.DROPOUT,
             num_layers = Config.NUM_DENOISER_LAYERS[level]
             )
@@ -138,7 +145,7 @@ class ZonkeyLayer(nn.Module):
             d_model = Config.D_MODEL[level],
             n_heads = Config.NUM_HEADS[level],
             d_ff = Config.D_MODEL[level]*Config.FF_DIM_RATIO,
-            max_seq_len = self.max_seq_len+Config.COMPRESSION_VECTORS[level]+1,
+            max_seq_len = self.max_seq_len+Config.COMPRESSION_VECTORS[level]+2,
             dropout = Config.DROPOUT,
             use_rezero = False,
             decoder = True,
@@ -163,6 +170,7 @@ class ZonkeyLayer(nn.Module):
         self.register_buffer('_drifting_queue', torch.zeros(queue_size, flat_dim), persistent=False)
         self._drifting_queue_ptr = 0
         self._drifting_queue_count = 0
+        self._pending_clean_for_queue = None
 
         if Config.USE_GRADIENT_CHECKPOINTING:
             self.denoise_and_reconstruct = lambda *args, **kwargs: torch.utils.checkpoint.checkpoint(
@@ -171,6 +179,23 @@ class ZonkeyLayer(nn.Module):
         else:
             self.denoise_and_reconstruct = self._denoise_and_reconstruct
     
+    @torch.no_grad()
+    def push_clean_to_queue(self):
+        """Ring-buffer push of the last batch's clean compressed vectors into the
+        coverage memory queue. Called AFTER backward (from training_step) so it never
+        mutates queue state inside the gradient-checkpointed forward/recompute."""
+        pend = getattr(self, "_pending_clean_for_queue", None)
+        if pend is None:
+            return
+        q = self._drifting_queue
+        flat = F.normalize(pend.reshape(pend.shape[0], -1), p=2, dim=-1).to(q.dtype)
+        n = min(flat.shape[0], q.shape[0])
+        idx = (torch.arange(n, device=q.device) + self._drifting_queue_ptr) % q.shape[0]
+        q[idx] = flat[:n]
+        self._drifting_queue_ptr = int((self._drifting_queue_ptr + n) % q.shape[0])
+        self._drifting_queue_count = int(min(self._drifting_queue_count + n, q.shape[0]))
+        self._pending_clean_for_queue = None
+
     def noise_schedule(self, t: torch.Tensor) -> torch.Tensor:
         return t
     
@@ -285,7 +310,8 @@ class ZonkeyLayer(nn.Module):
     def compute_bos_probability_logits(self, vectors: torch.Tensor) -> torch.Tensor:
         return self.bos_layer(vectors).squeeze(-1)+Config.EOS_TARGET_BIAS[self.level]
     
-    def compressed_to_denoised(self, compressed: torch.Tensor, noise_level: torch.Tensor) -> torch.Tensor:
+    def compressed_to_denoised(self, compressed: torch.Tensor, noise_level: torch.Tensor,
+                               self_cond: Optional[torch.Tensor] = None) -> torch.Tensor:
         batch_size = compressed.shape[0]
         # Explicit flow-time conditioning (no cosine inference; t is always known under FM).
         if not torch.is_tensor(noise_level):
@@ -294,25 +320,32 @@ class ZonkeyLayer(nn.Module):
             noise_level = noise_level.expand(batch_size)
         time_vec = self.time_embedding(noise_level).to(compressed.dtype)
 
+        # Self-conditioning token: the model's previous x1 estimate (flattened compressed
+        # space) projected to one prompt token; learned null token when no estimate exists.
+        if self_cond is not None:
+            sc_tok = self.self_cond_proj(self_cond.reshape(batch_size, -1).to(compressed.dtype))
+        else:
+            sc_tok = self.null_self_cond.unsqueeze(0).expand(batch_size, -1)
+
         prompt = torch.cat([
             time_vec.view(batch_size, 1, compressed.shape[2]),
+            sc_tok.view(batch_size, 1, compressed.shape[2]),
             compressed
         ], dim=1)
 
         decompressed = self.decompressor.generate(prompt, Config.MAX_SEQ_LENGTHS[self.level])
-        
-        vectors = decompressed[:, (1+Config.COMPRESSION_VECTORS[self.level]):]
-        # vectors = decompressed[:, Config.COMPRESSION_VECTORS[self.level]:]
+
+        prompt_len = 2 + Config.COMPRESSION_VECTORS[self.level]
+        vectors = decompressed[:, prompt_len:]
         bos_probability = self.compute_bos_probability(vectors)
         is_real_inferred = self.bos_probs_to_inferred_real_position(bos_probability)
-        
+
         cum_not_eos_expanded = torch.cat([
-            self.ones.expand(decompressed.shape[0], -1), 
+            self.ones.expand(decompressed.shape[0], -1),
             is_real_inferred
         ], dim=1)
         denoised = self.denoiser(decompressed, cum_not_eos_expanded)
-        denoised = denoised[:, (1+Config.COMPRESSION_VECTORS[self.level]):, :]
-        # denoised = denoised[:, Config.COMPRESSION_VECTORS[self.level]:, :]
+        denoised = denoised[:, prompt_len:, :]
         denoised = F.normalize(denoised, p=2, dim=-1) * self.dim_norm
         dbos_probability = self.compute_bos_probability(denoised)
         is_real_inferred = self.bos_probs_to_inferred_real_position(dbos_probability)
@@ -656,11 +689,12 @@ class ZonkeyLayer(nn.Module):
         original_position: Optional[torch.Tensor] = None,
         clean=False,
         fake_negatives: Optional[torch.Tensor] = None,
+        self_cond: Optional[torch.Tensor] = None,
         ) -> Tuple[torch.Tensor, Optional[dict], torch.Tensor]:
         # Flow-matching corruption: interpolate the clean compressed vector toward
         # noise along the geodesic by fraction `noise_level` (0 = clean, 1 = noise).
         noisy_compressed = self.add_noise(compressed, noise_level)
-        denoised, is_real_inferred = self.compressed_to_denoised(noisy_compressed, noise_level)
+        denoised, is_real_inferred = self.compressed_to_denoised(noisy_compressed, noise_level, self_cond=self_cond)
 
         if input_sequence is None:
             return denoised, None, is_real_inferred
@@ -942,9 +976,11 @@ class ZonkeyLayer(nn.Module):
             fake_negatives=fake_negatives,
         )
 
-        # === Pass 2: flow-matching denoiser across the whole path, t ~ U(0,1) ===
-        # The slerp interpolation gives the smooth global velocity field.
-        t_fm = torch.rand(batch, device=clean_compressed.device, dtype=clean_compressed.dtype)
+        # === Pass 2: flow-matching denoiser across the whole path ===
+        # t = U(0,1)^T_FM_EXPONENT: slerp keeps cos(x_t, x1) = cos(t*pi/2), so uniform t
+        # spends half of training above 0.71 cosine — too easy. Exponent < 1 shifts the
+        # mass toward the high-noise regime generation actually starts from.
+        t_fm = torch.rand(batch, device=clean_compressed.device, dtype=clean_compressed.dtype) ** Config.T_FM_EXPONENT
         denoised_fm, fm_losses, is_real_inferred_fm = self.denoise_and_reconstruct(
             clean_compressed, input_sequence, all_sentence_bos_probs, t_fm, splitter_existence_share,
             token_ids=token_ids,
@@ -955,23 +991,30 @@ class ZonkeyLayer(nn.Module):
         )
 
         # === Pass 3: DDMM "dirty" denoiser on a self-generated intermediate ===
-        # Build a realistic off-path state the sampler actually visits (denoise a
-        # noised vector, then re-compress — same as the generation loop), then train
-        # the denoiser to refine it. Closes the train/sample gap that pure-interpolation
-        # FM misses. The intermediate is produced under no_grad; only the final
-        # denoise+reconstruct carries gradient.
+        # Build a realistic off-path state the sampler actually visits (denoise a noised
+        # vector, then re-compress — same as the generation loop), then train the denoiser
+        # to refine it, with the intermediate also fed back as self-conditioning (this is
+        # exactly the sampler's situation: previous estimate available, noisy input).
+        # t_mid ~ Beta(1,3) (mean 0.25) keeps the intermediate informative about the
+        # original; the reconstruction is additionally weighted by (1 - t_mid) so the
+        # rare uninformative intermediates don't train the decoder to hallucinate.
+        # t_dirty spans the FULL noise range so self-conditioned refinement is trained
+        # at every t the ODE visits, not just the final landing.
         with torch.no_grad():
-            t_mid = torch.rand(batch, device=clean_compressed.device, dtype=clean_compressed.dtype)
+            t_mid = self.beta_dist.sample((batch,)).to(clean_compressed.dtype)
             denoised_mid, _, is_real_mid = self.denoise_and_reconstruct(clean_compressed, noise_level=t_mid)
             recompressed = self.compress(denoised_mid, is_real_mid)
-        t_dirty = self.noise_step_size * torch.rand(batch, device=clean_compressed.device, dtype=clean_compressed.dtype)
+        t_dirty = Config.DIRTY_T_MAX * torch.rand(batch, device=clean_compressed.device, dtype=clean_compressed.dtype)
+        dirty_self_cond = recompressed if Config.USE_SELF_COND else None
+        dirty_share = splitter_existence_share * (1.0 - t_mid).unsqueeze(1)
         denoised_dirty, dirty_losses, is_real_inferred_dirty = self.denoise_and_reconstruct(
-            recompressed, input_sequence, all_sentence_bos_probs, t_dirty, splitter_existence_share,
+            recompressed, input_sequence, all_sentence_bos_probs, t_dirty, dirty_share,
             token_ids=token_ids,
             num_sentences_per_doc=num_sentences_per_doc,
             original_position=original_position,
             clean=False,
             fake_negatives=fake_negatives,
+            self_cond=dirty_self_cond,
         )
 
         # MLM robustness on the (near-clean) denoised reconstruction.
@@ -987,13 +1030,18 @@ class ZonkeyLayer(nn.Module):
             fake_negatives=fake_negatives,
         )
 
-        # Coverage loss: encourages uniform distribution of compressed vectors on the
-        # sphere. Under flow matching this is load-bearing: the ODE integrates from a
-        # uniform-on-sphere noise prior, so the data marginal must cover the sphere or
-        # the velocity field has to extrapolate into dead zones.
+        # Coverage loss: encourages spread of compressed vectors on the sphere. Only the
+        # filled part of the queue participates (zero rows would corrupt the NN search).
+        # READ-ONLY here: the queue is *not* mutated inside this forward, because under
+        # gradient checkpointing this function is recomputed during backward — mutating
+        # the queue/count here would make the recompute see a different count than the
+        # original forward (shape mismatch). We stash this batch's vectors and push them
+        # after backward (PlZonkey.training_step -> push_clean_to_queue).
         clean_uniformity = compute_improved_coverage_loss(
-            clean_compressed, doc_ids=doc_ids, memory_queue=self._drifting_queue
+            clean_compressed, doc_ids=doc_ids,
+            memory_queue=self._drifting_queue[:self._drifting_queue_count]
         )
+        self._pending_clean_for_queue = clean_compressed.detach()
 
         # Create fake negatives for the level above: shuffle input vectors across
         # sequences at each position, then compress to get chimeric compressed vectors.
@@ -1144,7 +1192,8 @@ class ZonkeyLayer(nn.Module):
         fixed_vectors: Optional[torch.Tensor] = None,
         fixed_compressed_vectors: Optional[torch.Tensor] = None,
         is_real_position: Optional[torch.Tensor] = None,
-        existance_cutoff: float = 0.1
+        existance_cutoff: float = 0.1,
+        treat_as_noisy: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         device = Config.DEVICE
         d_model = Config.D_MODEL[self.level]
@@ -1175,7 +1224,12 @@ class ZonkeyLayer(nn.Module):
             compressed_flat = F.normalize(compressed.reshape(batch_size, -1), p=2, dim=-1) * self.upwards_norm
             compressed = compressed_flat.view(batch_size, compression_vectors, d_model)
             t_start = torch.full((batch_size,), noise_level_scalar, device=device, dtype=compressed.dtype)
-            x_t = self.add_noise(compressed, t_start) if noise_level_scalar > 0 else compressed
+            if treat_as_noisy:
+                # The input is ALREADY an off-manifold/noisy point at t_start (e.g. an
+                # upper level's output): decode it truthfully, don't add fresh noise.
+                x_t = compressed
+            else:
+                x_t = self.add_noise(compressed, t_start) if noise_level_scalar > 0 else compressed
         elif fixed_vectors is not None:
             fixed_vectors = fixed_vectors[:batch_size, :, :]
             fixed_vectors = F.normalize(fixed_vectors, p=2, dim=-1) * self.dim_norm
@@ -1197,13 +1251,16 @@ class ZonkeyLayer(nn.Module):
             denoised, is_real_inferred = self.compressed_to_denoised(x_t, t_start)
         else:
             ts = torch.linspace(noise_level_scalar, 0.0, num_diffusion_steps + 1, device=device)
+            self_cond = None  # first step has no previous estimate (matches training)
             for step in range(num_diffusion_steps):
                 t_cur = ts[step]
                 t_next = ts[step + 1]
                 t_cur_b = t_cur.expand(batch_size)
-                denoised, is_real_inferred = self.compressed_to_denoised(x_t, t_cur_b)
+                denoised, is_real_inferred = self.compressed_to_denoised(x_t, t_cur_b, self_cond=self_cond)
                 # Data prediction: re-compress the predicted clean sequence to get x1_hat.
                 x1_hat = self.compress(denoised, is_real_inferred)
+                if Config.USE_SELF_COND:
+                    self_cond = x1_hat  # feed this step's estimate to the next step
                 # Move along the geodesic toward x1_hat so that we land exactly on it at t=0.
                 frac = ((t_cur - t_next) / t_cur.clamp(min=Config.EPS)).clamp(0.0, 1.0)
                 x_t_unit = F.normalize(x_t.reshape(batch_size, -1), p=2, dim=-1)
@@ -1211,7 +1268,7 @@ class ZonkeyLayer(nn.Module):
                 x_t = (self._slerp(x_t_unit, x1_unit, frac) * self.upwards_norm).view(batch_size, compression_vectors, d_model)
             # Final clean decode at t=0 for the sharpest token vectors.
             final_t = torch.zeros(batch_size, device=device)
-            denoised, is_real_inferred = self.compressed_to_denoised(x_t, final_t)
+            denoised, is_real_inferred = self.compressed_to_denoised(x_t, final_t, self_cond=self_cond)
 
         bos_probability_final = self.compute_bos_probability(denoised)
         is_real_inferred_final = self.bos_probs_to_inferred_real_position(bos_probability_final)
