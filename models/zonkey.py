@@ -14,6 +14,47 @@ from models.zonkey_layer import ZonkeyLayer
 from muon import SingleDeviceMuonWithAuxAdam, MuonWithAuxAdam
 import torch.distributed as dist
 
+# Detached / logging-only keys. Including them in the mean rescales real losses
+# without training anything (avg_bos_prob is .detach()'d).
+METRIC_LOSS_KEYS = frozenset({"avg_bos_prob"})
+
+
+def _as_loss_tensor(value):
+    if isinstance(value, torch.Tensor):
+        t = value
+    elif hasattr(value, "tensor"):
+        t = value.tensor
+    else:
+        return None
+    return t if t.ndim == 0 else t.mean()
+
+
+def aggregate_leveled_losses(leveled_losses):
+    """Mean of non-metric losses per level, then LEVEL_LOSS_WEIGHT[l]. Scale of the
+    per-level mean is preserved (not a sum) so the effective LR does not jump."""
+    total = None
+    level_totals = []
+    weights = getattr(Config, "LEVEL_LOSS_WEIGHT", None)
+    for l, losses in enumerate(leveled_losses):
+        vals = []
+        for name, value in losses.items():
+            if name in METRIC_LOSS_KEYS:
+                continue
+            t = _as_loss_tensor(value)
+            if t is not None:
+                vals.append(t)
+        if not vals:
+            level_totals.append(None)
+            continue
+        lvl = torch.stack(vals).mean()
+        if weights is not None and l < len(weights):
+            lvl = lvl * weights[l]
+        level_totals.append(lvl)
+        total = lvl if total is None else total + lvl
+    if total is None:
+        raise RuntimeError("aggregate_leveled_losses: no loss tensors")
+    return total, level_totals
+
 class PlZonkey(pl.LightningModule):
     def __init__(self, writer=None):
         super().__init__()
@@ -98,20 +139,7 @@ class PlZonkey(pl.LightningModule):
             leveled_compressed, leveled_losses = self.model.forward(batch)
 
             # Replicate the same loss aggregation as training_step
-            total_loss = torch.zeros(1, device=device)
-            # for l in range(len(leveled_losses) - 1):
-            #     leveled_losses[l]["clean_mlm_loss"] = leveled_losses[l + 1]["clean_mlm_loss"]
-            # del leveled_losses[len(leveled_losses) - 1]["clean_mlm_loss"]
-
-            for l in range(len(leveled_losses)):
-                vals = []
-                for name, value in leveled_losses[l].items():
-                    if isinstance(value, torch.Tensor):
-                        vals.append(value)
-                    elif hasattr(value, 'tensor'):
-                        vals.append(value.tensor)
-                if vals:
-                    total_loss = total_loss + torch.stack(vals).mean()
+            total_loss, _ = aggregate_leveled_losses(leveled_losses)
 
             # Full backward pass (this is where peak memory usually occurs)
             total_loss.backward()
@@ -157,7 +185,12 @@ class PlZonkey(pl.LightningModule):
         factor = self._warmup_factor()
         for opt in self.trainer.optimizers:
             for group in opt.param_groups:
-                group["lr"] = group.get("base_lr", Config.LEARNING_RATE) * factor
+                # Lightning restored optimizer state clobbers base_lr with the OLD
+                # checkpoint value; re-assert it from the CURRENT config so a changed
+                # LR on resume actually takes effect.
+                group["base_lr"] = (Config.MUON_LR if group.get("use_muon")
+                                    else Config.LEARNING_RATE)
+                group["lr"] = group["base_lr"] * factor
 
     def _warmup_factor(self):
         """Linear warmup factor in [0,1], then 1.0 forever. Keyed off steps since THIS
@@ -198,6 +231,19 @@ class PlZonkey(pl.LightningModule):
                 del checkpoint['optimizer_states']
             if 'lr_schedulers' in checkpoint:
                 del checkpoint['lr_schedulers']
+
+        # Overwrite the LR baked into the restored optimizer state with the CURRENT
+        # config value. PyTorch's optimizer.load_state_dict() replaces param_groups
+        # wholesale (keeping only `params`), so a stale `lr`/`base_lr` from the
+        # checkpoint would otherwise silently override a changed config on resume.
+        # Mutating the checkpoint dict here is ordering-independent — it always runs
+        # before the restore applies.
+        if 'optimizer_states' in checkpoint:
+            for opt_state in checkpoint['optimizer_states']:
+                for group in opt_state.get('param_groups', []):
+                    new_lr = Config.MUON_LR if group.get('use_muon') else Config.LEARNING_RATE
+                    group['lr'] = new_lr
+                    group['base_lr'] = new_lr
 
         # Restore EMA weights if present (so EMA survives stop/resume).
         if self.use_ema and checkpoint.get("ema_state") is not None:
@@ -288,16 +334,33 @@ class PlZonkey(pl.LightningModule):
 
                     # Generate samples from all levels
                     for level in range(len(leveled_compressed)):
+                        _xl_t = float(Config.CROSS_LEVEL_DECODE_T)
                         if level > 0:
-                            print(f"text from level {level} lower_diffusion_steps=0: ")
-                            self.model.generate_sequence_from_level_N(level,num_diffusion_steps=0,fixed_compressed_vectors=leveled_compressed[level][0][0:1],noise_level=0.0,existance_cutoff=0.1,lower_diffusion_steps=0)
-                        
-                        print("-----")    
-                        print(f"decompressing from level {level}: ")
-                        self.model.generate_sequence_from_level_N(level,fixed_compressed_vectors=leveled_compressed[level][0][0:1])
-                        if len(leveled_compressed[level])>1 and level>0:
-                            print(f"decompressing from level {level} s2: ")
-                            self.model.generate_sequence_from_level_N(level,fixed_compressed_vectors=leveled_compressed[level][0][1:2])
+                            print(f"decompressing CLEAN from level {level} (L{level}@t=0, lower@t=0): ")
+                            self.model.generate_sequence_from_level_N(
+                                level, num_diffusion_steps=0,
+                                fixed_compressed_vectors=leveled_compressed[level][0][0:1],
+                                noise_level=0.0, existance_cutoff=0.1,
+                                lower_diffusion_steps=0, lower_t=0.0)
+                            print(f"decompressing XL-t from level {level} (L{level}@t=0, lower@t={_xl_t}): ")
+                            self.model.generate_sequence_from_level_N(
+                                level, num_diffusion_steps=0,
+                                fixed_compressed_vectors=leveled_compressed[level][0][0:1],
+                                noise_level=0.0, existance_cutoff=0.1,
+                                lower_diffusion_steps=0, lower_t=_xl_t)
+                        else:
+                            print(f"decompressing CLEAN from level {level}: ")
+                            self.model.generate_sequence_from_level_N(
+                                level, fixed_compressed_vectors=leveled_compressed[level][0][0:1],
+                                noise_level=0.0, existance_cutoff=0.1)
+
+                        if len(leveled_compressed[level]) > 1 and level > 0:
+                            print(f"decompressing CLEAN from level {level} s2: ")
+                            self.model.generate_sequence_from_level_N(
+                                level, num_diffusion_steps=0,
+                                fixed_compressed_vectors=leveled_compressed[level][0][1:2],
+                                noise_level=0.0, existance_cutoff=0.1,
+                                lower_diffusion_steps=0, lower_t=0.0)
 
                         print(f"decompressing from level {level} with {Config.NOISE_LAST_STEP_SIZE[level]} noise: ")
                         # Noise exactly the one vector we decode, reshaped to (1, CV, d) so
@@ -307,11 +370,14 @@ class PlZonkey(pl.LightningModule):
                         _one_vec = leveled_compressed[level][0][0:1].view(1, _cv, -1)
                         noise_level = torch.full((1,), Config.NOISE_LAST_STEP_SIZE[level], device=_one_vec.device, dtype=_one_vec.dtype)
                         _one_vec_noisy = self.model.layers[level].add_noise(_one_vec, noise_level)
-                        self.model.generate_sequence_from_level_N(level,fixed_compressed_vectors=_one_vec_noisy.view(1, -1),noise_level=Config.NOISE_LAST_STEP_SIZE[level])
+                        self.model.generate_sequence_from_level_N(
+                            level, fixed_compressed_vectors=_one_vec_noisy.view(1, -1),
+                            noise_level=Config.NOISE_LAST_STEP_SIZE[level], existance_cutoff=0.1,
+                            lower_t=_xl_t)
                         print(f"random seq from level {level}: ")
-                        self.model.generate_sequence_from_level_N(level,num_diffusion_steps=Config.EVAL_DIFFUSION_STEPS,noise_level=1.0)
-                        # print(f"ar random seq from level {level}: ") #not doing ar loss now
-                        # self.model.ar_generate_sequence_from_level_N(level)
+                        self.model.generate_sequence_from_level_N(
+                            level, num_diffusion_steps=Config.EVAL_DIFFUSION_STEPS, noise_level=1.0,
+                            existance_cutoff=0.1, lower_t=_xl_t)
 
                 
                     # Clean up generation artifacts to free GPU memory
@@ -327,31 +393,17 @@ class PlZonkey(pl.LightningModule):
             torch.cuda.empty_cache()  # Free fragmented memory
 
         should_log = (self.global_step % 5 == 0)
-        # Collect loss values for total_loss computation (fast, no dict creation)
-        all_loss_values = [[] for _ in range(len(leveled_losses))]
-        total_loss = 0
-        
-        # Moving the MLM down a level for leveled weight calculations
-        # for l in range(len(leveled_losses)-1):
-        #     leveled_losses[l]["clean_mlm_loss"] = leveled_losses[l+1]["clean_mlm_loss"]
-        # del leveled_losses[len(leveled_losses)-1]["clean_mlm_loss"]
+        total_loss, level_totals = aggregate_leveled_losses(leveled_losses)
 
-        # Compute total loss from all levels equally
-        for l in range(len(leveled_losses)):
-            for name, value in leveled_losses[l].items():
-                all_loss_values[l].append(value)
-                
-                # Only log to TensorBoard occasionally (skip Lightning's self.log entirely)
-                if should_log and self.tb_writer is not None:
-                    if not isinstance(value, torch.Tensor):
-                        item = value.tensor.item()
-                    else:
-                        item = value.item()
-                    self.tb_writer.add_scalar(f"level_{l}/{name}", float(item), self.global_step)
-            total_loss_level = torch.stack(all_loss_values[l]).mean()
-            total_loss += total_loss_level
-            if self.tb_writer is not None:
-                self.tb_writer.add_scalar(f"loss/_{l}", float(total_loss_level.item()), self.global_step)
+        for l, losses in enumerate(leveled_losses):
+            if should_log and self.tb_writer is not None:
+                for name, value in losses.items():
+                    t = _as_loss_tensor(value)
+                    if t is None:
+                        continue
+                    self.tb_writer.add_scalar(f"level_{l}/{name}", float(t.item()), self.global_step)
+            if self.tb_writer is not None and level_totals[l] is not None:
+                self.tb_writer.add_scalar(f"loss/_{l}", float(level_totals[l].item()), self.global_step)
                 
 
 
@@ -386,7 +438,7 @@ class PlZonkey(pl.LightningModule):
             self.tb_writer.add_scalar("training/learning_rate", current_lr, self.global_step)
             # Debug: print LR every 100 steps to verify decay
         
-        del all_loss_values, total_loss
+        del total_loss
         return None
 
     def configure_optimizers(self):
@@ -481,7 +533,7 @@ class Zonkey(nn.Module):
         print("".join([chr(x) for x in tokens_out]))
         return 
         
-    def generate_sequence_from_level_N(self,N,num_diffusion_steps=0,fixed_compressed_vectors=None,noise_level=0.0,existance_cutoff=0.5,lower_diffusion_steps=0):
+    def generate_sequence_from_level_N(self,N,num_diffusion_steps=0,fixed_compressed_vectors=None,noise_level=0.0,existance_cutoff=0.1,lower_diffusion_steps=0,lower_t=None):
         #get initial sequence, 
         initial_seq, existence_mask, is_real_inferred_final =  self.layers[N].generate(
             batch_size=1,
@@ -490,18 +542,26 @@ class Zonkey(nn.Module):
             noise_level=torch.tensor(noise_level, dtype=torch.float32, device=Config.DEVICE),
             existance_cutoff=existance_cutoff)
         doc = initial_seq.squeeze(0)[0:existence_mask.bool().sum().item(),:] # <actual_len,d_model>
+        if lower_t is None:
+            top_nl = noise_level
+            if torch.is_tensor(top_nl):
+                top_nl = float(top_nl.reshape(-1)[0].item())
+            else:
+                top_nl = float(top_nl)
+            # Clean recon of a dataset code: children at t=0. Unconditional / noised:
+            # children at CROSS_LEVEL_DECODE_T (the xl training pass).
+            if fixed_compressed_vectors is None or top_nl > 0.0:
+                lower_t = float(Config.CROSS_LEVEL_DECODE_T)
+            else:
+                lower_t = 0.0
         while N>0:
             N-=1
-            # Truthful-t decode: upper-level outputs are slightly off the lower level's
-            # manifold, so decode them at CROSS_LEVEL_DECODE_T (the regime the dirty pass
-            # trains) instead of pretending they're clean t=0 vectors. treat_as_noisy
-            # passes the vectors through as-is — no fresh noise is added.
             seq, existence_mask, is_real_inferred = self.layers[N].generate(
                 fixed_compressed_vectors=doc,
-                noise_level=torch.full((doc.shape[0],), Config.CROSS_LEVEL_DECODE_T, dtype=torch.float32, device=Config.DEVICE),
+                noise_level=torch.full((doc.shape[0],), float(lower_t), dtype=torch.float32, device=Config.DEVICE),
                 treat_as_noisy=True,
                 num_diffusion_steps=lower_diffusion_steps, # zero here for no refinement by lower layers
-                existance_cutoff=existance_cutoff #can remove this, no need to hard code it here
+                existance_cutoff=existance_cutoff
                 )
             doc,_,_ = self.layers[N].stitcher(seq, is_real_inferred, torch.tensor([seq.shape[0]], dtype=torch.long, device=seq.device))
 
@@ -510,7 +570,7 @@ class Zonkey(nn.Module):
         self.print_char_sequence(doc[:100])
         return doc
 
-    def ar_generate_sequence_from_level_N(self, N, existance_cutoff=0.5):
+    def ar_generate_sequence_from_level_N(self, N, existance_cutoff=0.1):
         initial_seq, existence_mask, is_real_inferred_final = self.layers[N].ar_generate()
         doc = initial_seq.squeeze(0)[0:existence_mask.bool().sum().item(), :]
         level = N

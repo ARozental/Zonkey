@@ -45,7 +45,7 @@ Config.USE_GRADIENT_CHECKPOINTING = bool(int(os.environ.get("GC", "0")))
 
 import torch
 torch.manual_seed(0)
-from models.zonkey import Zonkey
+from models.zonkey import Zonkey, aggregate_leveled_losses
 
 device = "cpu"
 model = Zonkey().to(device)
@@ -68,16 +68,8 @@ for step in range(4):
     batch = make_batch()
     leveled_compressed, leveled_losses = model.forward(batch)
 
-    total_loss = 0.0
-    per_level = []
-    for l in range(len(leveled_losses)):
-        vals = []
-        for name, value in leveled_losses[l].items():
-            if isinstance(value, torch.Tensor):
-                vals.append(value if value.ndim == 0 else value.mean())
-        lvl = torch.stack(vals).mean()
-        per_level.append(lvl.item())
-        total_loss = total_loss + lvl
+    total_loss, per_level_t = aggregate_leveled_losses(leveled_losses)
+    per_level = [t.item() for t in per_level_t]
 
     opt.zero_grad()
     total_loss.backward()
@@ -93,6 +85,13 @@ for step in range(4):
     opt.step()
 
     finite = torch.isfinite(total_loss).item()
+    if step == 0:
+        keys0 = set(leveled_losses[0].keys())
+        keys1 = set(leveled_losses[1].keys())
+        for k in ("xl_reconstruction_loss", "xl_bos_loss", "fm_compressed_fm_loss", "average_bos_loss", "avg_bos_prob"):
+            assert k in keys0, f"missing {k} at L0, have {sorted(keys0)}"
+            assert k in keys1, f"missing {k} at L1, have {sorted(keys1)}"
+        print(f"  L0 keys include xl/fm and avg_bos_prob (metric)={('avg_bos_prob' in keys0)}")
     print(f"step {step}: total_loss={total_loss.item():.4f} per_level={['%.3f'%x for x in per_level]} "
           f"grad_norm={gnorm:.3f} params_with_grad={n_grad} finite={finite}")
     assert finite, "non-finite loss!"
@@ -107,8 +106,12 @@ with torch.no_grad():
     print(f"  decode@t=0  -> denoised {tuple(den.shape)}, exist_sum={emask.sum().item():.1f}")
     den2, _, _ = model.layers[0].generate(num_diffusion_steps=8, noise_level=1.0)
     print(f"  ODE 8-step from noise -> denoised {tuple(den2.shape)}")
-    model.generate_sequence_from_level_N(1, fixed_compressed_vectors=leveled_compressed[1][0][0:1])
-    print("  generate_sequence_from_level_N(1) OK")
+    model.generate_sequence_from_level_N(1, fixed_compressed_vectors=leveled_compressed[1][0][0:1],
+                                         noise_level=0.0, lower_t=0.0)
+    print("  generate CLEAN from level 1 OK")
+    model.generate_sequence_from_level_N(1, fixed_compressed_vectors=leveled_compressed[1][0][0:1],
+                                         noise_level=0.0, lower_t=Config.CROSS_LEVEL_DECODE_T)
+    print("  generate XL-t from level 1 OK")
 
     # Mirror the exact eval-block primitives in zonkey.py:245-250.
     lvl = 1

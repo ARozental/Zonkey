@@ -25,6 +25,7 @@ def calculate_token_loss(
     full_reconstruction_ratio=0.85,
     noise_level=None,
     regression_power=None,
+    sample_weight=None,
 ):
     B, L, D = encoded_sequences.shape
     V = token_embedding_layer.weight.shape[0]
@@ -97,7 +98,11 @@ def calculate_token_loss(
         loss = F.cross_entropy(logits, true_ids, reduction='none').reshape(B, L)
         pos_cos = exact_sims.gather(1, true_ids.view(BL, 1)).squeeze(1).reshape(B, L)
         loss = _regression_blend(loss, pos_cos, noise_level, regression_power)
-        loss = (loss * splitter_existence_share).sum() / (splitter_existence_share.sum() + Config.EPS)
+        w = splitter_existence_share
+        if sample_weight is not None:
+            w = w * sample_weight.reshape(-1, 1).to(dtype=w.dtype)
+        # Divide by un-gated existence so (1-t)^p actually shrinks the scalar, not just re-averages.
+        loss = (loss * w).sum() / (splitter_existence_share.sum() + Config.EPS)
         return loss, None
 
 
@@ -113,6 +118,7 @@ def calculate_reconstruction_loss(
     full_reconstruction_ratio=0.85,
     noise_level=None,
     regression_power=None,
+    sample_weight=None,
 ):
     batch, seq_len, hidden = denoised.shape
     device = denoised.device
@@ -258,7 +264,15 @@ def calculate_reconstruction_loss(
         ce_loss = ce_loss.reshape(batch, seq_len)
         pos_cos = pos_sim.reshape(batch, seq_len)
         ce_loss = _regression_blend(ce_loss, pos_cos, noise_level, regression_power)
-        weighted_loss = ce_loss * splitter_existence_share * sequence_weight
-        total_loss = weighted_loss.sum() / (splitter_existence_share.sum() + Config.EPS)
+        # Absolute pull to the positive. atanh-InfoNCE logits are unbounded, but the
+        # softmax still saturates once the positive beats easy negatives — (1-cos)
+        # keeps a gradient all the way to the manifold.
+        direct_w = float(getattr(Config, "DIRECT_COSINE_WEIGHT", 0.0))
+        if direct_w != 0.0:
+            ce_loss = ce_loss + direct_w * (1.0 - pos_cos)
+        w = splitter_existence_share * sequence_weight
+        if sample_weight is not None:
+            w = w * sample_weight.reshape(-1, 1).to(dtype=w.dtype)
+        total_loss = (ce_loss * w).sum() / (splitter_existence_share.sum() + Config.EPS)
 
         return total_loss, None

@@ -96,8 +96,17 @@ class Config:
     # (dirty pass during training, previous ODE step at sampling). Arch token always
     # exists; this flag only controls whether real estimates are fed (vs the null token).
     USE_SELF_COND = True
-    MLM_WEIGHT = [0.0,2.0] #0.0 for token level always 
-    DIRTY_MLM_WEIGHT = [1.0, 1.0] #mirrors MLM_WEIGHT; 0.0 for token level
+    MLM_WEIGHT = [0.0,2.0]
+    DIRTY_MLM_WEIGHT = [1.0, 1.0]
     DECODER_MLM_WEIGHT = [0.6, 0.4]
-    EXISTS_WEIGHT = [0.05,0.05] 
+    EXISTS_WEIGHT = [0.05,0.05]
+    # Per-sample gate on sequence reconstruction for FM/dirty/xl (not BOS, not clean).
+    # Multiplies recon by (1-t)^p so high-t is not exact-sequence CE (barycenter).
+    SEQUENCE_RECON_T_GATE_POWER = 2.0
+    # Cosine in compressed space: 1 - cos(compress(decode(x_t)), x0). Supervises the
+    # sampler's x1_hat at high t where sequence recon is gated off.
+    COMPRESSED_FM_WEIGHT = [1.0, 1.0]
+    # Always-on (1-cos) added to L>0 contrastive recon. InfoNCE+atanh can still
+    # saturate vs easy negatives before the positive is on-manifold.
+    DIRECT_COSINE_WEIGHT = 0.5 
     

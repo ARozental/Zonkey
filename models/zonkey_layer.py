@@ -690,10 +690,14 @@ class ZonkeyLayer(nn.Module):
         clean=False,
         fake_negatives: Optional[torch.Tensor] = None,
         self_cond: Optional[torch.Tensor] = None,
+        skip_add_noise: bool = False,
+        x0_target: Optional[torch.Tensor] = None,
         ) -> Tuple[torch.Tensor, Optional[dict], torch.Tensor]:
         # Flow-matching corruption: interpolate the clean compressed vector toward
         # noise along the geodesic by fraction `noise_level` (0 = clean, 1 = noise).
-        noisy_compressed = self.add_noise(compressed, noise_level)
+        # skip_add_noise: the input is already an off-manifold point at `noise_level`
+        # (cross-level decode). Matches generate(..., treat_as_noisy=True).
+        noisy_compressed = compressed if skip_add_noise else self.add_noise(compressed, noise_level)
         denoised, is_real_inferred = self.compressed_to_denoised(noisy_compressed, noise_level, self_cond=self_cond)
 
         if input_sequence is None:
@@ -703,10 +707,20 @@ class ZonkeyLayer(nn.Module):
         with torch.no_grad():
             is_real_label = self.bos_probs_to_inferred_real_position(all_sentence_bos_probs)
 
+        # Per-sample (1-t)^p on sequence recon for non-clean passes. Divide-by-existence
+        # (not by gated mass) so high t actually shrinks the scalar. BOS is not gated.
+        sample_weight = None
+        if (not clean) and noise_level is not None:
+            gate_p = float(getattr(Config, "SEQUENCE_RECON_T_GATE_POWER", 0.0))
+            if gate_p != 0.0:
+                t = noise_level.clamp(0.0, 1.0).reshape(-1)
+                sample_weight = (1.0 - t).clamp(min=0.0) ** gate_p
+
         if self.level == 0:
             reconstruction_loss, _ = calculate_token_loss(
                 token_ids, denoised, splitter_existence_share, self.previous_layer,
-                noise_level=noise_level, regression_power=Config.REGRESSION_T_POWER)
+                noise_level=noise_level, regression_power=Config.REGRESSION_T_POWER,
+                sample_weight=sample_weight)
         else:
             reconstruction_loss, _ = calculate_reconstruction_loss(
                 denoised=denoised,
@@ -714,7 +728,8 @@ class ZonkeyLayer(nn.Module):
                 target_sequences=input_sequence,
                 splitter_existence_share=splitter_existence_share,
                 fake_negatives=fake_negatives,
-                noise_level=noise_level, regression_power=Config.REGRESSION_T_POWER)
+                noise_level=noise_level, regression_power=Config.REGRESSION_T_POWER,
+                sample_weight=sample_weight)
 
         dbos_ce_loss = bce(is_real_inferred, is_real_label, reduction='none')[:, 1:].mean() - bce(is_real_label, is_real_label, reduction='none')[:, 1:].mean()
 
@@ -722,6 +737,17 @@ class ZonkeyLayer(nn.Module):
             "reconstruction_loss": reconstruction_loss,
             "bos_loss": dbos_ce_loss * Config.EXISTS_WEIGHT[self.level],
         }
+
+        # Compressed-space x0 term: the ODE integrates x1_hat = compress(decode(x_t)).
+        # Keep this on at high t where sequence recon is gated off. Skip on the clean
+        # pass (redundant with recon) and whenever the caller didn't ask for it.
+        if not clean:
+            fm_target = compressed if x0_target is None else x0_target
+            x1_hat = self.compress(denoised, is_real_inferred)
+            B = x1_hat.shape[0]
+            x1_flat = F.normalize(x1_hat.reshape(B, -1), p=2, dim=-1)
+            tgt_flat = F.normalize(fm_target.reshape(B, -1), p=2, dim=-1)
+            losses["compressed_fm_loss"] = (1.0 - (x1_flat * tgt_flat).sum(-1)).mean()
 
         # Stitcher / document-reassembly losses only make sense near the data
         # manifold, so they are computed only on the clean (t~0) structural pass.
@@ -1015,6 +1041,25 @@ class ZonkeyLayer(nn.Module):
             clean=False,
             fake_negatives=fake_negatives,
             self_cond=dirty_self_cond,
+            x0_target=clean_compressed,
+        )
+
+        # === Pass 4: cross-level decode (matches generate_sequence_from_level_N descent) ===
+        # Inference does treat_as_noisy=True at CROSS_LEVEL_DECODE_T with null self-cond
+        # and no extra gaussian. The dirty pass is a different corruption (slerp + self_cond).
+        t_xl = torch.full(
+            (batch,), float(Config.CROSS_LEVEL_DECODE_T),
+            device=clean_compressed.device, dtype=clean_compressed.dtype)
+        _, xl_losses, _ = self.denoise_and_reconstruct(
+            recompressed.detach(), input_sequence, all_sentence_bos_probs, t_xl, splitter_existence_share,
+            token_ids=token_ids,
+            num_sentences_per_doc=num_sentences_per_doc,
+            original_position=original_position,
+            clean=False,
+            fake_negatives=fake_negatives,
+            self_cond=None,
+            skip_add_noise=True,
+            x0_target=clean_compressed,
         )
 
         # MLM robustness on the (near-clean) denoised reconstruction.
@@ -1067,6 +1112,7 @@ class ZonkeyLayer(nn.Module):
         # Combine and rename losses. The "fm_*" terms (the flow-matching denoiser
         # pass) reuse the old DIRTY_* config weights so existing config files keep
         # working unchanged.
+        fm_w = Config.COMPRESSED_FM_WEIGHT[self.level] if hasattr(Config, "COMPRESSED_FM_WEIGHT") else 1.0
         losses = {
             "coverage_loss": clean_uniformity * Config.COVERAGE_WEIGHT[self.level],
             "clean_bos_loss": clean_losses["bos_loss"],
@@ -1076,9 +1122,14 @@ class ZonkeyLayer(nn.Module):
             "clean_stitcher_sequence_loss": clean_losses["stitcher_sequence_loss"],
             "fm_bos_loss": fm_losses["bos_loss"],
             "fm_reconstruction_loss": fm_losses["reconstruction_loss"] * Config.DIRTY_RECONSTRUCTION_WEIGHT[self.level],
+            "fm_compressed_fm_loss": fm_losses["compressed_fm_loss"] * fm_w,
             "fm_mlm_loss": denoised_mlm_loss * Config.DIRTY_MLM_WEIGHT[self.level],
             "dirty_bos_loss": dirty_losses["bos_loss"],
             "dirty_reconstruction_loss": dirty_losses["reconstruction_loss"] * Config.DIRTY_RECONSTRUCTION_WEIGHT[self.level],
+            "dirty_compressed_fm_loss": dirty_losses["compressed_fm_loss"] * fm_w,
+            "xl_bos_loss": xl_losses["bos_loss"],
+            "xl_reconstruction_loss": xl_losses["reconstruction_loss"],
+            "xl_compressed_fm_loss": xl_losses["compressed_fm_loss"] * fm_w,
         }
 
         return denoised_clean[:input_sequence.shape[0]], clean_compressed, losses, is_real_inferred, fake_negatives_for_upper
@@ -1137,20 +1188,17 @@ class ZonkeyLayer(nn.Module):
         stitched_docs, total_position_loss, total_sequence_loss = self.stitcher(all_sentence_vectors, is_real_inferred, num_sentences_per_doc, original_position=original_position, original_input_sequences=all_sentence_vectors,all_p_exist_share=all_p_exist_share,all_tokens=all_tokens)
         
         losses["avg_bos_prob"] = bos_per_position.detach()
-        wanted_bos_prob = Config.COMPRESSION_VECTORS[self.level]/Config.MAX_SEQ_LENGTHS[self.level]
-        bos_per_position = torch.maximum(bos_per_position, torch.tensor(wanted_bos_prob, device=bos_per_position.device))
-        losses["average_bos_loss"] = ((bos_per_position+1-wanted_bos_prob)**2 - 1)*Config.COMPRESSION_PENALTY[self.level]
-        
-        # Reweight quality losses by realized compression rate (unchanged intent).
-        compression_reweight = (bos_per_position + 0.1) / (wanted_bos_prob + 0.1)
-        losses["clean_reconstruction_loss"] = losses["clean_reconstruction_loss"] * compression_reweight
-        losses["clean_stitcher_position_loss"] = losses["clean_stitcher_position_loss"] * compression_reweight
-        losses["clean_stitcher_sequence_loss"] = losses["clean_stitcher_sequence_loss"] * compression_reweight
-        losses["fm_bos_loss"] = losses["fm_bos_loss"] * compression_reweight
-        losses["fm_reconstruction_loss"] = losses["fm_reconstruction_loss"] * compression_reweight
-        losses["fm_mlm_loss"] = losses["fm_mlm_loss"] * compression_reweight
-        losses["dirty_bos_loss"] = losses["dirty_bos_loss"] * compression_reweight
-        losses["dirty_reconstruction_loss"] = losses["dirty_reconstruction_loss"] * compression_reweight
+        wanted_bos_prob = Config.COMPRESSION_VECTORS[self.level] / Config.MAX_SEQ_LENGTHS[self.level]
+        # H-Net ratio loss (eq. 10) with F = stopgrad(G). Centered so the minimum is 0
+        # at G = 1/N, unlike the old clamp which scored extra compression as "at target"
+        # and then cheapened recon when BOS was high (the opposite Lagrangian).
+        G = bos_per_position
+        F = G.detach()
+        N_ratio = 1.0 / max(float(wanted_bos_prob), Config.EPS)
+        ratio = (N_ratio / max(N_ratio - 1.0, Config.EPS)) * (
+            (N_ratio - 1.0) * F * G + (1.0 - F) * (1.0 - G)
+        )
+        losses["average_bos_loss"] = (ratio - 1.0).clamp_min(0.0) * Config.COMPRESSION_PENALTY[self.level]
 
         losses["patch_loss"] = patch_loss*10
         losses["short_sentence_loss"] = short_sentence_loss*10
