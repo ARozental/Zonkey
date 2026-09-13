@@ -322,7 +322,7 @@ def compute_improved_coverage_loss(
     doc_ids: Optional[torch.Tensor] = None,
     memory_queue: Optional[torch.Tensor] = None,   # (Q, flat_dim) — already flattened + normalized
 ) -> torch.Tensor:
-    """Document-aware KoLeo coverage loss (SOTA 2025 style).
+    """Document-aware nearest-neighbor entropy (KoLeo) loss.
     
     - z shape: (B, C, D) → flattened to (B, flat_dim = C*D) exactly as you already do
     - Nearest-neighbor search **only across different documents** (same-doc vectors are ignored)
@@ -368,14 +368,17 @@ def compute_improved_coverage_loss(
         else:
             invalid |= same_doc
 
-    # Apply mask
+    valid_rows = (~invalid).any(dim=1)
+    if not bool(valid_rows.any()):
+        return z_norm.sum() * 0.0
+
+    # Nearest neighbor on the unit sphere. KoLeo maximizes local distance by
+    # minimizing -log(distance); average per sample rather than a batch-wide
+    # logsumexp whose baseline and gradients depend strongly on batch size.
     sim = sim.masked_fill(invalid, -1e9)
-
-    # === KoLeo surrogate: soft-max of the worst (largest) cosine ===
-    max_sim_nn = torch.max(sim, dim=1)[0]                       # largest cosine = smallest angle
-    koleo = torch.mean(torch.logsumexp(max_sim_nn, dim=0))
-
-    return koleo
+    max_sim_nn = torch.max(sim[valid_rows], dim=1)[0].clamp(-1.0, 1.0)
+    nearest_distance = torch.sqrt((2.0 - 2.0 * max_sim_nn).clamp_min(Config.EPS))
+    return -torch.log(nearest_distance.clamp_min(Config.EPS)).mean()
 
 
 def compute_drifting_loss(

@@ -38,7 +38,7 @@ def aggregate_leveled_losses(leveled_losses):
     for l, losses in enumerate(leveled_losses):
         vals = []
         for name, value in losses.items():
-            if name in METRIC_LOSS_KEYS:
+            if name in METRIC_LOSS_KEYS or name.startswith("metric_"):
                 continue
             t = _as_loss_tensor(value)
             if t is not None:
@@ -100,6 +100,7 @@ class PlZonkey(pl.LightningModule):
     def on_save_checkpoint(self, checkpoint):
         if self.use_ema and self._ema is not None:
             checkpoint["ema_state"] = [e.clone() for e in self._ema]
+        checkpoint["optimizer_layout_version"] = 2
 
     def calibrate_memory(self):
         """Run a worst-case forward+backward pass to measure peak GPU memory.
@@ -202,13 +203,11 @@ class PlZonkey(pl.LightningModule):
         return min(1.0, (step + 1) / warmup)
 
     def on_load_checkpoint(self, checkpoint):
-        """
-        Override checkpoint loading to handle optimizer switching.
-        When switching between Muon and AdamW, skip loading the old optimizer state.
-        """
+        """Validate optimizer compatibility and restore current learning rates."""
         # Check if optimizer type has changed
+        optimizer_states_present = bool(checkpoint.get("optimizer_states"))
         checkpoint_had_muon = False
-        if 'optimizer_states' in checkpoint and len(checkpoint['optimizer_states']) > 0:
+        if optimizer_states_present:
             # Try to detect if the checkpoint used Muon by checking for 'use_muon' in param_groups
             try:
                 first_opt_state = checkpoint['optimizer_states'][0]
@@ -221,16 +220,15 @@ class PlZonkey(pl.LightningModule):
                 pass
         
         current_uses_muon = Config.USE_MUON
+        optimizer_layout_changed = checkpoint.get("optimizer_layout_version", 1) != 2
         
-        # If optimizer type changed, remove optimizer states from checkpoint
-        if checkpoint_had_muon != current_uses_muon:
-            print(f"\n⚠️  Optimizer type changed: checkpoint used {'Muon' if checkpoint_had_muon else 'AdamW'}, "
-                  f"current config uses {'Muon' if current_uses_muon else 'AdamW'}")
-            print("   Skipping old optimizer state - will initialize fresh optimizer\n")
-            if 'optimizer_states' in checkpoint:
-                del checkpoint['optimizer_states']
-            if 'lr_schedulers' in checkpoint:
-                del checkpoint['lr_schedulers']
+        if optimizer_states_present and (
+            checkpoint_had_muon != current_uses_muon or optimizer_layout_changed
+        ):
+            raise RuntimeError(
+                "Checkpoint optimizer layout is incompatible. Use scripts/train.py "
+                "with --load_weights_only; run_trainer also selects this automatically."
+            )
 
         # Overwrite the LR baked into the restored optimizer state with the CURRENT
         # config value. PyTorch's optimizer.load_state_dict() replaces param_groups
@@ -303,7 +301,7 @@ class PlZonkey(pl.LightningModule):
                     logits = torch.matmul(tokens_normalized, embeddings_normalized.t())
                     best_token_idx = logits.argmax(dim=-1)
                     tokens_out = best_token_idx.tolist()
-                    print("original doc start: ","".join([chr(x) for x in tokens_out]))
+                    print("original doc start: ", self.model.token_ids_to_text(tokens_out))
 
                     # test to see if we make a reasonable split for the first word
                     denoised, existence_mask, is_real_inferred_final = self.model.layers[0].generate(num_diffusion_steps=0,fixed_compressed_vectors=leveled_compressed[0][0][0:1],noise_level=torch.tensor([0.0],device=Config.DEVICE))
@@ -325,29 +323,23 @@ class PlZonkey(pl.LightningModule):
                     tokens_out2 = best_token_idx.tolist()
 
 
-                    print("level 0 text 0: ","".join([chr(x) for x in tokens_out0]))
-                    print("level 0 text 1: ","".join([chr(x) for x in tokens_out1]))
-                    print("level 0 text 2: ","".join([chr(x) for x in tokens_out2]))
+                    print("level 0 text 0: ", self.model.token_ids_to_text(tokens_out0))
+                    print("level 0 text 1: ", self.model.token_ids_to_text(tokens_out1))
+                    print("level 0 text 2: ", self.model.token_ids_to_text(tokens_out2))
                     print("is_real_inferred text 0: ",[int(10000*x)/10000 for x in is_real_inferred_final[0][0:Config.MAX_SEQ_LENGTHS[0]].tolist()])
                     print("is_real_inferred text 1: ",[int(10000*x)/10000 for x in is_real_inferred_final1[0][0:Config.MAX_SEQ_LENGTHS[0]].tolist()])
                     print("is_real_inferred text 2: ",[int(10000*x)/10000 for x in is_real_inferred_final2[0][0:Config.MAX_SEQ_LENGTHS[0]].tolist()])
 
                     # Generate samples from all levels
                     for level in range(len(leveled_compressed)):
-                        _xl_t = float(Config.CROSS_LEVEL_DECODE_T)
                         if level > 0:
-                            print(f"decompressing CLEAN from level {level} (L{level}@t=0, lower@t=0): ")
+                            print(f"decompressing CLEAN from level {level} (all levels @t=0): ")
                             self.model.generate_sequence_from_level_N(
                                 level, num_diffusion_steps=0,
                                 fixed_compressed_vectors=leveled_compressed[level][0][0:1],
                                 noise_level=0.0, existance_cutoff=0.1,
-                                lower_diffusion_steps=0, lower_t=0.0)
-                            print(f"decompressing XL-t from level {level} (L{level}@t=0, lower@t={_xl_t}): ")
-                            self.model.generate_sequence_from_level_N(
-                                level, num_diffusion_steps=0,
-                                fixed_compressed_vectors=leveled_compressed[level][0][0:1],
-                                noise_level=0.0, existance_cutoff=0.1,
-                                lower_diffusion_steps=0, lower_t=_xl_t)
+                                lower_diffusion_steps=0, lower_t=0.0,
+                                print_children=True)
                         else:
                             print(f"decompressing CLEAN from level {level}: ")
                             self.model.generate_sequence_from_level_N(
@@ -363,21 +355,18 @@ class PlZonkey(pl.LightningModule):
                                 lower_diffusion_steps=0, lower_t=0.0)
 
                         print(f"decompressing from level {level} with {Config.NOISE_LAST_STEP_SIZE[level]} noise: ")
-                        # Noise exactly the one vector we decode, reshaped to (1, CV, d) so
-                        # flow_interpolate normalizes on the right sphere (noising the whole
-                        # (docs, sentences, feat) tensor flattened per-doc was wrong).
+                        # Let generate add noise exactly once to the one code being decoded.
+                        # The previous diagnostic pre-noised here and generate noised again.
                         _cv = Config.COMPRESSION_VECTORS[level]
                         _one_vec = leveled_compressed[level][0][0:1].view(1, _cv, -1)
-                        noise_level = torch.full((1,), Config.NOISE_LAST_STEP_SIZE[level], device=_one_vec.device, dtype=_one_vec.dtype)
-                        _one_vec_noisy = self.model.layers[level].add_noise(_one_vec, noise_level)
                         self.model.generate_sequence_from_level_N(
-                            level, fixed_compressed_vectors=_one_vec_noisy.view(1, -1),
+                            level, fixed_compressed_vectors=_one_vec.view(1, -1),
                             noise_level=Config.NOISE_LAST_STEP_SIZE[level], existance_cutoff=0.1,
-                            lower_t=_xl_t)
+                            lower_t=0.0)
                         print(f"random seq from level {level}: ")
                         self.model.generate_sequence_from_level_N(
                             level, num_diffusion_steps=Config.EVAL_DIFFUSION_STEPS, noise_level=1.0,
-                            existance_cutoff=0.1, lower_t=_xl_t)
+                            existance_cutoff=0.1, lower_t=0.0)
 
                 
                     # Clean up generation artifacts to free GPU memory
@@ -443,14 +432,28 @@ class PlZonkey(pl.LightningModule):
 
     def configure_optimizers(self):
         if Config.USE_MUON:
-            # Separate parameters for Muon (2D hidden layers) vs Adam (embeddings, biases, scalars)
+            # Muon is defined for 2-D hidden matrices. Conv1d kernels are 3-D and the
+            # old ndim>=2 test accidentally treated them as batches of tiny matrices.
+            # Output/routing heads also need AdamW rather than orthogonalized updates.
             hidden_matrix_params = []
             other_params = []
+            adam_head_names = (
+                "bos_layer.",
+                "classification_head.",
+                "signal_coherence.",
+                "segment_splitter.bos_classifier.proj.",
+                "stitcher.score_linear.",
+            )
             
             for name, p in self.model.named_parameters():
                 if p.requires_grad:
-                    # Use Muon for 2D+ parameters in hidden layers (not embeddings)
-                    if p.ndim >= 2 and "embedding" not in name.lower():
+                    use_muon = (
+                        p.ndim == 2
+                        and min(p.shape) > 1
+                        and "token_embedding_layer." not in name
+                        and not any(fragment in name for fragment in adam_head_names)
+                    )
+                    if use_muon:
                         hidden_matrix_params.append(p)
                     else:
                         other_params.append(p)
@@ -530,10 +533,20 @@ class Zonkey(nn.Module):
         logits = logits
 
         tokens_out = logits.argmax(dim=-1)
-        print("".join([chr(x) for x in tokens_out]))
+        print(self.token_ids_to_text(tokens_out))
         return 
+
+    @staticmethod
+    def token_ids_to_text(token_ids):
+        values = token_ids.detach().reshape(-1).tolist() if torch.is_tensor(token_ids) else list(token_ids)
+        payload = bytes(int(x) for x in values if int(x) not in (0, 1))
+        return payload.decode("utf-8", errors="replace")
         
-    def generate_sequence_from_level_N(self,N,num_diffusion_steps=0,fixed_compressed_vectors=None,noise_level=0.0,existance_cutoff=0.1,lower_diffusion_steps=0,lower_t=None):
+    def generate_sequence_from_level_N(
+        self, N, num_diffusion_steps=0, fixed_compressed_vectors=None,
+        noise_level=0.0, existance_cutoff=0.1, lower_diffusion_steps=0,
+        lower_t=None, print_children=False,
+    ):
         #get initial sequence, 
         initial_seq, existence_mask, is_real_inferred_final =  self.layers[N].generate(
             batch_size=1,
@@ -543,17 +556,9 @@ class Zonkey(nn.Module):
             existance_cutoff=existance_cutoff)
         doc = initial_seq.squeeze(0)[0:existence_mask.bool().sum().item(),:] # <actual_len,d_model>
         if lower_t is None:
-            top_nl = noise_level
-            if torch.is_tensor(top_nl):
-                top_nl = float(top_nl.reshape(-1)[0].item())
-            else:
-                top_nl = float(top_nl)
-            # Clean recon of a dataset code: children at t=0. Unconditional / noised:
-            # children at CROSS_LEVEL_DECODE_T (the xl training pass).
-            if fixed_compressed_vectors is None or top_nl > 0.0:
-                lower_t = float(Config.CROSS_LEVEL_DECODE_T)
-            else:
-                lower_t = 0.0
+            # A completed parent denoise predicts clean child codes. Its structured
+            # model error is not forward-diffusion noise with a known time label.
+            lower_t = 0.0
         while N>0:
             N-=1
             seq, existence_mask, is_real_inferred = self.layers[N].generate(
@@ -563,6 +568,11 @@ class Zonkey(nn.Module):
                 num_diffusion_steps=lower_diffusion_steps, # zero here for no refinement by lower layers
                 existance_cutoff=existance_cutoff
                 )
+            if print_children and N == 0:
+                for child_idx in range(min(3, seq.shape[0])):
+                    child_len = int(existence_mask[child_idx].sum().item())
+                    print(f"  child {child_idx}: ", end="")
+                    self.print_char_sequence(seq[child_idx, :child_len])
             doc,_,_ = self.layers[N].stitcher(seq, is_real_inferred, torch.tensor([seq.shape[0]], dtype=torch.long, device=seq.device))
 
             doc = self._clip_tail_by_existence(doc, N, existance_cutoff)

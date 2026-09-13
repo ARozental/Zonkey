@@ -38,16 +38,27 @@ class WikipediaCharsDataset(Dataset):
     def __getitem__(self, idx: int):
         article = self.wiki_dataset[idx]
         text = article["text"]
-        
-        tokens = [ord(x) % Config.TOKENIZER_VOCAB_SIZE_CHARS for x in text]
-        
+
+        # Model real UTF-8 bytes. ord(char) % 256 aliases unrelated Unicode
+        # codepoints and is not the byte-level representation used by H-Net.
+        tokens = list(text.encode("utf-8"))
+        max_length = Config.MAX_DOC_LENGTHS[0]
+
+        # Do not train almost exclusively on encyclopedic lead paragraphs. Preserve
+        # some starts for document-opening structure, but sample most windows from
+        # throughout long articles.
+        if len(tokens) > max_length:
+            if torch.rand(()) < 0.2:
+                start = 0
+            else:
+                start = int(torch.randint(0, len(tokens) - max_length + 1, ()).item())
+            tokens = tokens[start:start + max_length]
+
         if len(tokens) == Config.MAX_DOC_LENGTHS[0] - 1:
             tokens.append(1)
         elif len(tokens) < Config.MAX_DOC_LENGTHS[0]:
             padding = [1] + [0] * (Config.MAX_DOC_LENGTHS[0] - len(tokens) - 1)
             tokens.extend(padding)
-        elif len(tokens) > Config.MAX_DOC_LENGTHS[0]:
-            tokens = tokens[:Config.MAX_DOC_LENGTHS[0]]
         
         return torch.tensor(tokens, dtype=torch.long)
 

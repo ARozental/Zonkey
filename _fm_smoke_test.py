@@ -45,11 +45,54 @@ Config.USE_GRADIENT_CHECKPOINTING = bool(int(os.environ.get("GC", "0")))
 
 import torch
 torch.manual_seed(0)
-from models.zonkey import Zonkey, aggregate_leveled_losses
+from models.zonkey import PlZonkey, Zonkey, aggregate_leveled_losses
+from models.zonkey_layer import ZonkeyLayer
+
+for d in (8, 64):
+    x = torch.nn.functional.normalize(torch.randn(16, d), dim=-1)
+    y = torch.nn.functional.normalize(torch.randn(16, d), dim=-1)
+    recovered = ZonkeyLayer._sphere_exp_map(x, ZonkeyLayer._sphere_log_map(x, y))
+    assert torch.allclose(recovered, y, atol=2e-5), f"sphere log/exp mismatch at d={d}"
 
 device = "cpu"
 model = Zonkey().to(device)
 model.train()
+
+# The denoiser must receive the exact compressed prompt, not decoder-rewritten
+# prompt states.
+captured_denoiser_input = {}
+def capture_denoiser_input(_module, args):
+    captured_denoiser_input["x"] = args[0].detach().clone()
+
+hook = model.layers[0].denoiser.register_forward_pre_hook(capture_denoiser_input)
+probe = torch.nn.functional.normalize(
+    torch.randn(2, Config.COMPRESSION_VECTORS[0], Config.D_MODEL[0]).reshape(2, -1),
+    dim=-1,
+).reshape(2, Config.COMPRESSION_VECTORS[0], Config.D_MODEL[0])
+probe = probe * model.layers[0].upwards_norm
+with torch.no_grad():
+    model.layers[0].compressed_to_denoised(probe, torch.zeros(2))
+hook.remove()
+assert torch.allclose(
+    captured_denoiser_input["x"][:, 2:2 + Config.COMPRESSION_VECTORS[0]], probe
+)
+
+# Muon receives only 2-D hidden matrices; Conv1d and prediction heads stay AdamW.
+old_use_muon = Config.USE_MUON
+Config.USE_MUON = True
+configured = PlZonkey.configure_optimizers(types.SimpleNamespace(model=model))["optimizer"]
+muon_ids = {
+    id(p)
+    for group in configured.param_groups if group.get("use_muon")
+    for p in group["params"]
+}
+names = dict(model.named_parameters())
+assert all(p.ndim == 2 and min(p.shape) > 1 for p in model.parameters() if id(p) in muon_ids)
+assert id(names["layers.0.local_feature_extractor.conv.weight"]) not in muon_ids
+assert id(names["layers.0.bos_layer.weight"]) not in muon_ids
+Config.USE_MUON = old_use_muon
+del configured
+
 opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=3e-4)
 
 def make_batch():
@@ -88,10 +131,15 @@ for step in range(4):
     if step == 0:
         keys0 = set(leveled_losses[0].keys())
         keys1 = set(leveled_losses[1].keys())
-        for k in ("xl_reconstruction_loss", "xl_bos_loss", "fm_compressed_fm_loss", "average_bos_loss", "avg_bos_prob"):
+        for k in ("fm_flow_velocity_loss", "average_bos_loss", "avg_bos_prob",
+                  "metric_clean_existence_mae"):
             assert k in keys0, f"missing {k} at L0, have {sorted(keys0)}"
             assert k in keys1, f"missing {k} at L1, have {sorted(keys1)}"
-        print(f"  L0 keys include xl/fm and avg_bos_prob (metric)={('avg_bos_prob' in keys0)}")
+        for k in ("interface_sequence_loss", "interface_existence_loss",
+                  "metric_clean_positive_cosine"):
+            assert k in keys1, f"missing {k} at L1, have {sorted(keys1)}"
+        assert "metric_clean_token_accuracy" in keys0
+        print("  flow/interface/clean metrics present")
     print(f"step {step}: total_loss={total_loss.item():.4f} per_level={['%.3f'%x for x in per_level]} "
           f"grad_norm={gnorm:.3f} params_with_grad={n_grad} finite={finite}")
     assert finite, "non-finite loss!"
@@ -109,17 +157,14 @@ with torch.no_grad():
     model.generate_sequence_from_level_N(1, fixed_compressed_vectors=leveled_compressed[1][0][0:1],
                                          noise_level=0.0, lower_t=0.0)
     print("  generate CLEAN from level 1 OK")
-    model.generate_sequence_from_level_N(1, fixed_compressed_vectors=leveled_compressed[1][0][0:1],
-                                         noise_level=0.0, lower_t=Config.CROSS_LEVEL_DECODE_T)
-    print("  generate XL-t from level 1 OK")
 
     # Mirror the exact eval-block primitives in zonkey.py:245-250.
     lvl = 1
     nl = Config.NOISE_LAST_STEP_SIZE[lvl]
-    noise_level = torch.full((leveled_compressed[lvl].shape[0],), nl, dtype=leveled_compressed[lvl].dtype)
-    noised = model.layers[lvl].add_noise(leveled_compressed[lvl], noise_level)
-    print(f"  add_noise on 3-D leveled tensor {tuple(noised.shape)} OK")
-    model.generate_sequence_from_level_N(lvl, fixed_compressed_vectors=noised[0][0:1], noise_level=nl)
+    model.generate_sequence_from_level_N(
+        lvl, fixed_compressed_vectors=leveled_compressed[lvl][0][0:1],
+        noise_level=nl, lower_t=0.0)
+    print("  single-noise diagnostic OK")
     den_rand, _, _ = model.layers[lvl].generate(num_diffusion_steps=20, noise_level=1.0)
     print(f"  20-step random ODE @ level 1 -> {tuple(den_rand.shape)} OK")
 

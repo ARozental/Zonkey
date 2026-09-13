@@ -85,28 +85,28 @@ class Config:
     # so uniform t spends half of training above 0.71 cosine (too easy). Exponent<1
     # shifts mass toward high noise (0.5 -> density 2t, median t~0.71).
     T_FM_EXPONENT = 0.5
-    # Dirty pass: t_mid ~ Beta(1,3) (informative intermediates), t_dirty ~ U(0,DIRTY_T_MAX)
-    # so self-conditioned refinement is trained across the whole noise range.
-    DIRTY_T_MAX = 1.0
-    # Hierarchical generation: decode upper-level outputs at this truthful flow-time
-    # instead of pretending they're clean t=0 vectors (they're slightly off-manifold,
-    # which is exactly the regime the dirty pass trains).
-    CROSS_LEVEL_DECODE_T = 0.1
+    # Dirty pass is a local off-manifold refinement. The full [0,1] range gave it a
+    # near-clean self-condition at noise levels where sampling has no such estimate.
+    DIRTY_T_MAX = 0.1
     # Self-conditioning: feed the model's previous x1 estimate as an extra prompt token
     # (dirty pass during training, previous ODE step at sampling). Arch token always
     # exists; this flag only controls whether real estimates are fed (vs the null token).
     USE_SELF_COND = True
+    SELF_CONDITION_TRAIN_STEPS = 30
     MLM_WEIGHT = [0.0,2.0]
     DIRTY_MLM_WEIGHT = [1.0, 1.0]
     DECODER_MLM_WEIGHT = [0.6, 0.4]
     EXISTS_WEIGHT = [0.05,0.05]
-    # Per-sample gate on sequence reconstruction for FM/dirty/xl (not BOS, not clean).
+    # Per-sample gate on sequence reconstruction for FM/dirty (not BOS, not clean).
     # Multiplies recon by (1-t)^p so high-t is not exact-sequence CE (barycenter).
     SEQUENCE_RECON_T_GATE_POWER = 2.0
-    # Cosine in compressed space: 1 - cos(compress(decode(x_t)), x0). Supervises the
-    # sampler's x1_hat at high t where sequence recon is gated off.
-    COMPRESSED_FM_WEIGHT = [1.0, 1.0]
+    # Riemannian conditional-flow loss on the backward tangent velocity.
+    FLOW_VELOCITY_WEIGHT = [1.0, 1.0]
     # Always-on (1-cos) added to L>0 contrastive recon. InfoNCE+atanh can still
     # saturate vs easy negatives before the positive is on-manifold.
-    DIRECT_COSINE_WEIGHT = 0.5 
+    DIRECT_COSINE_WEIGHT = 0.5
+    # Sampled one-level behavioral consistency. This tests parent-produced child
+    # codes through the actual lower decoder without recursively unrolling to chars.
+    INTERFACE_CONSISTENCY_WEIGHT = [0.0, 1.0]
+    INTERFACE_CONSISTENCY_SAMPLES = 12
     

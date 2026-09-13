@@ -25,22 +25,40 @@ def run_training(args):
 
     # Model init or resume from checkpoint if provided
     ckpt_path = None
+    resume_trainer_state = False
     if args.resume:
         ckpt_path = Path(args.resume).expanduser()
         if not ckpt_path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
-        if getattr(args, 'load_weights_only', False):
+        checkpoint = torch.load(str(ckpt_path), map_location="cpu")
+        optimizer_states = checkpoint.get("optimizer_states", [])
+        checkpoint_had_muon = any(
+            group.get("use_muon", False)
+            for state in optimizer_states
+            for group in state.get("param_groups", [])
+        )
+        optimizer_compatible = (
+            checkpoint.get("optimizer_layout_version", 1) == 2
+            and checkpoint_had_muon == Config.USE_MUON
+        )
+        weights_only = getattr(args, 'load_weights_only', False) or not optimizer_compatible
+        if weights_only:
             model = PlZonkey(writer=tb_writer)
-            checkpoint = torch.load(str(ckpt_path), map_location="cpu")
             state_dict = checkpoint.get("state_dict", checkpoint)
             incompatible = model.load_state_dict(state_dict, strict=False)
-            print("Loaded checkpoint weights with strict=False")
+            if checkpoint.get("ema_state") is not None and model.use_ema:
+                model._ema = [value.clone() for value in checkpoint["ema_state"]]
+            reason = "requested" if getattr(args, 'load_weights_only', False) else "optimizer layout changed"
+            print(f"Loaded checkpoint weights with strict=False ({reason}); optimizer starts fresh")
             if incompatible.missing_keys:
                 print(f"Missing keys (new params kept random): {len(incompatible.missing_keys)}")
             if incompatible.unexpected_keys:
                 print(f"Unexpected keys (ignored): {len(incompatible.unexpected_keys)}")
+            ckpt_path = None
         else:
             model = PlZonkey.load_from_checkpoint(str(ckpt_path), writer=tb_writer)
+            resume_trainer_state = True
+        del checkpoint
     else:
         model = PlZonkey(writer=tb_writer)
 
@@ -56,7 +74,7 @@ def run_training(args):
     trainer = pl.Trainer(**make_trainer_config(time_now))
     
     # Pass ckpt_path to trainer.fit() to restore trainer state (global_step, epoch, etc.)
-    if ckpt_path and Config.USE_OPTIMIZER_CHECKPOINT and not getattr(args, 'load_weights_only', False):
+    if ckpt_path and resume_trainer_state and Config.USE_OPTIMIZER_CHECKPOINT:
         trainer.fit(model, dataloader, ckpt_path=str(ckpt_path))
     else:
         trainer.fit(model, dataloader)
