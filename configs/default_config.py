@@ -100,7 +100,8 @@ class Config:
     # Per-sample gate on sequence reconstruction for FM/dirty (not BOS, not clean).
     # Multiplies recon by (1-t)^p so high-t is not exact-sequence CE (barycenter).
     SEQUENCE_RECON_T_GATE_POWER = 2.0
-    # Riemannian conditional-flow loss on the backward tangent velocity.
+    # Spherical CFM on log-displacements (t²-weighted velocity MSE). The sampler
+    # still integrates log(x_t, x0)/t; we do not divide by t in the loss.
     FLOW_VELOCITY_WEIGHT = [1.0, 1.0]
     # Always-on (1-cos) added to L>0 contrastive recon. InfoNCE+atanh can still
     # saturate vs easy negatives before the positive is on-manifold.

@@ -54,9 +54,21 @@ for d in (8, 64):
     recovered = ZonkeyLayer._sphere_exp_map(x, ZonkeyLayer._sphere_log_map(x, y))
     assert torch.allclose(recovered, y, atol=2e-5), f"sphere log/exp mismatch at d={d}"
 
+# Displacement CFM stays O(1) at small t; dividing log maps by t does not.
+x = torch.nn.functional.normalize(torch.randn(32, 16), dim=-1)
+y = torch.nn.functional.normalize(torch.randn(32, 16), dim=-1)
+t_small = torch.full((32,), 1e-3)
+x_t = ZonkeyLayer._slerp(x, y, t_small)
+disp_err = (ZonkeyLayer._sphere_log_map(x_t, y) - ZonkeyLayer._sphere_log_map(x_t, x)).pow(2).sum(-1).mean()
+vel_err = disp_err / (1e-3 ** 2)
+assert disp_err < 20.0, f"displacement loss should be O(1), got {disp_err}"
+assert vel_err > 1e5, f"expected /t velocity form to explode at t=1e-3, got {vel_err}"
+
 device = "cpu"
 model = Zonkey().to(device)
 model.train()
+assert model.token_ids_to_text([ord("A"), 0, 1, ord("B")]) == "AB"
+assert model.token_ids_to_text([233]) == chr(233)  # é as a character, not UTF-8 C3 A9
 
 # The denoiser must receive the exact compressed prompt, not decoder-rewritten
 # prompt states.
@@ -90,6 +102,7 @@ names = dict(model.named_parameters())
 assert all(p.ndim == 2 and min(p.shape) > 1 for p in model.parameters() if id(p) in muon_ids)
 assert id(names["layers.0.local_feature_extractor.conv.weight"]) not in muon_ids
 assert id(names["layers.0.bos_layer.weight"]) not in muon_ids
+assert id(names["layers.0.stitcher.proj.weight"]) not in muon_ids
 Config.USE_MUON = old_use_muon
 del configured
 

@@ -226,7 +226,7 @@ class PlZonkey(pl.LightningModule):
             checkpoint_had_muon != current_uses_muon or optimizer_layout_changed
         ):
             raise RuntimeError(
-                "Checkpoint optimizer layout is incompatible. Use scripts/train.py "
+                "Checkpoint optimizer layout is incompatible. Use scripts/run_trainer.py "
                 "with --load_weights_only; run_trainer also selects this automatically."
             )
 
@@ -443,6 +443,7 @@ class PlZonkey(pl.LightningModule):
                 "signal_coherence.",
                 "segment_splitter.bos_classifier.proj.",
                 "stitcher.score_linear.",
+                "stitcher.proj.",
             )
             
             for name, p in self.model.named_parameters():
@@ -538,9 +539,9 @@ class Zonkey(nn.Module):
 
     @staticmethod
     def token_ids_to_text(token_ids):
+        """Character decode: token id i is chr(i), matching ord(c) % 256. Not UTF-8."""
         values = token_ids.detach().reshape(-1).tolist() if torch.is_tensor(token_ids) else list(token_ids)
-        payload = bytes(int(x) for x in values if int(x) not in (0, 1))
-        return payload.decode("utf-8", errors="replace")
+        return "".join(chr(int(x) % 256) for x in values if int(x) not in (0, 1))
         
     def generate_sequence_from_level_N(
         self, N, num_diffusion_steps=0, fixed_compressed_vectors=None,

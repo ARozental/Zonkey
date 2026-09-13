@@ -725,8 +725,8 @@ class ZonkeyLayer(nn.Module):
         ) -> Tuple[torch.Tensor, Optional[dict], torch.Tensor]:
         # Flow-matching corruption: interpolate the clean compressed vector toward
         # noise along the geodesic by fraction `noise_level` (0 = clean, 1 = noise).
-        # skip_add_noise: the input is already an off-manifold point at `noise_level`
-        # (cross-level decode). Matches generate(..., treat_as_noisy=True).
+        # skip_add_noise: `compressed` is already the state at `noise_level`
+        # (on-path FM sample, or a parent code decoded with treat_as_noisy=True).
         noisy_compressed = compressed if skip_add_noise else self.add_noise(compressed, noise_level)
         denoised, is_real_inferred = self.compressed_to_denoised(noisy_compressed, noise_level, self_cond=self_cond)
 
@@ -789,10 +789,10 @@ class ZonkeyLayer(nn.Module):
                     (positive_cos * metric_weights).sum() / metric_denom
                 ).detach()
 
-        # Riemannian conditional flow matching. The network remains x0-parameterized,
-        # but is optimized for the backward tangent field the sampler actually follows,
-        # including both direction and distance. Endpoint cosine alone can be tiny even
-        # when iterative spherical transport is wrong.
+        # Spherical CFM on x0. The sampler integrates log(x_t, x0_hat)/t; training
+        # compares the log-displacements themselves. Dividing by t first makes
+        # ||Δv||² = ||Δlog||² / t², so any residual x0 error explodes as t→0 and
+        # starves the high-t direction generation actually starts from.
         if compute_flow_loss:
             flow_target = compressed if x0_target is None else x0_target
             x1_hat = self.compress(denoised, is_real_inferred)
@@ -800,14 +800,9 @@ class ZonkeyLayer(nn.Module):
             x_t_flat = F.normalize(noisy_compressed.reshape(B, -1), p=2, dim=-1)
             pred_flat = F.normalize(x1_hat.reshape(B, -1), p=2, dim=-1)
             target_flat = F.normalize(flow_target.reshape(B, -1), p=2, dim=-1)
-            remaining_t = noise_level.reshape(B, 1).clamp_min(1e-3)
-            predicted_velocity = self._sphere_log_map(x_t_flat, pred_flat) / remaining_t
-            target_velocity = self._sphere_log_map(x_t_flat, target_flat) / remaining_t
-            velocity_error = (predicted_velocity - target_velocity).pow(2).sum(-1)
-            valid = (noise_level.reshape(-1) >= 1e-3).to(velocity_error.dtype)
-            losses["flow_velocity_loss"] = (
-                (velocity_error * valid).sum() / valid.sum().clamp_min(1.0)
-            )
+            predicted_disp = self._sphere_log_map(x_t_flat, pred_flat)
+            target_disp = self._sphere_log_map(x_t_flat, target_flat)
+            losses["flow_velocity_loss"] = (predicted_disp - target_disp).pow(2).sum(-1).mean()
 
         # Stitcher / document-reassembly losses only make sense near the data
         # manifold, so they are computed only on the clean (t~0) structural pass.
@@ -819,6 +814,27 @@ class ZonkeyLayer(nn.Module):
             losses["stitcher_sequence_loss"] = stitcher_sequence_loss * 0.01
 
         return denoised, losses, is_real_inferred
+
+    def _reshape_as_lower_compressed(self, codes: torch.Tensor) -> torch.Tensor:
+        """View this level's child codes as the previous level's compressed prompt.
+
+        Matches generate(): flatten, unit-normalize, scale to the lower level's
+        upwards_norm, then reshape to (N, CV_{n-1}, D_{n-1}).
+        """
+        prev = self.previous_layer
+        if prev is None:
+            raise RuntimeError("cannot reshape child codes without a previous layer")
+        prev_cv = Config.COMPRESSION_VECTORS[self.level - 1]
+        prev_d = Config.D_MODEL[self.level - 1]
+        expected = prev_cv * prev_d
+        flat = codes.reshape(codes.shape[0], -1)
+        if flat.shape[-1] != expected:
+            raise ValueError(
+                f"level {self.level} child code dim {flat.shape[-1]} != "
+                f"level {self.level - 1} compressed dim {expected}"
+            )
+        flat = F.normalize(flat, p=2, dim=-1) * prev.upwards_norm
+        return flat.view(codes.shape[0], prev_cv, prev_d)
 
     def calculate_interface_consistency_loss(
         self,
@@ -847,12 +863,10 @@ class ZonkeyLayer(nn.Module):
         sample_probs = flat_weights / flat_weights.sum().clamp_min(Config.EPS)
         sample_indices = torch.multinomial(sample_probs, num_samples, replacement=False)
 
-        prev_cv = Config.COMPRESSION_VECTORS[self.level - 1]
-        prev_d = Config.D_MODEL[self.level - 1]
         predicted = predicted_lower_codes.reshape(-1, self.d_model)[sample_indices]
         target = target_lower_codes.reshape(-1, self.d_model)[sample_indices]
-        predicted = predicted.reshape(num_samples, prev_cv, prev_d)
-        target = target.reshape(num_samples, prev_cv, prev_d)
+        predicted = self._reshape_as_lower_compressed(predicted)
+        target = self._reshape_as_lower_compressed(target)
         t0 = torch.zeros(num_samples, device=predicted.device, dtype=predicted.dtype)
 
         with torch.no_grad():
