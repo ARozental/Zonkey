@@ -26,18 +26,23 @@ def calculate_token_loss(
     noise_level=None,
     regression_power=None,
     sample_weight=None,
+    detach_table=False,
 ):
+    # detach_table: the char table is a target here (generative passes, interface loss),
+    # so this loss trains the decoder only and never moves the embeddings.
     B, L, D = encoded_sequences.shape
     V = token_embedding_layer.weight.shape[0]
     BL = B * L
     device = encoded_sequences.device
 
     W = token_embedding_layer.weight  # (V, D)
+    if detach_table:
+        W = W.detach()
     true_ids = original_tokens.reshape(BL)
 
     if previous_denoised is not None:
         # Get target embeddings for optimal_t computation
-        target_embeddings = token_embedding_layer.weight[original_tokens]  # (B, L, D)
+        target_embeddings = W[original_tokens]  # (B, L, D)
 
         # Sequence-level optimal t (shared across whole sequence)
         pos_sim, _, optimal_t = arc_cosine_similarity_seq(

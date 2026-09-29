@@ -88,11 +88,21 @@ class LinearEncoder(nn.Module):
 class SegmentSplitter(nn.Module):
     def __init__(self, level, max_num_sentences=70):
         super().__init__()
+        self.level = level
         self.d_model = Config.D_MODEL[level]
         self.max_seq_len = Config.MAX_DOC_LENGTHS[level]
         self.max_sentence_length = Config.MAX_SEQ_LENGTHS[level]
-        self.min_sentence_length = Config.COMPRESSION_VECTORS[level]
+        min_len = getattr(Config, "MIN_SEGMENT_LENGTH", [None] * (level + 1))
+        min_len = min_len[level] if level < len(min_len) else None
+        self.min_sentence_length = int(min_len) if min_len is not None else Config.COMPRESSION_VECTORS[level]
         self.max_num_sentences = max_num_sentences #per batch
+        # Per-document cap: a document never needs more segments than the level above
+        # consumes (MAX_DOC_LENGTHS[level+1]); the old `// 2` cap let two long documents
+        # fill the batch cap and silently dropped the third.
+        if level + 1 < len(Config.MAX_DOC_LENGTHS):
+            self.max_sentences_per_doc = max(1, min(int(Config.MAX_DOC_LENGTHS[level + 1]), max_num_sentences))
+        else:
+            self.max_sentences_per_doc = max(1, max_num_sentences // max(1, int(Config.BATCH_SIZE)))
         self.force_max_segments = False
 
         self.bos_classifier = LinearEncoder(self.d_model, level)
@@ -314,9 +324,12 @@ class SegmentSplitter(nn.Module):
         is_bos_extra = self.compute_is_bos_extra(is_bos_by_random, is_real_position)
 
         # Mean probability that a sentence is shorter than self.min_sentence_length
-        short_sentence_loss = self.compute_mean_p_short_sentence(bos_probs, is_real_position, self.min_sentence_length)
-        short_sentence_loss += self.compute_mean_p_short_sentence(bos_probs, is_real_position, self.min_sentence_length-1)
-        short_sentence_loss += self.compute_mean_p_short_sentence(bos_probs, is_real_position, self.min_sentence_length-2)
+        # (terms for min, min-1, min-2; a "shorter than 1" term would penalize every BOS,
+        # so lengths below 2 are skipped, which only matters for MIN_SEGMENT_LENGTH < 4).
+        short_sentence_loss = bos_probs.new_zeros(())
+        for min_len in (self.min_sentence_length, self.min_sentence_length - 1, self.min_sentence_length - 2):
+            if min_len >= 2:
+                short_sentence_loss = short_sentence_loss + self.compute_mean_p_short_sentence(bos_probs, is_real_position, min_len)
 
         # Combine BOS markers
         attention_mask = is_real_position > 0.5
@@ -330,7 +343,7 @@ class SegmentSplitter(nn.Module):
         
         # PASS 1: Count sentences and plan
         # Calculate max sentences allowed per document
-        max_sentences_per_doc_limit = max(1, self.max_num_sentences // 2)
+        max_sentences_per_doc_limit = self.max_sentences_per_doc
         
         planned_docs = [] # List of tuples: (batch_index, bos_positions_subset)
         total_num_sentences = 0
@@ -433,8 +446,16 @@ class SegmentSplitter(nn.Module):
             all_p_exist_share[idx_slice] = p_exist_share
             
             # Apply masks out-of-place and then assign to the final tensor
-            # This avoids modifying tensors that might be needed for backward pass
-            all_sentence_bos_probs[idx_slice] = temp_bos_probs.masked_fill(~valid, 0)
+            # This avoids modifying tensors that might be needed for backward pass.
+            # Past the end of the document the segment must stop existing: a (near-)certain
+            # BOS there makes the cumulative existence (the decoder's BOS label and the
+            # existence weights used by compress) drop to ~0. With bos=0 it held its last
+            # value while the content weight was 0, i.e. it trained "keep existing, with
+            # untrained content" on every window that crosses a document end. 1-1e-6, not
+            # 1, keeps log1p finite (an exact 1 gives -inf in the cumsum and NaN gradients).
+            real_here = valid & (temp_is_real > 0.5)
+            all_sentence_bos_probs[idx_slice] = torch.where(
+                real_here, temp_bos_probs, torch.full_like(temp_bos_probs, 1.0 - 1e-6))
             all_sentence_is_real[idx_slice] = temp_is_real.masked_fill(~valid, 0)
             
             # Create original_position tensor

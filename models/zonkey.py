@@ -68,18 +68,43 @@ class PlZonkey(pl.LightningModule):
         self.ema_decay = float(getattr(Config, "EMA_DECAY", 0.999))
         self.ema_update_every = max(1, int(getattr(Config, "EMA_UPDATE_EVERY", 1)))
         self._ema = None  # lazily initialized list parallel to trainable params
+        # Added to global_step for the LR schedule and TensorBoard steps. run_trainer sets it
+        # to the checkpoint's step on a weights-only resume (Lightning restarts global_step at 0).
+        self._schedule_offset = int(getattr(Config, "LR_SCHEDULE_OFFSET", 0) or 0)
+        self._run_start_step = 0
 
     def _ema_params(self):
         return [p for p in self.model.parameters() if p.requires_grad]
 
+    def load_ema_state(self, ema_state):
+        """Restore EMA weights only if they match the current parameter list exactly;
+        otherwise (architecture changed) the EMA restarts from the current weights."""
+        params = self._ema_params()
+        if (ema_state is not None and len(ema_state) == len(params)
+                and all(tuple(e.shape) == tuple(p.shape) for e, p in zip(ema_state, params))):
+            self._ema = [e.clone() for e in ema_state]
+            return True
+        if ema_state is not None:
+            print("EMA state does not match the current parameters; EMA restarts from the current weights")
+        self._ema = None
+        return False
+
+    def _schedule_step(self):
+        return int(self.global_step) + int(self._schedule_offset)
+
     @torch.no_grad()
     def _ema_update(self):
+        # EMA lives on the parameters' device (~1 GB at 258M params). The old CPU copy moved
+        # every parameter GPU->CPU on every step. The decay is compounded over
+        # EMA_UPDATE_EVERY so the EMA horizon does not depend on the update interval.
+        params = [p.detach() for p in self._ema_params()]
         if self._ema is None:
-            self._ema = [p.detach().float().cpu().clone() for p in self._ema_params()]
+            self._ema = [p.float().clone() for p in params]
             return
-        d = self.ema_decay
-        for e, p in zip(self._ema, self._ema_params()):
-            e.mul_(d).add_(p.detach().float().cpu(), alpha=1.0 - d)
+        if self._ema[0].device != params[0].device:
+            self._ema = [e.to(device=p.device, dtype=torch.float32) for e, p in zip(self._ema, params)]
+        weight = 1.0 - self.ema_decay ** self.ema_update_every
+        torch._foreach_lerp_(self._ema, params, weight)
 
     @contextlib.contextmanager
     def _ema_swapped(self):
@@ -99,8 +124,10 @@ class PlZonkey(pl.LightningModule):
 
     def on_save_checkpoint(self, checkpoint):
         if self.use_ema and self._ema is not None:
-            checkpoint["ema_state"] = [e.clone() for e in self._ema]
+            checkpoint["ema_state"] = [e.detach().cpu() for e in self._ema]
         checkpoint["optimizer_layout_version"] = 2
+        # The schedule step at save time, so a weights-only resume can continue the LR curve.
+        checkpoint["schedule_step"] = self._schedule_step()
 
     def calibrate_memory(self):
         """Run a worst-case forward+backward pass to measure peak GPU memory.
@@ -180,27 +207,42 @@ class PlZonkey(pl.LightningModule):
             return True
 
     def on_train_start(self):
-        # Warmup restarts on EVERY run start (fresh or resumed): a resume often comes
-        # with changed hyperparameters, so easing the LR back in is the safe default.
+        # Warmup restarts on EVERY run start (fresh or resumed): restored optimizer state
+        # can be stale, so the LR is eased back in (RESUME_WARMUP_STEPS after a resume).
         self._run_start_step = int(self.global_step)
-        factor = self._warmup_factor()
+        factor = self._lr_factor()
         for opt in self.trainer.optimizers:
             for group in opt.param_groups:
                 # Lightning restored optimizer state clobbers base_lr with the OLD
-                # checkpoint value; re-assert it from the CURRENT config so a changed
-                # LR on resume actually takes effect.
+                # checkpoint value; re-assert it from the CURRENT config (peak LRs).
                 group["base_lr"] = (Config.MUON_LR if group.get("use_muon")
                                     else Config.LEARNING_RATE)
                 group["lr"] = group["base_lr"] * factor
+        print(f"LR schedule: {getattr(Config, 'LR_SCHEDULE', 'cosine')}, schedule step {self._schedule_step()}, "
+              f"factor {factor:.4f}, horizon {Config.LR_DECAY_STEPS}, floor {Config.MIN_LR_RATIO}")
+
+    def _lr_factor(self):
+        """LR multiplier for both optimizer groups (Muon and Adam keep their own base LR).
+
+        warmup: linear over the first steps of THIS run (WARMUP_STEPS for a fresh run,
+        RESUME_WARMUP_STEPS after a resume), times the schedule evaluated at the schedule
+        step (global_step + offset), so a resumed run continues the same curve instead of
+        restarting it. cosine: from 1 down to MIN_LR_RATIO over LR_DECAY_STEPS, then flat.
+        """
+        since_start = int(self.global_step) - int(getattr(self, "_run_start_step", 0))
+        resumed = (int(getattr(self, "_run_start_step", 0)) + int(self._schedule_offset)) > 0
+        warmup = int(getattr(Config, "RESUME_WARMUP_STEPS", 0)) if resumed else int(getattr(Config, "WARMUP_STEPS", 0))
+        warm = min(1.0, (since_start + 1) / max(1, warmup))
+        if str(getattr(Config, "LR_SCHEDULE", "cosine")).lower() == "constant":
+            return warm
+        progress = min(1.0, self._schedule_step() / max(1, int(Config.LR_DECAY_STEPS)))
+        floor = float(Config.MIN_LR_RATIO)
+        cosine = floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.pi * progress))
+        return warm * cosine
 
     def _warmup_factor(self):
-        """Linear warmup factor in [0,1], then 1.0 forever. Keyed off steps since THIS
-        run started (not absolute global_step), so resuming from a checkpoint warms up
-        again. Multiplies each group's base_lr (Muon and Adam groups have different
-        scales — never overwrite with one value)."""
-        warmup = max(1, int(getattr(Config, "WARMUP_STEPS", 0)))
-        step = int(self.global_step) - int(getattr(self, "_run_start_step", 0))
-        return min(1.0, (step + 1) / warmup)
+        # Kept for backward compatibility; the schedule lives in _lr_factor.
+        return self._lr_factor()
 
     def on_load_checkpoint(self, checkpoint):
         """Validate optimizer compatibility and restore current learning rates."""
@@ -245,7 +287,12 @@ class PlZonkey(pl.LightningModule):
 
         # Restore EMA weights if present (so EMA survives stop/resume).
         if self.use_ema and checkpoint.get("ema_state") is not None:
-            self._ema = [e.clone() for e in checkpoint["ema_state"]]
+            self.load_ema_state(checkpoint["ema_state"])
+
+        # Keep the LR schedule continuous if this checkpoint itself came from a
+        # weights-only resume (its global_step restarted at 0 while the schedule did not).
+        if "schedule_step" in checkpoint and not int(getattr(Config, "LR_SCHEDULE_OFFSET", 0) or 0):
+            self._schedule_offset = max(0, int(checkpoint["schedule_step"]) - int(checkpoint.get("global_step", 0) or 0))
 
     def forward(self, x):
         return self.model(x)
@@ -253,7 +300,13 @@ class PlZonkey(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         optimizer = self.optimizers()
 
-        leveled_compressed, leveled_losses = self.model.forward(batch) 
+        log_step = self._schedule_step()
+        diag_every = int(getattr(Config, "DIAGNOSTICS_EVERY_N_STEPS", 0) or 0)
+        diag = diag_every > 0 and log_step % diag_every == 0
+        for layer in self.model.layers:
+            layer.diagnostics_this_step = diag
+
+        leveled_compressed, leveled_losses = self.model.forward(batch)
 
         _print_step = None
         if getattr(self, "trainer", None) is not None:
@@ -378,22 +431,32 @@ class PlZonkey(pl.LightningModule):
                         if _captured.strip():
                             self.tb_writer.add_text("samples/generated", _captured, _print_step)
                 
-        if (self.global_step % 4 == 0):
+        if (self.global_step % int(getattr(Config, "EMPTY_CACHE_EVERY_N_STEPS", 4)) == 0):
             torch.cuda.empty_cache()  # Free fragmented memory
 
         should_log = (self.global_step % 5 == 0)
         total_loss, level_totals = aggregate_leveled_losses(leveled_losses)
 
         for l, losses in enumerate(leveled_losses):
-            if should_log and self.tb_writer is not None:
+            if (should_log or diag) and self.tb_writer is not None:
                 for name, value in losses.items():
                     t = _as_loss_tensor(value)
                     if t is None:
                         continue
-                    self.tb_writer.add_scalar(f"level_{l}/{name}", float(t.item()), self.global_step)
+                    self.tb_writer.add_scalar(f"level_{l}/{name}", float(t.item()), log_step)
             if self.tb_writer is not None and level_totals[l] is not None:
-                self.tb_writer.add_scalar(f"loss/_{l}", float(level_totals[l].item()), self.global_step)
-                
+                self.tb_writer.add_scalar(f"loss/_{l}", float(level_totals[l].item()), log_step)
+        if diag and self.tb_writer is not None:
+            # Hidden-matrix RMS per module: should flatten out with MUON_WEIGHT_DECAY
+            # (without decay it grew to 10-40x the init scale by 885k).
+            with torch.no_grad():
+                for l, layer in enumerate(self.model.layers):
+                    for name in ("compressor", "denoiser", "decompressor"):
+                        rms = [p.detach().float().pow(2).mean().sqrt()
+                               for p in getattr(layer, name).parameters() if p.ndim == 2 and min(p.shape) > 1]
+                        if rms:
+                            self.tb_writer.add_scalar(f"weights/level_{l}_{name}_rms", float(torch.stack(rms).mean()), log_step)
+
 
 
         # Scale loss for gradient accumulation
@@ -410,7 +473,7 @@ class PlZonkey(pl.LightningModule):
         should_step = (batch_idx + 1) % Config.GRAD_ACCUMULATION_STEPS == 0
         
         if should_step:
-            factor = self._warmup_factor()
+            factor = self._lr_factor()
             for group in optimizer.param_groups:
                 group["lr"] = group.get("base_lr", Config.LEARNING_RATE) * factor
             if Config.GRAD_CLIP_VAL > 0:
@@ -421,11 +484,11 @@ class PlZonkey(pl.LightningModule):
                 self._ema_update()
 
         if should_log and self.tb_writer is not None:
-            self.tb_writer.add_scalar("loss/total", float(total_loss.item()), self.global_step)
-            # Log current learning rate
-            current_lr = optimizer.param_groups[0]['lr']
-            self.tb_writer.add_scalar("training/learning_rate", current_lr, self.global_step)
-            # Debug: print LR every 100 steps to verify decay
+            self.tb_writer.add_scalar("loss/total", float(total_loss.item()), log_step)
+            # Learning rate of each group (Muon group first, as before; Adam group separately).
+            for group in optimizer.param_groups:
+                tag = "training/learning_rate" if group.get("use_muon", True) else "training/learning_rate_adam"
+                self.tb_writer.add_scalar(tag, group["lr"], log_step)
         
         del total_loss
         return None
@@ -466,7 +529,9 @@ class PlZonkey(pl.LightningModule):
             param_groups = []
             if hidden_matrix_params:
                 param_groups.append(dict(params=hidden_matrix_params, lr=Config.MUON_LR,
-                                        momentum=Config.MUON_MOMENTUM, use_muon=True))
+                                        momentum=Config.MUON_MOMENTUM,
+                                        weight_decay=float(getattr(Config, "MUON_WEIGHT_DECAY", 0.0)),
+                                        use_muon=True))
             if other_params:
                 param_groups.append(dict(params=other_params, lr=Config.LEARNING_RATE,
                                         eps=Config.EPS, use_muon=False))
@@ -508,6 +573,20 @@ class Zonkey(nn.Module):
 
 
 
+    def _clip_to_last_segment(self, doc, level, existence_mask):
+        """Trim a stitched document (1, max_doc_len, d) to its real content.
+
+        The stitcher pastes every segment up to the next one's inferred start, and the last
+        segment in full (all MAX_SEQ_LENGTHS positions), after which the buffer is zeros.
+        Cut the last segment at its own existence length (existence_mask[-1]), which removes
+        the untruncated tail ("        eeee") that ended most generated lines, and drops the
+        zero rows so a lower level never decodes them."""
+        starts = self.layers[level].stitcher.last_segment_start
+        start = int(starts[0]) if len(starts) > 0 else 0
+        last_len = max(1, int(existence_mask[-1].sum().item()))
+        end = min(doc.shape[1], start + last_len)
+        return doc[:, :end, :]
+
     def _clip_tail_by_existence(self, doc, level, existance_cutoff):
         max_seq_len = Config.MAX_SEQ_LENGTHS[level]
         doc_len = doc.shape[1]
@@ -539,9 +618,10 @@ class Zonkey(nn.Module):
 
     @staticmethod
     def token_ids_to_text(token_ids):
-        """Character decode: token id i is chr(i), matching ord(c) % 256. Not UTF-8."""
+        """Character decode: token id i is chr(i) (see data.wiki_chars.text_to_ids). Not UTF-8.
+        0 (PAD) and 1 (END) are dropped; 2 (UNK, any foreign character) prints as U+FFFD."""
         values = token_ids.detach().reshape(-1).tolist() if torch.is_tensor(token_ids) else list(token_ids)
-        return "".join(chr(int(x) % 256) for x in values if int(x) not in (0, 1))
+        return "".join(chr(0xFFFD) if int(x) == 2 else chr(int(x) % 256) for x in values if int(x) not in (0, 1))
         
     def generate_sequence_from_level_N(
         self, N, num_diffusion_steps=0, fixed_compressed_vectors=None,
@@ -576,7 +656,7 @@ class Zonkey(nn.Module):
                     self.print_char_sequence(seq[child_idx, :child_len])
             doc,_,_ = self.layers[N].stitcher(seq, is_real_inferred, torch.tensor([seq.shape[0]], dtype=torch.long, device=seq.device))
 
-            doc = self._clip_tail_by_existence(doc, N, existance_cutoff)
+            doc = self._clip_to_last_segment(doc, N, existence_mask)
             doc = doc.squeeze(0)
         self.print_char_sequence(doc[:100])
         return doc
@@ -594,7 +674,7 @@ class Zonkey(nn.Module):
                 existance_cutoff=existance_cutoff
             )
             doc, _, _ = self.layers[level].stitcher(seq, is_real_inferred, torch.tensor([seq.shape[0]], dtype=torch.long, device=seq.device))
-            doc = self._clip_tail_by_existence(doc, level, existance_cutoff)
+            doc = self._clip_to_last_segment(doc, level, existence_mask)
             doc = doc.squeeze(0)
         self.print_char_sequence(doc[:100])
         return doc
@@ -608,7 +688,7 @@ class Zonkey(nn.Module):
         
         fake_negatives = None
         for i in range(len(self.layers)):
-            if Config.USE_GRADIENT_CHECKPOINTING:
+            if Config.USE_GRADIENT_CHECKPOINTING and getattr(Config, "GRADIENT_CHECKPOINT_SCOPE", "all") in ("all", "levels"):
                 if i == 0:
                     denoised, is_real_inferred, compressed, losses, reconstructed_docs, is_real, fake_negatives = checkpoint(
                         self.layers[i], token_embeddings, is_real_position, texts, False, None, use_reentrant=False)

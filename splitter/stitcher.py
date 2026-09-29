@@ -33,7 +33,12 @@ class Stitcher(nn.Module):
         self.token_embedding_layer = token_embedding_layer
         self.dim_norm = expected_l2_norm(self.d_model)
         
-        self.register_buffer('_output_buffer', torch.zeros(self.max_sequences, self.max_doc_len, self.d_model))
+        # Scratch space for assembled documents (generation only). Not persistent: it is all
+        # zeros, it used to add ~0.6 GB to every checkpoint, and its shape depends on config.
+        self.register_buffer('_output_buffer', torch.zeros(self.max_sequences, self.max_doc_len, self.d_model), persistent=False)
+        # Per document, where the last (never-merged) segment was placed by the last
+        # assembling forward. Generation uses it to cut that segment at its own existence.
+        self.last_segment_start = []
 
     def infer_start_position(
         self,
@@ -73,10 +78,12 @@ class Stitcher(nn.Module):
         k = n_offsets + j
         mask = k < seq_len
         
-        # Gather scores using advanced indexing
+        # Gather scores using advanced indexing. Out-of-range k are clamped for the gather and
+        # zeroed by the mask (same values as masked assignment, but without the data-dependent
+        # nonzero that made torch.compile fall back to eager for this frame).
         batch_idx = torch.arange(batch_size, device=seq1.device).view(1, batch_size, 1).expand(M, batch_size, seq_len)
-        scores = torch.zeros(M, batch_size, seq_len, dtype=sim.dtype, device=seq1.device)
-        scores[mask] = sim[batch_idx[mask], q[mask], k[mask]]
+        gathered = sim[batch_idx, q, k.clamp(max=seq_len - 1)]
+        scores = torch.where(mask, gathered, torch.zeros_like(gathered))
         
         counts = mask.float().sum(dim=0).clamp(min=1.0)  # [batch, seq_len]
         match_scores = scores.sum(dim=0) / counts  # [batch, seq_len]
@@ -223,10 +230,14 @@ class Stitcher(nn.Module):
         denoised_is_real_position,
         num_seq_per_doc, 
         original_position=None, 
-        original_input_sequences=None, 
-        all_p_exist_share=None, 
+        original_input_sequences=None,
+        all_p_exist_share=None,
         all_tokens=None,
-        previous_denoised=None):
+        previous_denoised=None,
+        assemble=True):
+        # assemble=False (training): only the position/sequence losses are needed. The
+        # assembled documents were never used in training, and assembling them costs one
+        # GPU->CPU sync per segment pair (~800 per step at level 0).
 
         # Extract start_positions from original_position if provided
         # original_position shape: [num_sequences, seq_len, 2] where [:,:,0]=doc_id, [:,:,1]=position_in_doc
@@ -250,8 +261,10 @@ class Stitcher(nn.Module):
         # Output buffer handling
         d_model = denoised_input_sequences.shape[2]
         seq_len = denoised_input_sequences.shape[1]
-        
-        if num_docs <= self.max_sequences:
+
+        if not assemble:
+            all_patches = None
+        elif num_docs <= self.max_sequences:
             all_patches = self._output_buffer[:num_docs, :self.max_doc_len, :d_model].detach()
             all_patches.fill_(0)
         else:
@@ -259,6 +272,8 @@ class Stitcher(nn.Module):
                                      device=denoised_input_sequences.device, dtype=denoised_input_sequences.dtype)
         
         stitched_len = torch.full((num_docs,), seq_len, device=denoised_input_sequences.device, dtype=torch.long)
+        if assemble:
+            self.last_segment_start = [0] * num_docs
 
         # Precompute document start indices in the flat input
         doc_starts = torch.cat([torch.tensor([0], device=num_seq_per_doc_filtered.device), 
@@ -269,7 +284,7 @@ class Stitcher(nn.Module):
         multi_sent_mask = ~single_sent_mask
         
         # --- 1. Handle Single Sentence Documents ---
-        if single_sent_mask.any():
+        if assemble and single_sent_mask.any():
             single_doc_indices = torch.nonzero(single_sent_mask).squeeze(1)
             flat_indices = doc_starts[single_doc_indices]
             single_docs = denoised_input_sequences[flat_indices]
@@ -329,8 +344,8 @@ class Stitcher(nn.Module):
             
             # --- Reconstruct Output ---
             current_pair_idx = 0
-            num_multi_docs = len(multi_doc_indices)
-            
+            num_multi_docs = len(multi_doc_indices) if assemble else 0
+
             # Iterate over unique multi-sentence docs to stitch them back
             for i in range(num_multi_docs):
                 doc_idx = multi_doc_indices[i].item()
@@ -360,6 +375,7 @@ class Stitcher(nn.Module):
                         break
                 
                 # Place last sentence
+                self.last_segment_start[doc_idx] = current_pos
                 if current_pos < self.max_doc_len:
                     remaining = self.max_doc_len - current_pos
                     take = min(self.max_seq_len, remaining)

@@ -24,10 +24,19 @@ class Config:
     #learning
     BATCH_SIZE = 3
     LEARNING_RATE = 3e-4
-    # LR schedule (manual optimization → applied per optimizer step by PlZonkey).
-    WARMUP_STEPS = 1000          # linear warmup over this many optimizer steps
-    LR_DECAY_STEPS = 300000      # cosine-decay horizon in optimizer steps (gentle if large)
-    MIN_LR_RATIO = 0.1           # final LR = LEARNING_RATE * MIN_LR_RATIO
+    # LR schedule (manual optimization → applied per optimizer step by PlZonkey._lr_factor).
+    # LEARNING_RATE and MUON_LR are PEAK values: do not lower them by hand, the schedule
+    # decays both groups. factor = warmup(steps since this run started) * cosine(schedule step),
+    # where schedule step = global_step + offset. A full resume restores global_step, so the
+    # schedule continues where it stopped; a weights-only resume (Lightning restarts
+    # global_step at 0) takes the offset from the checkpoint's saved schedule step
+    # automatically (run_trainer.py), so it continues too.
+    LR_SCHEDULE = "cosine"       # "cosine" or "constant"
+    WARMUP_STEPS = 1000          # linear warmup at the start of a fresh run
+    RESUME_WARMUP_STEPS = 500    # short re-warmup after any resume (restored optimizer state can be stale)
+    LR_DECAY_STEPS = 300000      # cosine horizon in schedule steps; flat at MIN_LR_RATIO afterwards
+    MIN_LR_RATIO = 0.1           # final LR = peak * MIN_LR_RATIO
+    LR_SCHEDULE_OFFSET = 0       # set only to override the automatic weights-only resume offset
     DROPOUT = 0.0
     MAX_SEQ_LENGTHS = [16,32]
     COMPRESSION_PENALTY = [3,3] #trades off compression and quality
@@ -42,6 +51,9 @@ class Config:
     # Conservative value given tiny batches; only the Adam group uses LEARNING_RATE.
     MUON_LR = 0.005
     MUON_MOMENTUM = 0.95  # Momentum for Muon optimizer
+    # Decoupled weight decay on the Muon (hidden-matrix) group only; scaled by the scheduled LR.
+    # Without it Muon's fixed-size updates grew hidden matrices to 10-40x their init RMS by 885k.
+    MUON_WEIGHT_DECAY = 0.01
     USE_OPTIMIZER_CHECKPOINT = True #use checkpoint when available to restore optimizer state
 
     # EMA of weights — generation samples from the EMA copy (much more coherent).
@@ -55,6 +67,11 @@ class Config:
     TB_WRITER = None
     NUM_WORKERS = 12
     USE_GRADIENT_CHECKPOINTING = False
+    # What USE_GRADIENT_CHECKPOINTING recomputes: "all" (each level's whole forward AND each
+    # denoise pass inside it, i.e. denoise passes run three times), "levels" (whole levels
+    # only) or "passes" (each denoise pass only).
+    GRADIENT_CHECKPOINT_SCOPE = "all"
+    EMPTY_CACHE_EVERY_N_STEPS = 4  # torch.cuda.empty_cache() cadence in training_step
     MAX_STEPS = None
     MAX_EPOCHS = 1
     SAVE_EVERY_N_STEPS = 10000
@@ -106,8 +123,46 @@ class Config:
     # Always-on (1-cos) added to L>0 contrastive recon. InfoNCE+atanh can still
     # saturate vs easy negatives before the positive is on-manifold.
     DIRECT_COSINE_WEIGHT = 0.5
-    # Sampled one-level behavioral consistency. This tests parent-produced child
-    # codes through the actual lower decoder without recursively unrolling to chars.
+    # One-hop interface loss: the parent's predicted child codes are decoded by the child
+    # level exactly as generation does, and scored with the child level's own
+    # reconstruction loss against the decode of the true child codes. Never unrolls more
+    # than one level, so it is the same code at every depth.
     INTERFACE_CONSISTENCY_WEIGHT = [0.0, 1.0]
-    INTERFACE_CONSISTENCY_SAMPLES = 12
-    
+    INTERFACE_CONSISTENCY_SAMPLES = 64
+
+    # Code margin. The clean pass decodes from the code moved toward random noise by
+    # t_aug along the geodesic (angle = t_aug * 90 degrees) while the time label stays 0,
+    # so "t=0" means "a code that is near a real code" and every decoder learns to read
+    # its code from directions that survive small errors (a parent's prediction error, or
+    # the sampler's end point). t_aug is log-uniform in the range (scale-free), and
+    # CLEAN_NOISE_EXACT_FRACTION of the samples stay exact. Isotropic noise of angle a has
+    # only a/sqrt(D) along any single direction, so the same range is never harder at
+    # higher levels (larger D); the invariance it teaches depends on the angle only.
+    CLEAN_NOISE_T_RANGE = [1e-4, 3e-2]
+    CLEAN_NOISE_EXACT_FRACTION = 0.25
+
+    # Generative passes treat codes as data: the FM input/target and the FM/dirty
+    # reconstruction targets (child codes, or the char table at level 0) are detached, so
+    # the flow loss cannot pull codes toward the denoiser's average prediction.
+    DETACH_GENERATIVE_TARGETS = True
+
+    # FM/dirty reconstruction is weighted per sample by the probability that the
+    # denoiser's own estimate (compress(denoised)) picks its source among the batch's
+    # codes (identical owned content counts as the same source). Unidentifiable inputs
+    # can only teach the average output ("eeee"), so they get no reconstruction weight.
+    IDENTIFIABILITY_GATE = True
+
+    # Draft = one causal pass of the decompressor over [prompt; learned queries],
+    # normalized to dim_norm. The old 27-step self-feeding unroll produced a
+    # content-free draft whose norm grew with position (9.5k -> 22k at L0).
+    PARALLEL_DRAFT = True
+
+    # Segment-length targets per level. None keeps the old coupling to
+    # COMPRESSION_VECTORS (target BOS prob = CV/MAX_SEQ_LENGTH, min length = CV); set
+    # them explicitly for upper levels that use COMPRESSION_VECTORS = 1.
+    TARGET_BOS_PROB = [None, None, None, None, None, None]
+    MIN_SEGMENT_LENGTH = [None, None, None, None, None, None]
+
+    # Cheap no-grad diagnostics logged as level_n/metric_* every N optimizer steps.
+    DIAGNOSTICS_EVERY_N_STEPS = 250
+

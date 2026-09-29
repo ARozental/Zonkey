@@ -2,6 +2,7 @@
 import torch
 import sys
 import os
+import unicodedata
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from datasets import load_dataset
@@ -11,6 +12,34 @@ from functools import partial
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ['TRANSFORMERS_OFFLINE'] = '1'
 os.environ['HF_DATASETS_OFFLINE'] = '1'
+
+
+# 0 = PAD, 1 = END (appended after the text), 2 = "foreign character".
+UNK_ID = 2
+_FIXES = {"‘": "'", "’": "'", "‚": "'", "“": '"', "”": '"', "„": '"',
+          "–": "-", "—": "-", "―": "-", "−": "-", "‐": "-", "‑": "-", "…": "...",
+          "ł": "l", "Ł": "L", "đ": "d", "Đ": "D", "ı": "i", "œ": "oe", "Œ": "OE"}
+
+
+def text_to_ids(text: str) -> list[int]:
+    """The only text -> id mapping. Keeps Latin-1 as is, strips accents outside it
+    (š->s, ā->a, ō->o), maps typographic punctuation to ASCII, emits one UNK per run of
+    anything else, and never emits 0 (PAD) or 1 (END). Every id is in [2, 255], so the
+    256-entry embedding and the chr(i % 256) decode are unchanged."""
+    ids = []
+    for ch in text:
+        ch = _FIXES.get(ch, ch)
+        if len(ch) == 1 and 2 <= ord(ch) < 256:
+            ids.append(ord(ch))
+            continue
+        base = "".join(c for c in unicodedata.normalize("NFKD", ch) if not unicodedata.combining(c))
+        if not base:
+            continue                            # bare combining mark (stress accents): drop
+        if all(2 <= ord(c) < 256 for c in base):
+            ids.extend(ord(c) for c in base)
+        elif not ids or ids[-1] != UNK_ID:
+            ids.append(UNK_ID)
+    return ids
 
 
 def load_wikipedia(max_examples: int | None = None):
@@ -39,7 +68,7 @@ class WikipediaCharsDataset(Dataset):
         article = self.wiki_dataset[idx]
         text = article["text"]
         
-        tokens = [ord(x) % Config.TOKENIZER_VOCAB_SIZE_CHARS for x in text]
+        tokens = text_to_ids(text)
         
         if len(tokens) == Config.MAX_DOC_LENGTHS[0] - 1:
             tokens.append(1)

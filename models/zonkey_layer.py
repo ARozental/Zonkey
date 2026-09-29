@@ -153,6 +153,11 @@ class ZonkeyLayer(nn.Module):
             num_layers = Config.NUM_DECOMPRESSOR_LAYERS[level]
             )
         self.ar_decoder = AutoregressiveDecoder(decompressor=self.decompressor, denoiser=self.denoiser) #no new weights here
+        # Learned inputs of the parallel draft (Config.PARALLEL_DRAFT): one per output
+        # position, at the scale of every other sequence vector (norm ~ dim_norm).
+        self.draft_queries = nn.Parameter(torch.randn(1, self.max_seq_len, d_model), requires_grad=True)
+        # Set by PlZonkey on the steps where the no-grad diagnostics should be logged.
+        self.diagnostics_this_step = False
 
 
 
@@ -172,10 +177,17 @@ class ZonkeyLayer(nn.Module):
         self._drifting_queue_count = 0
         self._pending_clean_for_queue = None
 
-        if Config.USE_GRADIENT_CHECKPOINTING:
-            self.denoise_and_reconstruct = lambda *args, **kwargs: torch.utils.checkpoint.checkpoint(
-                self._denoise_and_reconstruct, *args, **kwargs, use_reentrant=False
-            )
+        checkpoint_scope = getattr(Config, "GRADIENT_CHECKPOINT_SCOPE", "all")
+        if Config.USE_GRADIENT_CHECKPOINTING and checkpoint_scope in ("all", "passes"):
+            def _checkpointed_pass(*args, **kwargs):
+                return torch.utils.checkpoint.checkpoint(
+                    self._denoise_and_reconstruct, *args, **kwargs, use_reentrant=False
+                )
+            # Without the level-wide checkpoint around it, torch.compile cannot trace this
+            # activation checkpoint (dynamo AssertionError in lift_tracked_freevar_to_input),
+            # so in "passes" scope the checkpointed pass runs outside dynamo.
+            self.denoise_and_reconstruct = (torch._dynamo.disable(_checkpointed_pass)
+                                            if checkpoint_scope == "passes" else _checkpointed_pass)
         else:
             self.denoise_and_reconstruct = self._denoise_and_reconstruct
     
@@ -359,13 +371,20 @@ class ZonkeyLayer(nn.Module):
         ], dim=1)
 
         prompt_len = 2 + Config.COMPRESSION_VECTORS[self.level]
-        decompressed = self.decompressor.generate(prompt, Config.MAX_SEQ_LENGTHS[self.level])
-        # Transformer.generate returns decoder hidden states for the prompt positions.
-        # The bidirectional denoiser needs the exact time/self-condition/code values,
-        # not a one-layer rewrite of its conditioning. Keep the generated draft while
-        # restoring an identity path for all prompt information.
-        decompressed = torch.cat([prompt, decompressed[:, prompt_len:, :]], dim=1)
-        vectors = decompressed[:, prompt_len:]
+        if getattr(Config, "PARALLEL_DRAFT", False):
+            # One causal pass over [prompt; learned queries]. Each draft position reads the
+            # code through attention; nothing is fed back, so the draft cannot accumulate
+            # (the 27-step unroll summed every earlier increment into each position and its
+            # norm grew with position, 9.5k -> 22k at L0 vs a working scale of 16).
+            queries = self.draft_queries.expand(batch_size, -1, -1).to(prompt.dtype)
+            drafted = self.decompressor.decode(torch.cat([prompt, queries], dim=1))[:, prompt_len:, :]
+            vectors = F.normalize(drafted, p=2, dim=-1) * self.dim_norm
+        else:
+            # Legacy 27-step self-feeding unroll (kept so old checkpoints decode as trained).
+            vectors = self.decompressor.generate(prompt, Config.MAX_SEQ_LENGTHS[self.level])[:, prompt_len:, :]
+        # The bidirectional denoiser needs the exact time/self-condition/code values, not a
+        # decoder rewrite of its conditioning: identity path for all prompt information.
+        decompressed = torch.cat([prompt, vectors], dim=1)
         bos_probability = self.compute_bos_probability(vectors)
         is_real_inferred = self.bos_probs_to_inferred_real_position(bos_probability)
 
@@ -722,11 +741,16 @@ class ZonkeyLayer(nn.Module):
         skip_add_noise: bool = False,
         x0_target: Optional[torch.Tensor] = None,
         compute_flow_loss: bool = False,
+        detach_targets: bool = False,
+        gate_codes: Optional[torch.Tensor] = None,
         ) -> Tuple[torch.Tensor, Optional[dict], torch.Tensor]:
         # Flow-matching corruption: interpolate the clean compressed vector toward
         # noise along the geodesic by fraction `noise_level` (0 = clean, 1 = noise).
         # skip_add_noise: `compressed` is already the state at `noise_level`
         # (on-path FM sample, or a parent code decoded with treat_as_noisy=True).
+        # detach_targets: generative pass, the reconstruction targets (child codes, or the
+        # char table at level 0) are data and receive no gradient.
+        # gate_codes: the batch's clean codes; enables the identifiability gate.
         noisy_compressed = compressed if skip_add_noise else self.add_noise(compressed, noise_level)
         denoised, is_real_inferred = self.compressed_to_denoised(noisy_compressed, noise_level, self_cond=self_cond)
 
@@ -737,6 +761,10 @@ class ZonkeyLayer(nn.Module):
         with torch.no_grad():
             is_real_label = self.bos_probs_to_inferred_real_position(all_sentence_bos_probs)
 
+        # The data-prediction estimate x1_hat = compress(denoised) is needed by the flow loss
+        # (with gradient) and by the identifiability gate (without).
+        x1_hat = self.compress(denoised, is_real_inferred) if compute_flow_loss else None
+
         # Per-sample (1-t)^p on sequence recon for non-clean passes. Divide-by-existence
         # (not by gated mass) so high t actually shrinks the scalar. BOS is not gated.
         sample_weight = None
@@ -745,17 +773,24 @@ class ZonkeyLayer(nn.Module):
             if gate_p != 0.0:
                 t = noise_level.clamp(0.0, 1.0).reshape(-1)
                 sample_weight = (1.0 - t).clamp(min=0.0) ** gate_p
+        identifiable = None
+        if (not clean) and gate_codes is not None and getattr(Config, "IDENTIFIABILITY_GATE", False):
+            with torch.no_grad():
+                estimate = x1_hat.detach() if x1_hat is not None else self.compress(denoised.detach(), is_real_inferred.detach())
+                identifiable = self._identifiability(estimate, gate_codes, input_sequence, is_real_label)
+            sample_weight = identifiable if sample_weight is None else sample_weight * identifiable
 
+        target_sequence = input_sequence.detach() if detach_targets else input_sequence
         if self.level == 0:
             reconstruction_loss, _ = calculate_token_loss(
                 token_ids, denoised, splitter_existence_share, self.previous_layer,
                 noise_level=noise_level, regression_power=Config.REGRESSION_T_POWER,
-                sample_weight=sample_weight)
+                sample_weight=sample_weight, detach_table=detach_targets)
         else:
             reconstruction_loss, _ = calculate_reconstruction_loss(
                 denoised=denoised,
                 is_real_inferred=is_real_inferred,
-                target_sequences=input_sequence,
+                target_sequences=target_sequence,
                 splitter_existence_share=splitter_existence_share,
                 fake_negatives=fake_negatives,
                 noise_level=noise_level, regression_power=Config.REGRESSION_T_POWER,
@@ -767,6 +802,8 @@ class ZonkeyLayer(nn.Module):
             "reconstruction_loss": reconstruction_loss,
             "bos_loss": dbos_ce_loss * Config.EXISTS_WEIGHT[self.level],
         }
+        if identifiable is not None:
+            losses["metric_identifiable"] = identifiable.mean().detach()
         if clean:
             metric_weights = splitter_existence_share.detach()
             metric_denom = metric_weights.sum().clamp_min(Config.EPS)
@@ -795,7 +832,6 @@ class ZonkeyLayer(nn.Module):
         # starves the high-t direction generation actually starts from.
         if compute_flow_loss:
             flow_target = compressed if x0_target is None else x0_target
-            x1_hat = self.compress(denoised, is_real_inferred)
             B = x1_hat.shape[0]
             x_t_flat = F.normalize(noisy_compressed.reshape(B, -1), p=2, dim=-1)
             pred_flat = F.normalize(x1_hat.reshape(B, -1), p=2, dim=-1)
@@ -807,13 +843,80 @@ class ZonkeyLayer(nn.Module):
         # Stitcher / document-reassembly losses only make sense near the data
         # manifold, so they are computed only on the clean (t~0) structural pass.
         if clean:
-            reconstructed_docs, stitcher_position_loss, stitcher_sequence_loss = self.stitcher(
+            _, stitcher_position_loss, stitcher_sequence_loss = self.stitcher(
                 denoised, is_real_inferred, num_sentences_per_doc, original_position=original_position,
-                original_input_sequences=input_sequence, all_p_exist_share=splitter_existence_share, all_tokens=token_ids)
+                original_input_sequences=input_sequence, all_p_exist_share=splitter_existence_share, all_tokens=token_ids,
+                assemble=False)
             losses["stitcher_position_loss"] = stitcher_position_loss
             losses["stitcher_sequence_loss"] = stitcher_sequence_loss * 0.01
 
         return denoised, losses, is_real_inferred
+
+    @torch.no_grad()
+    def _identifiability(self, estimate: torch.Tensor, codes: torch.Tensor,
+                         input_sequence: torch.Tensor, is_real_label: torch.Tensor) -> torch.Tensor:
+        """Per-sample probability (no grad) that `estimate` picks its own source among the
+        batch's clean `codes`, with the reconstruction losses' logit 2*atanh(cos). Windows
+        whose owned content (positions with existence label > 0.5) is identical count as
+        the same source, so repeated words ("the") are not penalized for being ambiguous
+        with each other."""
+        n = estimate.shape[0]
+        e = F.normalize(estimate.reshape(n, -1).float(), p=2, dim=-1)
+        c = F.normalize(codes.reshape(n, -1).float(), p=2, dim=-1)
+        logits = 2 * torch.atanh((e @ c.t()).clamp(-1 + 1e-6, 1 - 1e-6))
+        probs = torch.softmax(logits, dim=-1)
+        owned = (is_real_label > 0.5).to(input_sequence.dtype).unsqueeze(-1)
+        content = (input_sequence.detach() * owned).reshape(n, -1)
+        _, group = torch.unique(content, dim=0, return_inverse=True)
+        same_source = (group.unsqueeze(0) == group.unsqueeze(1)).to(probs.dtype)
+        return (probs * same_source).sum(-1).clamp(0.0, 1.0)
+
+    def _sample_clean_noise_t(self, n: int, device, dtype) -> torch.Tensor:
+        """t_aug for the clean pass: log-uniform in CLEAN_NOISE_T_RANGE, and exactly 0 for a
+        CLEAN_NOISE_EXACT_FRACTION of the samples (see Config)."""
+        lo, hi = getattr(Config, "CLEAN_NOISE_T_RANGE", [0.0, 0.0])
+        if hi <= 0.0 or lo <= 0.0:
+            return torch.zeros(n, device=device, dtype=dtype)
+        u = torch.rand(n, device=device)
+        t = torch.exp(math.log(lo) + u * (math.log(hi) - math.log(lo)))
+        exact = torch.rand(n, device=device) < float(getattr(Config, "CLEAN_NOISE_EXACT_FRACTION", 0.0))
+        return torch.where(exact, torch.zeros_like(t), t).to(dtype)
+
+    @torch.no_grad()
+    def _code_diagnostics(self, clean_compressed: torch.Tensor, input_sequence: torch.Tensor,
+                          is_real_label: torch.Tensor, token_ids: Optional[torch.Tensor]) -> dict:
+        """No-grad health metrics of this level's code space (logged every
+        DIAGNOSTICS_EVERY_N_STEPS): effective dimensionality, nearest-neighbour angle, and
+        how much of the decode survives 0.23 degrees of isotropic noise at label t=0."""
+        out = {}
+        n = clean_compressed.shape[0]
+        if n < 4:
+            return out
+        z = F.normalize(clean_compressed.reshape(n, -1).float(), p=2, dim=-1)
+        zc = z - z.mean(0, keepdim=True)
+        ev = torch.linalg.eigvalsh(zc @ zc.t()).clamp_min(0)
+        out["metric_code_participation_ratio"] = (ev.sum() ** 2 / (ev.pow(2).sum() + 1e-12)).detach()
+        sim = z @ z.t()
+        sim.fill_diagonal_(-2.0)
+        nn_cos = sim.max(-1).values.clamp(-1.0, 1.0)
+        out["metric_code_nn_angle_deg"] = torch.rad2deg(torch.acos(nn_cos)).median().detach()
+        k = min(64, n)
+        idx = torch.randperm(n, device=clean_compressed.device)[:k]
+        codes = clean_compressed[idx]
+        zeros = torch.zeros(k, device=codes.device, dtype=codes.dtype)
+        exact, _ = self.compressed_to_denoised(codes, zeros)
+        noisy_codes = self.add_noise(codes, torch.full((k,), 0.0025, device=codes.device, dtype=codes.dtype))
+        noisy, _ = self.compressed_to_denoised(noisy_codes, zeros)
+        owned = is_real_label[idx] > 0.5
+        if self.level == 0:
+            table = F.normalize(self.previous_layer.weight, p=2, dim=-1)
+            ids_exact = (F.normalize(exact, p=2, dim=-1) @ table.t()).argmax(-1)
+            ids_noisy = (F.normalize(noisy, p=2, dim=-1) @ table.t()).argmax(-1)
+            out["metric_offmanifold_char_acc"] = (((ids_exact == ids_noisy) & owned).sum() / owned.sum().clamp_min(1)).detach()
+        else:
+            cos = F.cosine_similarity(exact, noisy, dim=-1)
+            out["metric_offmanifold_cos"] = ((cos * owned).sum() / owned.sum().clamp_min(1)).detach()
+        return out
 
     def _reshape_as_lower_compressed(self, codes: torch.Tensor) -> torch.Tensor:
         """View this level's child codes as the previous level's compressed prompt.
@@ -841,48 +944,75 @@ class ZonkeyLayer(nn.Module):
         predicted_lower_codes: torch.Tensor,
         target_lower_codes: torch.Tensor,
         position_weights: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Make this level's predicted child codes behave like real child codes.
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        """Make this level's predicted child codes decode like the real child codes.
 
-        This unrolls exactly one adjacent interface: level n's output codes are
-        decoded by level n-1 and matched to the decode of the paired real codes.
-        It therefore scales to deeper hierarchies without every level decoding to
-        characters. Only a small sample is used to bound activation memory.
+        One hop only: level n's predicted child codes are decoded by level n-1 exactly as
+        generation decodes them (t=0), and the decode is scored with level n-1's OWN
+        reconstruction loss against the decode of the paired true child code (the teacher,
+        no grad): character CE when level n-1 is 0, level n-1's contrastive reconstruction
+        otherwise. The gradient reaches both levels: level n learns to land where level
+        n-1 can read, level n-1 learns to read level n's typical errors. Positions are
+        sampled by this level's inferred existence, i.e. the children generation keeps.
         """
+        metrics = {}
         if self.level == 0:
             zero = predicted_lower_codes.new_zeros(())
-            return zero, zero
+            return zero, zero, metrics
 
         flat_weights = position_weights.detach().reshape(-1).float().clamp_min(0.0)
         valid_count = int((flat_weights > Config.EPS).sum().item())
         if valid_count == 0:
             zero = predicted_lower_codes.new_zeros(())
-            return zero, zero
+            return zero, zero, metrics
 
         num_samples = min(int(Config.INTERFACE_CONSISTENCY_SAMPLES), valid_count)
         sample_probs = flat_weights / flat_weights.sum().clamp_min(Config.EPS)
         sample_indices = torch.multinomial(sample_probs, num_samples, replacement=False)
 
+        lower = self.previous_layer
         predicted = predicted_lower_codes.reshape(-1, self.d_model)[sample_indices]
-        target = target_lower_codes.reshape(-1, self.d_model)[sample_indices]
+        target = target_lower_codes.detach().reshape(-1, self.d_model)[sample_indices]
         predicted = self._reshape_as_lower_compressed(predicted)
         target = self._reshape_as_lower_compressed(target)
         t0 = torch.zeros(num_samples, device=predicted.device, dtype=predicted.dtype)
 
         with torch.no_grad():
-            teacher_sequence, teacher_real = self.previous_layer.compressed_to_denoised(
-                target, t0, self_cond=None)
-        student_sequence, student_real = self.previous_layer.compressed_to_denoised(
-            predicted, t0, self_cond=None)
+            teacher_sequence, teacher_real = lower.compressed_to_denoised(target, t0, self_cond=None)
+        student_sequence, student_real = lower.compressed_to_denoised(predicted, t0, self_cond=None)
 
-        teacher_sequence = teacher_sequence.detach()
-        teacher_real = teacher_real.detach()
-        per_position = 1.0 - F.cosine_similarity(
-            student_sequence, teacher_sequence, dim=-1)
-        sequence_loss = (
-            (per_position * teacher_real).sum()
-            / teacher_real.sum().clamp_min(Config.EPS)
-        )
+        # Content weight: the teacher's existence on the positions generation keeps.
+        keep = (teacher_real > 0.1).to(teacher_real.dtype)
+        content_weight = teacher_real * keep
+        if lower.level == 0:
+            table = F.normalize(lower.previous_layer.weight.detach(), p=2, dim=-1)
+            teacher_cos = F.normalize(teacher_sequence, p=2, dim=-1) @ table.t()
+            teacher_ids = teacher_cos.argmax(-1)
+            sequence_loss, _ = calculate_token_loss(
+                teacher_ids, student_sequence, content_weight, lower.previous_layer, detach_table=True)
+            with torch.no_grad():
+                # Measured only where the teacher decode is confident (char prob >= 0.5 under
+                # the loss's 2*atanh(cos) logits): while level 0 still decodes every code to
+                # the same characters, student and teacher would agree trivially.
+                teacher_prob = torch.softmax(2 * torch.atanh(teacher_cos.clamp(-1 + 1e-6, 1 - 1e-6)), -1).amax(-1)
+                kept = keep.bool() & (teacher_prob >= 0.5)
+                student_ids = (F.normalize(student_sequence.detach(), p=2, dim=-1) @ table.t()).argmax(-1)
+                if bool(kept.any()):
+                    correct = (student_ids == teacher_ids) & kept
+                    metrics["metric_child_char_acc"] = (correct.sum() / kept.sum()).detach()
+                    words = kept.any(-1) & (kept == keep.bool()).all(-1)   # every kept char confident
+                    if bool(words.any()):
+                        word_ok = ((student_ids == teacher_ids) | ~kept).all(-1)
+                        metrics["metric_child_word_acc"] = word_ok[words].float().mean().detach()
+        else:
+            sequence_loss, _ = calculate_reconstruction_loss(
+                denoised=student_sequence,
+                is_real_inferred=teacher_real,
+                target_sequences=teacher_sequence,
+                splitter_existence_share=content_weight)
+            with torch.no_grad():
+                cos = F.cosine_similarity(student_sequence.detach(), teacher_sequence, dim=-1)
+                metrics["metric_child_cos"] = ((cos * content_weight).sum() / content_weight.sum().clamp_min(Config.EPS)).detach()
 
         teacher_prob = teacher_real.clamp(Config.EPS, 1.0 - Config.EPS)
         student_prob = student_real.clamp(Config.EPS, 1.0 - Config.EPS)
@@ -891,7 +1021,7 @@ class ZonkeyLayer(nn.Module):
             - bce(teacher_prob, teacher_prob, reduction="none")
         )
         existence_loss = existence_kl[:, 1:].mean()
-        return sequence_loss, existence_loss
+        return sequence_loss, existence_loss, metrics
 
     
     def calculate_mlm_loss(
@@ -1122,25 +1252,42 @@ class ZonkeyLayer(nn.Module):
         doc_ids = original_position[:,0,0]
         batch = clean_compressed.shape[0]
 
-        # === Pass 1: structural anchor at t~0 (clean) ===
-        # Trains the decode-at-t=0 regime (the ODE's final step) plus the
-        # near-data-only structural losses (stitcher).
+        # === Pass 1: structural anchor at t=0 (clean) ===
+        # Trains the decode-at-t=0 regime (the ODE's final step, and how a parent's
+        # predicted children are decoded) plus the near-data-only structural losses
+        # (stitcher). The decoder input is the code moved by a small random angle
+        # (t_aug, Config.CLEAN_NOISE_T_RANGE) while the label stays t=0, so decoding at
+        # t=0 must work in a neighbourhood of every real code, not only exactly at it
+        # (at 885k a 0.23 degree off-manifold nudge cut L0 char accuracy to ~50%).
+        # Gradient still reaches the codes: this pass may shape them, and it pushes them
+        # apart until they survive the noise.
         t_clean = torch.zeros(batch, device=clean_compressed.device, dtype=clean_compressed.dtype)
+        t_aug = self._sample_clean_noise_t(batch, clean_compressed.device, clean_compressed.dtype)
+        clean_input = self.add_noise(clean_compressed, t_aug)
         denoised_clean, clean_losses, is_real_inferred = self.denoise_and_reconstruct(
-            clean_compressed, input_sequence, all_sentence_bos_probs, t_clean, splitter_existence_share,
+            clean_input, input_sequence, all_sentence_bos_probs, t_clean, splitter_existence_share,
             token_ids=token_ids,
             num_sentences_per_doc=num_sentences_per_doc,
             original_position=original_position,
             clean=True,
             fake_negatives=fake_negatives,
+            skip_add_noise=True,
         )
+
+        # Generative passes (FM, dirty) treat codes as data (Config.DETACH_GENERATIVE_TARGETS):
+        # their input and targets carry no gradient back into the codes, so the flow loss
+        # cannot pull every code toward the denoiser's average prediction. gate_codes feeds
+        # the identifiability gate (Config.IDENTIFIABILITY_GATE).
+        detach = bool(getattr(Config, "DETACH_GENERATIVE_TARGETS", False))
+        fm_source = clean_compressed.detach() if detach else clean_compressed
+        gate_codes = clean_compressed.detach()
 
         # === Pass 2: flow-matching denoiser across the whole path ===
         # t = U(0,1)^T_FM_EXPONENT: slerp keeps cos(x_t, x1) = cos(t*pi/2), so uniform t
         # spends half of training above 0.71 cosine — too easy. Exponent < 1 shifts the
         # mass toward the high-noise regime generation actually starts from.
         t_fm = torch.rand(batch, device=clean_compressed.device, dtype=clean_compressed.dtype) ** Config.T_FM_EXPONENT
-        x_t_fm = self.add_noise(clean_compressed, t_fm)
+        x_t_fm = self.add_noise(fm_source, t_fm)
 
         # Train self-conditioning on the exact state distribution used by sampling:
         # estimate x0, take one sampler-sized tangent step, then train the next state
@@ -1179,8 +1326,10 @@ class ZonkeyLayer(nn.Module):
             fake_negatives=fake_negatives,
             self_cond=fm_self_cond,
             skip_add_noise=True,
-            x0_target=clean_compressed,
+            x0_target=fm_source,
             compute_flow_loss=True,
+            detach_targets=detach,
+            gate_codes=gate_codes,
         )
 
         # === Pass 3: DDMM "dirty" denoiser on a self-generated intermediate ===
@@ -1209,15 +1358,20 @@ class ZonkeyLayer(nn.Module):
             clean=False,
             fake_negatives=fake_negatives,
             self_cond=dirty_self_cond,
-            x0_target=clean_compressed,
+            detach_targets=detach,
+            gate_codes=gate_codes,
         )
 
         interface_sequence_loss = clean_compressed.new_zeros(())
         interface_existence_loss = clean_compressed.new_zeros(())
+        interface_metrics = {}
         if self.level > 0 and Config.INTERFACE_CONSISTENCY_WEIGHT[self.level] > 0:
-            interface_sequence_loss, interface_existence_loss = (
+            # Sample the children generation would keep (this level's inferred existence),
+            # never padding rows (their "true child code" is a zero vector).
+            real_rows = (input_sequence.detach().abs().sum(-1) > 0).to(is_real_inferred.dtype)
+            interface_sequence_loss, interface_existence_loss, interface_metrics = (
                 self.calculate_interface_consistency_loss(
-                    denoised_clean, input_sequence, splitter_existence_share
+                    denoised_clean, input_sequence, is_real_inferred.detach() * real_rows
                 )
             )
 
@@ -1293,6 +1447,15 @@ class ZonkeyLayer(nn.Module):
         for metric_name, metric_value in clean_losses.items():
             if metric_name.startswith("metric_"):
                 losses[metric_name] = metric_value
+        if "metric_identifiable" in fm_losses:
+            losses["metric_fm_identifiable"] = fm_losses["metric_identifiable"]
+        if "metric_identifiable" in dirty_losses:
+            losses["metric_dirty_identifiable"] = dirty_losses["metric_identifiable"]
+        losses.update(interface_metrics)
+        if self.diagnostics_this_step:
+            with torch.no_grad():
+                label = self.bos_probs_to_inferred_real_position(all_sentence_bos_probs)
+                losses.update(self._code_diagnostics(clean_compressed.detach(), input_sequence, label, token_ids))
 
         return denoised_clean[:input_sequence.shape[0]], clean_compressed, losses, is_real_inferred, fake_negatives_for_upper
     
@@ -1347,10 +1510,12 @@ class ZonkeyLayer(nn.Module):
         num_sentences_per_doc = num_sentences_per_doc[0:num_actual_docs]
         input_sequence = input_sequence[0:num_actual_docs]
 
-        stitched_docs, total_position_loss, total_sequence_loss = self.stitcher(all_sentence_vectors, is_real_inferred, num_sentences_per_doc, original_position=original_position, original_input_sequences=all_sentence_vectors,all_p_exist_share=all_p_exist_share,all_tokens=all_tokens)
-        
+        stitched_docs, total_position_loss, total_sequence_loss = self.stitcher(all_sentence_vectors, is_real_inferred, num_sentences_per_doc, original_position=original_position, original_input_sequences=all_sentence_vectors,all_p_exist_share=all_p_exist_share,all_tokens=all_tokens, assemble=False)
+
         losses["avg_bos_prob"] = bos_per_position.detach()
-        wanted_bos_prob = Config.COMPRESSION_VECTORS[self.level] / Config.MAX_SEQ_LENGTHS[self.level]
+        target_bos = getattr(Config, "TARGET_BOS_PROB", None)
+        target_bos = target_bos[self.level] if target_bos is not None and self.level < len(target_bos) else None
+        wanted_bos_prob = float(target_bos) if target_bos is not None else Config.COMPRESSION_VECTORS[self.level] / Config.MAX_SEQ_LENGTHS[self.level]
         # H-Net ratio loss (eq. 10) with F = stopgrad(G). Centered so the minimum is 0
         # at G = 1/N, unlike the old clamp which scored extra compression as "at target"
         # and then cheapened recon when BOS was high (the opposite Lagrangian).

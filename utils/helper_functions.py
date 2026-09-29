@@ -529,8 +529,12 @@ import os, socket, subprocess, sys
 
 def make_tb_writer(time_now):
     project_root = Path(__file__).resolve().parents[1]
-    root_log_dir = project_root / "tensorboard_logs"
-    start_tensorboard(root_log_dir, port=6006)
+    # ZONKEY_TB_DIR redirects the logs (e.g. for smoke tests); ZONKEY_NO_TB_SERVER=1 skips
+    # launching the TensorBoard server.
+    tb_dir = os.environ.get("ZONKEY_TB_DIR")
+    root_log_dir = Path(tb_dir).expanduser() if tb_dir else project_root / "tensorboard_logs"
+    if not os.environ.get("ZONKEY_NO_TB_SERVER"):
+        start_tensorboard(root_log_dir, port=6006)
     run_id = time_now.strftime("%Y%m%d-%H%M%S")
     run_root = root_log_dir / run_id
     run_root.mkdir(parents=True, exist_ok=True)
