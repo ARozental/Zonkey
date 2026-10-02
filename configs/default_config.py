@@ -77,8 +77,7 @@ class Config:
     SAVE_EVERY_N_STEPS = 10000
     SAVE_TOP_K = -1  # -1 keeps every checkpoint; set to e.g. 3 to keep only the latest few
     PRINT_EVERY_N_STEPS = 10000
-    EVAL_DIFFUSION_STEPS = 30  # ODE sampling steps for the debug/print generation block
-    GRAD_CLIP_VAL = 0 
+    GRAD_CLIP_VAL = 0
     GRAD_ACCUMULATION_STEPS = 1  # Number of steps to accumulate gradients (1 = no accumulation)
     PRECISION = "32-true"  # Lightning precision: "32-true", "16-mixed", "bf16-mixed"
     
@@ -98,18 +97,20 @@ class Config:
     # High-noise regression blend: loss = (1-t^p)*contrastive + (t^p)*(1-cos_to_target).
     # p≈4 makes it negligible at low noise and dominant near t=1; set p>=10 to disable.
     REGRESSION_T_POWER = 4.0
-    # FM-pass t sampling: t = U(0,1)^T_FM_EXPONENT. Slerp keeps cos(x_t,x1)=cos(t*pi/2),
-    # so uniform t spends half of training above 0.71 cosine (too easy). Exponent<1
-    # shifts mass toward high noise (0.5 -> density 2t, median t~0.71).
+    # FM/dirty noise sampling: schedule position u = U(0,1)^T_FM_EXPONENT, mapped to each
+    # level's t by ZonkeyLayer.u_to_t. Exponent<1 shifts mass toward high noise.
     T_FM_EXPONENT = 0.5
-    # Dirty pass is a local off-manifold refinement. The full [0,1] range gave it a
-    # near-clean self-condition at noise levels where sampling has no such estimate.
-    DIRTY_T_MAX = 0.1
+    # Noise schedule in effective SNR rho = sqrt(D) * cot(t * pi / 2): schedule position u
+    # maps to rho = NOISE_SNR_MID * cot(u * pi / 2) at every level, so wider levels (larger
+    # D) get proportionally more noise for the same u. 32 = identity at D = 1024 (level 0).
+    NOISE_SNR_MID = 32.0
+    # The one step count shared by training and sampling: the self-conditioning training
+    # step is 1/DIFFUSION_STEPS in u, exactly one sampler step of generate().
+    DIFFUSION_STEPS = 30
     # Self-conditioning: feed the model's previous x1 estimate as an extra prompt token
     # (dirty pass during training, previous ODE step at sampling). Arch token always
     # exists; this flag only controls whether real estimates are fed (vs the null token).
     USE_SELF_COND = True
-    SELF_CONDITION_TRAIN_STEPS = 30
     MLM_WEIGHT = [0.0,2.0]
     DIRTY_MLM_WEIGHT = [1.0, 1.0]
     DECODER_MLM_WEIGHT = [0.6, 0.4]
@@ -129,6 +130,15 @@ class Config:
     # than one level, so it is the same code at every depth.
     INTERFACE_CONSISTENCY_WEIGHT = [0.0, 1.0]
     INTERFACE_CONSISTENCY_SAMPLES = 64
+
+    # Harder negatives for the clean-pass reconstruction at levels >= 1 (level 0 already
+    # scores its whole char vocabulary). MLM alternatives: MLM_ALT_PASSES complementary
+    # masked passes, each masking MLM_ALT_FRACTION of the slots, give one context guess per
+    # masked slot. Mined negatives: the MINED_NEGATIVES_K real child codes nearest to the
+    # prediction whose content id differs from the target's.
+    MLM_ALT_PASSES = 2
+    MLM_ALT_FRACTION = 0.25
+    MINED_NEGATIVES_K = 16
 
     # Code margin. The clean pass decodes from the code moved toward random noise by
     # t_aug along the geodesic (angle = t_aug * 90 degrees) while the time label stays 0,

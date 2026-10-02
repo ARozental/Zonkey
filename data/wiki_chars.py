@@ -8,6 +8,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from datasets import load_dataset
 from torch.utils.data import Dataset
 from configs.default_config import Config
+from utils.content_id import prefix_hash  # rolling hash for the windows' content ids
 from functools import partial
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ['TRANSFORMERS_OFFLINE'] = '1'
@@ -53,7 +54,8 @@ def load_wikipedia(max_examples: int | None = None):
 
 def collate_char(batch):
     return {
-        "full_texts": torch.stack(batch, dim=0)
+        "full_texts": torch.stack([item["tokens"] for item in batch], dim=0),
+        "prefix_hash": torch.stack([item["prefix_hash"] for item in batch], dim=0),
     }
 
 
@@ -77,8 +79,9 @@ class WikipediaCharsDataset(Dataset):
             tokens.extend(padding)
         elif len(tokens) > Config.MAX_DOC_LENGTHS[0]:
             tokens = tokens[:Config.MAX_DOC_LENGTHS[0]]
-        
-        return torch.tensor(tokens, dtype=torch.long)
+
+        return {"tokens": torch.tensor(tokens, dtype=torch.long),
+                "prefix_hash": torch.tensor(prefix_hash(tokens), dtype=torch.long)}
 
 def create_dataloader(
     batch_size: int = 3,

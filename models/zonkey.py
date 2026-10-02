@@ -11,6 +11,7 @@ from torch.utils.checkpoint import checkpoint
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from configs.default_config import Config
 from models.zonkey_layer import ZonkeyLayer
+from utils.content_id import prefix_hash_tensor, pow_table
 from muon import SingleDeviceMuonWithAuxAdam, MuonWithAuxAdam
 import torch.distributed as dist
 
@@ -316,6 +317,75 @@ class PlZonkey(pl.LightningModule):
         if _print_step <= 0:
             _print_step = int(batch_idx)
 
+        if (self.global_step % int(getattr(Config, "EMPTY_CACHE_EVERY_N_STEPS", 4)) == 0):
+            torch.cuda.empty_cache()  # Free fragmented memory
+
+        should_log = (self.global_step % 5 == 0)
+        total_loss, level_totals = aggregate_leveled_losses(leveled_losses)
+
+        for l, losses in enumerate(leveled_losses):
+            if (should_log or diag) and self.tb_writer is not None:
+                for name, value in losses.items():
+                    t = _as_loss_tensor(value)
+                    if t is None:
+                        continue
+                    self.tb_writer.add_scalar(f"level_{l}/{name}", float(t.item()), log_step)
+            if self.tb_writer is not None and level_totals[l] is not None:
+                self.tb_writer.add_scalar(f"loss/_{l}", float(level_totals[l].item()), log_step)
+        if diag and self.tb_writer is not None:
+            # Hidden-matrix RMS per module: should flatten out with MUON_WEIGHT_DECAY
+            # (without decay it grew to 10-40x the init scale by 885k).
+            with torch.no_grad():
+                for l, layer in enumerate(self.model.layers):
+                    for name in ("compressor", "denoiser", "decompressor"):
+                        rms = [p.detach().float().pow(2).mean().sqrt()
+                               for p in getattr(layer, name).parameters() if p.ndim == 2 and min(p.shape) > 1]
+                        if rms:
+                            self.tb_writer.add_scalar(f"weights/level_{l}_{name}_rms", float(torch.stack(rms).mean()), log_step)
+
+
+
+        # Scale loss for gradient accumulation
+        scaled_loss = total_loss / Config.GRAD_ACCUMULATION_STEPS
+        self.manual_backward(scaled_loss)
+
+        # Push this batch's clean vectors into each layer's coverage queue AFTER backward,
+        # so the queue is never mutated inside the gradient-checkpointed forward (which is
+        # recomputed during backward and would otherwise see a changed count -> shape error).
+        for layer in self.model.layers:
+            layer.push_clean_to_queue()
+
+        # Determine if we should step the optimizer (every N accumulation steps)
+        should_step = (batch_idx + 1) % Config.GRAD_ACCUMULATION_STEPS == 0
+
+        if should_step:
+            factor = self._lr_factor()
+            for group in optimizer.param_groups:
+                group["lr"] = group.get("base_lr", Config.LEARNING_RATE) * factor
+            if Config.GRAD_CLIP_VAL > 0:
+                self.clip_gradients(optimizer, gradient_clip_val=Config.GRAD_CLIP_VAL, gradient_clip_algorithm="norm")
+            optimizer.step()
+            optimizer.zero_grad()
+            if self.use_ema and (int(self.global_step) % self.ema_update_every == 0):
+                self._ema_update()
+
+        if should_log and self.tb_writer is not None:
+            self.tb_writer.add_scalar("loss/total", float(total_loss.item()), log_step)
+            # Learning rate of each group (Muon group first, as before; Adam group separately).
+            for group in optimizer.param_groups:
+                tag = "training/learning_rate" if group.get("use_muon", True) else "training/learning_rate_adam"
+                self.tb_writer.add_scalar(tag, group["lr"], log_step)
+
+        del total_loss, leveled_compressed, leveled_losses
+
+        # Sample prints run after the optimizer step and the EMA update, so the forward's
+        # activations are already freed, and the codes are re-encoded with the same (EMA)
+        # weights that decode them; codes from the online forward decoded by EMA decoders
+        # never occur in training or in real generation.
+        self._print_samples(batch, _print_step)
+        return None
+
+    def _print_samples(self, batch, _print_step):
         if (_print_step % int(Config.PRINT_EVERY_N_STEPS) == 0) and (_print_step > 0):
             with torch.no_grad():
                 _tb_text_buf = None
@@ -340,6 +410,14 @@ class PlZonkey(pl.LightningModule):
                     _tb_redirect = contextlib.nullcontext()
 
                 with _tb_redirect, self._ema_swapped():
+                    for layer in self.model.layers:
+                        layer.diagnostics_this_step = False
+                    leveled_compressed, _ = self.model.forward(batch)
+                    # The real step already pushed its codes; these EMA codes must not be
+                    # pushed into the queues at the next step.
+                    for layer in self.model.layers:
+                        layer._pending_clean_for_queue = None
+                        layer._pending_ids_for_queue = None
                     sample_indices = torch.randperm(Config.TOKENIZER_VOCAB_SIZE_CHARS,device=Config.DEVICE)[:100]
                     sample_embeddings = self.model.token_embedding_layer(sample_indices)
                     normalized = F.normalize(sample_embeddings, p=2, dim=1)
@@ -418,10 +496,10 @@ class PlZonkey(pl.LightningModule):
                             lower_t=0.0)
                         print(f"random seq from level {level}: ")
                         self.model.generate_sequence_from_level_N(
-                            level, num_diffusion_steps=Config.EVAL_DIFFUSION_STEPS, noise_level=1.0,
+                            level, num_diffusion_steps=Config.DIFFUSION_STEPS, noise_level=1.0,
                             existance_cutoff=0.1, lower_t=0.0)
 
-                
+
                     # Clean up generation artifacts to free GPU memory
                     del sample_indices, sample_embeddings, normalized, cosine_sim_matrix, mask
                     del texts, token_embeddings, tokens_normalized, embeddings_normalized, logits, best_token_idx
@@ -430,68 +508,6 @@ class PlZonkey(pl.LightningModule):
                         _captured = _tb_text_buf.getvalue()
                         if _captured.strip():
                             self.tb_writer.add_text("samples/generated", _captured, _print_step)
-                
-        if (self.global_step % int(getattr(Config, "EMPTY_CACHE_EVERY_N_STEPS", 4)) == 0):
-            torch.cuda.empty_cache()  # Free fragmented memory
-
-        should_log = (self.global_step % 5 == 0)
-        total_loss, level_totals = aggregate_leveled_losses(leveled_losses)
-
-        for l, losses in enumerate(leveled_losses):
-            if (should_log or diag) and self.tb_writer is not None:
-                for name, value in losses.items():
-                    t = _as_loss_tensor(value)
-                    if t is None:
-                        continue
-                    self.tb_writer.add_scalar(f"level_{l}/{name}", float(t.item()), log_step)
-            if self.tb_writer is not None and level_totals[l] is not None:
-                self.tb_writer.add_scalar(f"loss/_{l}", float(level_totals[l].item()), log_step)
-        if diag and self.tb_writer is not None:
-            # Hidden-matrix RMS per module: should flatten out with MUON_WEIGHT_DECAY
-            # (without decay it grew to 10-40x the init scale by 885k).
-            with torch.no_grad():
-                for l, layer in enumerate(self.model.layers):
-                    for name in ("compressor", "denoiser", "decompressor"):
-                        rms = [p.detach().float().pow(2).mean().sqrt()
-                               for p in getattr(layer, name).parameters() if p.ndim == 2 and min(p.shape) > 1]
-                        if rms:
-                            self.tb_writer.add_scalar(f"weights/level_{l}_{name}_rms", float(torch.stack(rms).mean()), log_step)
-
-
-
-        # Scale loss for gradient accumulation
-        scaled_loss = total_loss / Config.GRAD_ACCUMULATION_STEPS
-        self.manual_backward(scaled_loss)
-
-        # Push this batch's clean vectors into each layer's coverage queue AFTER backward,
-        # so the queue is never mutated inside the gradient-checkpointed forward (which is
-        # recomputed during backward and would otherwise see a changed count -> shape error).
-        for layer in self.model.layers:
-            layer.push_clean_to_queue()
-
-        # Determine if we should step the optimizer (every N accumulation steps)
-        should_step = (batch_idx + 1) % Config.GRAD_ACCUMULATION_STEPS == 0
-        
-        if should_step:
-            factor = self._lr_factor()
-            for group in optimizer.param_groups:
-                group["lr"] = group.get("base_lr", Config.LEARNING_RATE) * factor
-            if Config.GRAD_CLIP_VAL > 0:
-                self.clip_gradients(optimizer, gradient_clip_val=Config.GRAD_CLIP_VAL, gradient_clip_algorithm="norm")
-            optimizer.step()
-            optimizer.zero_grad()
-            if self.use_ema and (int(self.global_step) % self.ema_update_every == 0):
-                self._ema_update()
-
-        if should_log and self.tb_writer is not None:
-            self.tb_writer.add_scalar("loss/total", float(total_loss.item()), log_step)
-            # Learning rate of each group (Muon group first, as before; Adam group separately).
-            for group in optimizer.param_groups:
-                tag = "training/learning_rate" if group.get("use_muon", True) else "training/learning_rate_adam"
-                self.tb_writer.add_scalar(tag, group["lr"], log_step)
-        
-        del total_loss
-        return None
 
     def configure_optimizers(self):
         if Config.USE_MUON:
@@ -685,23 +701,39 @@ class Zonkey(nn.Module):
         is_real_position = (texts != 0)
         leveled_compressed = []
         leveled_losses = []
-        
+
+        # Content ids (utils/content_id.py): batches from the dataloader carry the prefix
+        # hashes; synthetic batches (calibration, smoke tests) get them computed here.
+        prefix_hash_b = batch.get("prefix_hash")
+        if prefix_hash_b is None:
+            prefix_hash_b = prefix_hash_tensor(texts)
+        prefix_hash_b = prefix_hash_b.to(texts.device)
+        pow_tab = getattr(self, "_pow_table_cache", None)
+        if pow_tab is None or pow_tab.device != texts.device or pow_tab.shape[0] != Config.MAX_DOC_LENGTHS[0] + 1:
+            pow_tab = pow_table(Config.MAX_DOC_LENGTHS[0], device=texts.device)
+            self._pow_table_cache = pow_tab
+        for layer in self.layers:
+            layer._batch_prefix_hash = prefix_hash_b
+            layer._pow_table = pow_tab
+
         fake_negatives = None
+        child_spans, child_ids = None, None
         for i in range(len(self.layers)):
             if Config.USE_GRADIENT_CHECKPOINTING and getattr(Config, "GRADIENT_CHECKPOINT_SCOPE", "all") in ("all", "levels"):
                 if i == 0:
-                    denoised, is_real_inferred, compressed, losses, reconstructed_docs, is_real, fake_negatives = checkpoint(
-                        self.layers[i], token_embeddings, is_real_position, texts, False, None, use_reentrant=False)
+                    denoised, is_real_inferred, compressed, losses, reconstructed_docs, is_real, fake_negatives, child_spans, child_ids = checkpoint(
+                        self.layers[i], token_embeddings, is_real_position, texts, False, None, None, None, use_reentrant=False)
                 else:
-                    _, _, compressed, losses, _, is_real, fake_negatives = checkpoint(
-                        self.layers[i], compressed, is_real.bool(), None, False, fake_negatives, use_reentrant=False)
+                    _, _, compressed, losses, _, is_real, fake_negatives, child_spans, child_ids = checkpoint(
+                        self.layers[i], compressed, is_real.bool(), None, False, fake_negatives, child_spans, child_ids, use_reentrant=False)
             else:
                 if i == 0:
-                    denoised, is_real_inferred, compressed, losses, reconstructed_docs, is_real, fake_negatives = self.layers[i](
+                    denoised, is_real_inferred, compressed, losses, reconstructed_docs, is_real, fake_negatives, child_spans, child_ids = self.layers[i](
                         token_embeddings, is_real_position, token_ids=texts)
                 else:
-                    _, _, compressed, losses, _, is_real, fake_negatives = self.layers[i](
-                        compressed, is_real.bool(), fake_negatives=fake_negatives)
+                    _, _, compressed, losses, _, is_real, fake_negatives, child_spans, child_ids = self.layers[i](
+                        compressed, is_real.bool(), fake_negatives=fake_negatives,
+                        child_spans=child_spans, child_ids=child_ids)
 
             leveled_compressed.append(compressed)
             leveled_losses.append(losses)

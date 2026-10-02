@@ -366,7 +366,9 @@ class SegmentSplitter(nn.Module):
                 # as per user request: "as we have reached max_docs, we do not continue"
                 break
                 
-            planned_docs.append((b, bos_positions[:num_to_take]))
+            # Keep the FULL BOS list: the ownership shares must be normalized over every
+            # window of the document, including the ones the cap drops (see PASS 2).
+            planned_docs.append((b, bos_positions, num_to_take))
             num_sentences_per_doc[b] = num_to_take
             num_main_per_doc[b] = num_to_take
             total_num_sentences += num_to_take
@@ -379,8 +381,9 @@ class SegmentSplitter(nn.Module):
             all_sentence_is_real = torch.empty(total_num_sentences, max_sentence_length, device=device, dtype=is_real_position.dtype)
             all_p_exist_share = torch.empty(total_num_sentences, max_sentence_length, device=device, dtype=bos_probs.dtype)
             all_bos_starts = torch.empty(total_num_sentences, dtype=torch.long, device=device)
+            all_owned_end = torch.empty(total_num_sentences, dtype=torch.long, device=device)
             original_position = torch.empty(total_num_sentences, max_sentence_length, 2, dtype=torch.long, device=device)
-            
+
             if input_tokens is not None:
                 all_tokens_out = torch.empty(total_num_sentences, max_sentence_length, dtype=torch.long, device=device)
             else:
@@ -392,53 +395,70 @@ class SegmentSplitter(nn.Module):
             all_sentence_is_real = torch.empty(0, max_sentence_length, device=device)
             all_p_exist_share = torch.empty(0, max_sentence_length, device=device)
             all_bos_starts = torch.empty(0, dtype=torch.long, device=device)
+            all_owned_end = torch.empty(0, dtype=torch.long, device=device)
             all_tokens_out = torch.empty(0, max_sentence_length, dtype=torch.long, device=device) if input_tokens is not None else None
             original_position = torch.empty(0, max_sentence_length, 2, dtype=torch.long, device=device)
             bos_per_position = torch.tensor(0.0, device=device)
 
         # PASS 2: Fill tensors
         current_idx = 0
-        for b, bos_positions in planned_docs:
-            num_sent_b = len(bos_positions)
-            
+        for b, bos_all, num_sent_b in planned_docs:
+            bos_positions = bos_all[:num_sent_b]
+
             # Extract sentences using advanced indexing
             local_indices = torch.arange(max_sentence_length, device=device)
-            global_positions = bos_positions.unsqueeze(1) + local_indices  # [num_sent, max_len]
-            valid = global_positions < full_seq_len
-            pos_clamped = global_positions.clamp(0, full_seq_len - 1)
-            
+            global_all = bos_all.unsqueeze(1) + local_indices  # [num_all, max_len], every window of the doc
+            valid_all = global_all < full_seq_len
+            pos_all = global_all.clamp(0, full_seq_len - 1)
+            global_positions = global_all[:num_sent_b]  # kept windows
+            valid = valid_all[:num_sent_b]
+            pos_clamped = pos_all[:num_sent_b]
+
             # Slice for direct assignment
             idx_slice = slice(current_idx, current_idx + num_sent_b)
-            
+
             # Fill pre-allocated tensors directly
             all_sentence_vectors[idx_slice] = input_sequence[b][pos_clamped, :]
-            
+
             # Use temporary variables to avoid in-place modification of tensors used in gradients
-            temp_bos_probs = bos_probs[b][pos_clamped]
+            temp_bos_all = bos_probs[b][pos_all]
+            temp_bos_probs = temp_bos_all[:num_sent_b]
             temp_is_real = is_real_position[b][pos_clamped]
-            
+
             if input_tokens is not None:
                 sentence_tokens = input_tokens[b][pos_clamped]
                 sentence_tokens = sentence_tokens.masked_fill(~valid, 0)
                 all_tokens_out[idx_slice] = sentence_tokens
-            
-            # Calculate p_exist in log space using temp variables
+
+            # Calculate p_exist in log space using temp variables, for EVERY window of the
+            # document. Ownership shares are normalized over all windows: when the per-doc cap
+            # drops the tail windows, the last kept window would otherwise get share ~1 on ~20
+            # positions that belong to the next (dropped) window, i.e. full-weight training on
+            # text its code barely sees.
             # Force float32 for log1p+cumsum+exp to avoid float16 underflow
-            log_one_minus_probs = torch.log1p(-temp_bos_probs.float().clamp(max=0.9999, min=0.0001))
+            log_one_minus_probs = torch.log1p(-temp_bos_all.float().clamp(max=0.9999, min=0.0001))
             log_one_minus_probs[:, 0] = 0
             log_p_exist = torch.cumsum(log_one_minus_probs, dim=1)
-            p_exist = torch.exp(log_p_exist)
-            p_exist = p_exist.masked_fill(~valid, 0)
-            
+            p_exist_all = torch.exp(log_p_exist)
+            p_exist_all = p_exist_all.masked_fill(~valid_all, 0)
+            p_exist = p_exist_all[:num_sent_b]
+
             # Vectorized p_exist_share
-            p_exist_sum = torch.zeros(full_seq_len, device=device, dtype=p_exist.dtype)
-            flat_pos = global_positions.view(-1)
-            flat_p = p_exist.view(-1)
-            flat_valid = valid.view(-1)
-            
+            p_exist_sum = torch.zeros(full_seq_len, device=device, dtype=p_exist_all.dtype)
+            flat_pos = global_all.view(-1)
+            flat_p = p_exist_all.view(-1)
+            flat_valid = valid_all.view(-1)
+
             # This uses atomic adds, safe for overlapping positions
             p_exist_sum.index_add_(0, flat_pos[flat_valid], flat_p[flat_valid])
-            
+
+            # Owned span of each kept window: up to the next sampled window start in the
+            # document's FULL BOS list, at most one window long, never past the real text.
+            real_len_b = int(is_real_position[b].sum())
+            next_start = torch.cat([bos_all[1:], torch.tensor([real_len_b], device=device, dtype=bos_all.dtype)])[:num_sent_b]
+            owned_end = torch.minimum(next_start, bos_positions + max_sentence_length).clamp(max=real_len_b)
+            all_owned_end[idx_slice] = torch.maximum(owned_end, bos_positions + 1)
+
             p_exist_totals = p_exist_sum[pos_clamped]
             p_exist_share = p_exist / (p_exist_totals + 1e-10)
             p_exist_share = p_exist_share.masked_fill(~valid, 0)
@@ -487,5 +507,7 @@ class SegmentSplitter(nn.Module):
             original_position,
             patch_loss,
             short_sentence_loss,
+            all_bos_starts,
+            all_owned_end,
         )
 

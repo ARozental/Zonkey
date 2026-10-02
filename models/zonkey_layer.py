@@ -1,3 +1,4 @@
+import contextlib
 import torch
 import torch.nn as nn
 from configs.default_config import Config
@@ -9,10 +10,25 @@ from losses.reconstruction import calculate_reconstruction_loss,calculate_token_
 from utils.helper_functions import calculate_mean_similarity,expected_l2_norm,calculate_spherical_uniformity_loss,compute_improved_coverage_loss,arc_cosine_similarity_seq
 from splitter.segment_splitter import SegmentSplitter
 from splitter.stitcher import Stitcher
+from utils.content_id import span_content_id
 from torch.distributions import Beta
 
 
 bce = F.binary_cross_entropy
+
+
+@contextlib.contextmanager
+def _frozen_parameters(module: nn.Module):
+    """Temporarily stop gradients into `module`'s parameters (not into its inputs)."""
+    params = [p for p in module.parameters() if p.requires_grad]
+    for p in params:
+        p.requires_grad_(False)
+    try:
+        yield
+    finally:
+        for p in params:
+            p.requires_grad_(True)
+
 
 class ResidualConv1d(nn.Module):
     def __init__(self, d_model, kernel_size=3):
@@ -173,9 +189,20 @@ class ZonkeyLayer(nn.Module):
         queue_size = Config.DRIFTING_QUEUE_SIZE[level]
         flat_dim = Config.COMPRESSION_VECTORS[level] * d_model
         self.register_buffer('_drifting_queue', torch.zeros(queue_size, flat_dim), persistent=False)
+        # Content id of each queued code (-1 = empty), written at the same ring indices.
+        self.register_buffer('_drifting_queue_ids', torch.full((queue_size,), -1, dtype=torch.long), persistent=False)
         self._drifting_queue_ptr = 0
         self._drifting_queue_count = 0
         self._pending_clean_for_queue = None
+        self._pending_ids_for_queue = None
+        # Set by Zonkey.forward before the level loop: the batch's prefix hashes and the
+        # power table used to compute window content ids (utils/content_id.py).
+        self._batch_prefix_hash = None
+        self._pow_table = None
+        # This level's input codes (normalized) and their ids from the last forward; the
+        # level above uses them as its vocabulary of real codes (interface loss, C4c).
+        self._last_doc_codes = None
+        self._last_doc_ids = None
 
         checkpoint_scope = getattr(Config, "GRADIENT_CHECKPOINT_SCOPE", "all")
         if Config.USE_GRADIENT_CHECKPOINTING and checkpoint_scope in ("all", "passes"):
@@ -204,9 +231,15 @@ class ZonkeyLayer(nn.Module):
         n = min(flat.shape[0], q.shape[0])
         idx = (torch.arange(n, device=q.device) + self._drifting_queue_ptr) % q.shape[0]
         q[idx] = flat[:n]
+        pend_ids = getattr(self, "_pending_ids_for_queue", None)
+        if pend_ids is not None and pend_ids.shape[0] == pend.shape[0]:
+            self._drifting_queue_ids[idx] = pend_ids[:n].to(self._drifting_queue_ids.dtype)
+        else:
+            self._drifting_queue_ids[idx] = -1
         self._drifting_queue_ptr = int((self._drifting_queue_ptr + n) % q.shape[0])
         self._drifting_queue_count = int(min(self._drifting_queue_count + n, q.shape[0]))
         self._pending_clean_for_queue = None
+        self._pending_ids_for_queue = None
 
     def noise_schedule(self, t: torch.Tensor) -> torch.Tensor:
         return t
@@ -309,6 +342,30 @@ class ZonkeyLayer(nn.Module):
         nl = torch.clamp(noise_level, min=0.0, max=1.0) if torch.is_tensor(noise_level) else noise_level
         x_t = self._slerp(x_unit, noise_unit, nl) * self.upwards_norm
         return x_t.view_as(x), (noise_unit * self.upwards_norm).view_as(x)
+
+    def u_to_t(self, u: torch.Tensor) -> torch.Tensor:
+        """Schedule position u in [0, 1] -> this level's flow time t.
+
+        The schedule is fixed in effective SNR rho = sqrt(D) * cot(t * pi / 2) (D = this
+        level's code dimension): u maps to rho = NOISE_SNR_MID * cot(u * pi / 2), the same rho
+        at every level and width. The slerp path stays identifiable until roughly
+        (1 - t) ~ 1/sqrt(D), so without this a wider level spends more of the schedule on
+        noise where the answer is already decided. Identity at D = NOISE_SNR_MID**2.
+        Float64 inside: in float32 pi/2 rounds up and its cosine comes out negative."""
+        D = float(self.upwards_d_model)
+        x = u.double().clamp(0, 1) * (math.pi / 2)
+        cot_u = (torch.cos(x) / torch.sin(x).clamp_min(1e-300)).clamp_min(0.0)
+        rho = Config.NOISE_SNR_MID * cot_u
+        t = (2 / math.pi) * torch.atan2(torch.ones_like(rho), rho / math.sqrt(D))
+        return t.clamp(0, 1).to(u.dtype)
+
+    def t_to_u(self, t: torch.Tensor) -> torch.Tensor:
+        """Inverse of u_to_t."""
+        D = float(self.upwards_d_model)
+        x = t.double().clamp(0, 1) * (math.pi / 2)
+        cot_t = (torch.cos(x) / torch.sin(x).clamp_min(1e-300)).clamp_min(0.0)
+        u = (2 / math.pi) * torch.atan2(torch.ones_like(cot_t), math.sqrt(D) * cot_t / Config.NOISE_SNR_MID)
+        return u.clamp(0, 1).to(t.dtype)
 
     def add_noise(self, x: torch.Tensor, noise_level: torch.Tensor) -> torch.Tensor:
         """Interpolate x toward a fresh random noise sample by ``noise_level`` along
@@ -743,6 +800,8 @@ class ZonkeyLayer(nn.Module):
         compute_flow_loss: bool = False,
         detach_targets: bool = False,
         gate_codes: Optional[torch.Tensor] = None,
+        gate_ids: Optional[torch.Tensor] = None,
+        extra_negatives: Optional[dict] = None,
         ) -> Tuple[torch.Tensor, Optional[dict], torch.Tensor]:
         # Flow-matching corruption: interpolate the clean compressed vector toward
         # noise along the geodesic by fraction `noise_level` (0 = clean, 1 = noise).
@@ -750,7 +809,10 @@ class ZonkeyLayer(nn.Module):
         # (on-path FM sample, or a parent code decoded with treat_as_noisy=True).
         # detach_targets: generative pass, the reconstruction targets (child codes, or the
         # char table at level 0) are data and receive no gradient.
-        # gate_codes: the batch's clean codes; enables the identifiability gate.
+        # gate_codes / gate_ids: the batch's clean codes and their content ids; enable the
+        # identifiability gate.
+        # extra_negatives: clean pass at levels >= 1 only; context guesses and mined neighbours
+        # appended to the reconstruction's negatives (see _extra_negative_sims).
         noisy_compressed = compressed if skip_add_noise else self.add_noise(compressed, noise_level)
         denoised, is_real_inferred = self.compressed_to_denoised(noisy_compressed, noise_level, self_cond=self_cond)
 
@@ -774,10 +836,10 @@ class ZonkeyLayer(nn.Module):
                 t = noise_level.clamp(0.0, 1.0).reshape(-1)
                 sample_weight = (1.0 - t).clamp(min=0.0) ** gate_p
         identifiable = None
-        if (not clean) and gate_codes is not None and getattr(Config, "IDENTIFIABILITY_GATE", False):
+        if (not clean) and gate_codes is not None and gate_ids is not None and getattr(Config, "IDENTIFIABILITY_GATE", False):
             with torch.no_grad():
                 estimate = x1_hat.detach() if x1_hat is not None else self.compress(denoised.detach(), is_real_inferred.detach())
-                identifiable = self._identifiability(estimate, gate_codes, input_sequence, is_real_label)
+                identifiable = self._identifiability(estimate, gate_codes, gate_ids)
             sample_weight = identifiable if sample_weight is None else sample_weight * identifiable
 
         target_sequence = input_sequence.detach() if detach_targets else input_sequence
@@ -787,6 +849,9 @@ class ZonkeyLayer(nn.Module):
                 noise_level=noise_level, regression_power=Config.REGRESSION_T_POWER,
                 sample_weight=sample_weight, detach_table=detach_targets)
         else:
+            extra_neg_sim = None
+            if extra_negatives is not None:
+                extra_neg_sim = self._extra_negative_sims(denoised, splitter_existence_share, extra_negatives)
             reconstruction_loss, _ = calculate_reconstruction_loss(
                 denoised=denoised,
                 is_real_inferred=is_real_inferred,
@@ -794,7 +859,8 @@ class ZonkeyLayer(nn.Module):
                 splitter_existence_share=splitter_existence_share,
                 fake_negatives=fake_negatives,
                 noise_level=noise_level, regression_power=Config.REGRESSION_T_POWER,
-                sample_weight=sample_weight)
+                sample_weight=sample_weight,
+                extra_neg_sim=extra_neg_sim)
 
         dbos_ce_loss = bce(is_real_inferred, is_real_label, reduction='none')[:, 1:].mean() - bce(is_real_label, is_real_label, reduction='none')[:, 1:].mean()
 
@@ -853,23 +919,80 @@ class ZonkeyLayer(nn.Module):
         return denoised, losses, is_real_inferred
 
     @torch.no_grad()
-    def _identifiability(self, estimate: torch.Tensor, codes: torch.Tensor,
-                         input_sequence: torch.Tensor, is_real_label: torch.Tensor) -> torch.Tensor:
+    def _identifiability(self, estimate: torch.Tensor, codes: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
         """Per-sample probability (no grad) that `estimate` picks its own source among the
         batch's clean `codes`, with the reconstruction losses' logit 2*atanh(cos). Windows
-        whose owned content (positions with existence label > 0.5) is identical count as
-        the same source, so repeated words ("the") are not penalized for being ambiguous
-        with each other."""
+        with the same content id (identical owned text, utils/content_id.py) count as the
+        same source, so repeated words or phrases are not penalized for being ambiguous with
+        each other. This is data-defined and works the same at every level."""
         n = estimate.shape[0]
         e = F.normalize(estimate.reshape(n, -1).float(), p=2, dim=-1)
         c = F.normalize(codes.reshape(n, -1).float(), p=2, dim=-1)
         logits = 2 * torch.atanh((e @ c.t()).clamp(-1 + 1e-6, 1 - 1e-6))
         probs = torch.softmax(logits, dim=-1)
-        owned = (is_real_label > 0.5).to(input_sequence.dtype).unsqueeze(-1)
-        content = (input_sequence.detach() * owned).reshape(n, -1)
-        _, group = torch.unique(content, dim=0, return_inverse=True)
-        same_source = (group.unsqueeze(0) == group.unsqueeze(1)).to(probs.dtype)
-        return (probs * same_source).sum(-1).clamp(0.0, 1.0)
+        same_source = (ids[:, None] == ids[None, :]) & (ids[:, None] >= 0)
+        same_source = same_source | torch.eye(n, dtype=torch.bool, device=ids.device)
+        return (probs * same_source.to(probs.dtype)).sum(-1).clamp(0.0, 1.0)
+
+    def _extra_negative_sims(self, denoised: torch.Tensor, share: torch.Tensor, extra: dict) -> torch.Tensor:
+        """Cosines [B, L, K] of the prediction to extra negatives, -1 where unavailable (C5).
+
+        guess / has_guess: the MLM path's context guess for the slot (no grad, raw, never
+        snapped). bank / bank_ids / target_ids: mined negatives, the MINED_NEGATIVES_K real child
+        codes nearest to the prediction whose content id differs from the slot's target. The
+        bank is detached, so mining only sharpens this level's prediction."""
+        B, L, D = denoised.shape
+        d_n = F.normalize(denoised.reshape(B * L, D), p=2, dim=-1)
+        cols = []
+        guess = extra.get("guess")
+        if guess is not None:
+            g_n = F.normalize(guess.reshape(B * L, D).detach(), p=2, dim=-1)
+            gcos = (d_n * g_n).sum(-1)
+            has = extra["has_guess"].reshape(-1)
+            cols.append(torch.where(has, gcos, torch.full_like(gcos, -1.0)).unsqueeze(1))
+        bank = extra.get("bank")
+        k = int(getattr(Config, "MINED_NEGATIVES_K", 0))
+        if bank is not None and bank.shape[0] > 0 and k > 0:
+            k = min(k, bank.shape[0])
+            sims = d_n @ bank.t()                                  # gradient to the prediction only
+            with torch.no_grad():
+                tgt = extra["target_ids"].reshape(-1)
+                same = extra["bank_ids"][None, :] == tgt[:, None]
+                masked = sims.detach().masked_fill(same, -2.0)
+                top_val, top = masked.topk(k, dim=-1)
+                ok = (top_val > -1.5) & ((tgt >= 0) & (share.reshape(-1) > 0)).unsqueeze(1)
+            mined = sims.gather(1, top)
+            cols.append(torch.where(ok, mined, torch.full_like(mined, -1.0)))
+        if not cols:
+            return None
+        return torch.cat(cols, dim=-1).reshape(B, L, -1)
+
+    @torch.no_grad()
+    def _mlm_alternatives(self, input_sequence: torch.Tensor, is_real_inferred: torch.Tensor,
+                          share: torch.Tensor):
+        """Context guesses for the reconstruction's extra negatives (C5a), no grad.
+
+        MLM_ALT_PASSES complementary masks over the slots with share > 0, each masking a
+        MLM_ALT_FRACTION of them with the MASK vector only, run through exactly the denoiser
+        path of calculate_mlm_loss. Returns guess [B, L, D] and has_guess [B, L]."""
+        B, L, D = input_sequence.shape
+        frac = float(getattr(Config, "MLM_ALT_FRACTION", 0.25))
+        passes = int(getattr(Config, "MLM_ALT_PASSES", 2))
+        cv = Config.COMPRESSION_VECTORS[self.level]
+        r = torch.rand(B, L, device=input_sequence.device)
+        guess = torch.zeros_like(input_sequence)
+        has = torch.zeros(B, L, dtype=torch.bool, device=input_sequence.device)
+        mask_vec = self.mask_vector.view(1, 1, D).to(input_sequence.dtype)
+        existence = torch.cat([self.compressor_cls_existence_probs.expand(B, -1), is_real_inferred], dim=1)
+        for k in range(passes):
+            m = (share > 0) & (r >= k * frac) & (r < (k + 1) * frac)
+            x = torch.where(m.unsqueeze(-1), mask_vec.expand(B, L, D), input_sequence)
+            x = torch.cat([self.compressor_cls_emd.expand(B, -1, -1).to(x.dtype), x], dim=1)
+            out = self.denoiser(x, existence)[:, cv:]
+            out = F.normalize(out, p=2, dim=-1) * self.dim_norm
+            guess = torch.where(m.unsqueeze(-1), out, guess)
+            has = has | m
+        return guess, has
 
     def _sample_clean_noise_t(self, n: int, device, dtype) -> torch.Tensor:
         """t_aug for the clean pass: log-uniform in CLEAN_NOISE_T_RANGE, and exactly 0 for a
@@ -944,16 +1067,21 @@ class ZonkeyLayer(nn.Module):
         predicted_lower_codes: torch.Tensor,
         target_lower_codes: torch.Tensor,
         position_weights: torch.Tensor,
+        bank: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         """Make this level's predicted child codes decode like the real child codes.
 
         One hop only: level n's predicted child codes are decoded by level n-1 exactly as
         generation decodes them (t=0), and the decode is scored with level n-1's OWN
-        reconstruction loss against the decode of the paired true child code (the teacher,
-        no grad): character CE when level n-1 is 0, level n-1's contrastive reconstruction
-        otherwise. The gradient reaches both levels: level n learns to land where level
-        n-1 can read, level n-1 learns to read level n's typical errors. Positions are
-        sampled by this level's inferred existence, i.e. the children generation keeps.
+        reconstruction scoring against the decode of the paired true child code (the
+        teacher, no grad): character CE over the char table when level n-1 is 0, CE over a
+        vocabulary of real level n-2 codes otherwise. The child decoder is frozen for the
+        student decode, so the gradient reaches only level n: choosing content is the
+        parent's job, and the child's tolerance to near-misses comes from its own clean-pass
+        noise. Each sample is weighted by p, the parent's probability of the true child
+        under the child-code bank (same logit as the reconstruction), so the interface only
+        refines correct picks. Positions are sampled by this level's inferred existence,
+        i.e. the children generation keeps.
         """
         metrics = {}
         if self.level == 0:
@@ -971,15 +1099,29 @@ class ZonkeyLayer(nn.Module):
         sample_indices = torch.multinomial(sample_probs, num_samples, replacement=False)
 
         lower = self.previous_layer
-        predicted = predicted_lower_codes.reshape(-1, self.d_model)[sample_indices]
+        predicted_flat = predicted_lower_codes.reshape(-1, self.d_model)[sample_indices]
         target = target_lower_codes.detach().reshape(-1, self.d_model)[sample_indices]
-        predicted = self._reshape_as_lower_compressed(predicted)
+        predicted = self._reshape_as_lower_compressed(predicted_flat)
         target = self._reshape_as_lower_compressed(target)
         t0 = torch.zeros(num_samples, device=predicted.device, dtype=predicted.dtype)
 
+        # p: the parent's probability of the true child (C4b), entries of the same content id
+        # merged; 0 for slots without a valid target id. No gradient.
+        with torch.no_grad():
+            if bank is not None and bank["codes"].shape[0] > 0:
+                tgt_ids = bank["target_ids"].reshape(-1)[sample_indices]
+                pred_n = F.normalize(predicted_flat.detach().float(), p=2, dim=-1)
+                logits = 2 * torch.atanh((pred_n @ bank["codes"].t()).clamp(-1 + 1e-6, 1 - 1e-6))
+                probs = torch.softmax(logits, dim=-1)
+                same = (bank["ids"][None, :] == tgt_ids[:, None]) & (tgt_ids[:, None] >= 0)
+                p = (probs * same.to(probs.dtype)).sum(-1).clamp(0.0, 1.0)
+            else:
+                p = torch.ones(num_samples, device=predicted.device)
+
         with torch.no_grad():
             teacher_sequence, teacher_real = lower.compressed_to_denoised(target, t0, self_cond=None)
-        student_sequence, student_real = lower.compressed_to_denoised(predicted, t0, self_cond=None)
+        with _frozen_parameters(lower):
+            student_sequence, student_real = lower.compressed_to_denoised(predicted, t0, self_cond=None)
 
         # Content weight: the teacher's existence on the positions generation keeps.
         keep = (teacher_real > 0.1).to(teacher_real.dtype)
@@ -989,7 +1131,8 @@ class ZonkeyLayer(nn.Module):
             teacher_cos = F.normalize(teacher_sequence, p=2, dim=-1) @ table.t()
             teacher_ids = teacher_cos.argmax(-1)
             sequence_loss, _ = calculate_token_loss(
-                teacher_ids, student_sequence, content_weight, lower.previous_layer, detach_table=True)
+                teacher_ids, student_sequence, content_weight, lower.previous_layer, detach_table=True,
+                sample_weight=p)
             with torch.no_grad():
                 # Measured only where the teacher decode is confident (char prob >= 0.5 under
                 # the loss's 2*atanh(cos) logits): while level 0 still decodes every code to
@@ -1005,11 +1148,7 @@ class ZonkeyLayer(nn.Module):
                         word_ok = ((student_ids == teacher_ids) | ~kept).all(-1)
                         metrics["metric_child_word_acc"] = word_ok[words].float().mean().detach()
         else:
-            sequence_loss, _ = calculate_reconstruction_loss(
-                denoised=student_sequence,
-                is_real_inferred=teacher_real,
-                target_sequences=teacher_sequence,
-                splitter_existence_share=content_weight)
+            sequence_loss = self._interface_vocab_ce(lower, student_sequence, teacher_sequence, content_weight, p)
             with torch.no_grad():
                 cos = F.cosine_similarity(student_sequence.detach(), teacher_sequence, dim=-1)
                 metrics["metric_child_cos"] = ((cos * content_weight).sum() / content_weight.sum().clamp_min(Config.EPS)).detach()
@@ -1020,8 +1159,40 @@ class ZonkeyLayer(nn.Module):
             bce(student_prob, teacher_prob, reduction="none")
             - bce(teacher_prob, teacher_prob, reduction="none")
         )
-        existence_loss = existence_kl[:, 1:].mean()
+        existence_loss = (existence_kl[:, 1:].mean(-1) * p).mean()
         return sequence_loss, existence_loss, metrics
+
+    @staticmethod
+    def _interface_vocab_ce(lower, student_sequence: torch.Tensor, teacher_sequence: torch.Tensor,
+                            content_weight: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+        """Interface scoring when the child level is >= 1 (C4c): CE of the student decode over a
+        vocabulary of real grandchild codes, with entries of the same content id merged into
+        one class; the class is the one the teacher decode lands on. Mirrors the level-0
+        branch (argmax character, then CE over the whole char table)."""
+        V = lower._last_doc_codes
+        V_ids = lower._last_doc_ids
+        grand = lower.previous_layer
+        if V is None or V_ids is None:
+            return student_sequence.sum() * 0.0
+        cnt = int(getattr(grand, "_drifting_queue_count", 0)) if grand is not None else 0
+        if cnt > 0:
+            V = torch.cat([V, grand._drifting_queue[:cnt].to(V.dtype)], dim=0)
+            V_ids = torch.cat([V_ids, grand._drifting_queue_ids[:cnt]], dim=0)
+        if V.shape[0] == 0:
+            return student_sequence.sum() * 0.0
+        n, L, D = student_sequence.shape
+        V = F.normalize(V.detach().float(), p=2, dim=-1)
+        with torch.no_grad():
+            t_n = F.normalize(teacher_sequence.reshape(n * L, D).float(), p=2, dim=-1)
+            teacher_class = V_ids[(t_n @ V.t()).argmax(-1)]
+            same = V_ids[None, :] == teacher_class[:, None]
+            valid = teacher_class >= 0
+        s_n = F.normalize(student_sequence.reshape(n * L, D).float(), p=2, dim=-1)
+        logits = 2 * torch.atanh((s_n @ V.t()).clamp(-1 + 1e-6, 1 - 1e-6))
+        ce = torch.logsumexp(logits, dim=-1) - torch.logsumexp(logits.masked_fill(~same, float("-inf")), dim=-1)
+        ce = torch.where(valid, ce, torch.zeros_like(ce)).reshape(n, L)
+        w = content_weight * valid.reshape(n, L).to(content_weight.dtype)
+        return (ce * w * p[:, None]).sum() / content_weight.sum().clamp_min(Config.EPS)
 
     
     def calculate_mlm_loss(
@@ -1199,7 +1370,11 @@ class ZonkeyLayer(nn.Module):
                          doc_sequences: Optional[torch.Tensor] = None,
                          mlm_only: Optional[bool] = False,
                          fake_negatives: Optional[torch.Tensor] = None,
+                         window_ids: Optional[torch.Tensor] = None,
+                         child_ids: Optional[torch.Tensor] = None,
                          ) -> torch.Tensor:
+        # window_ids [windows]: content id of each window (this level's codes).
+        # child_ids [docs, T]: content id of each input position (None at level 0).
         input_sequence = F.normalize(input_sequence, p=2, dim=-1) * self.dim_norm
 
         
@@ -1252,6 +1427,34 @@ class ZonkeyLayer(nn.Module):
         doc_ids = original_position[:,0,0]
         batch = clean_compressed.shape[0]
 
+        # Child-code bank (levels >= 1, no grad), built once and shared by the mined negatives
+        # (C5b) and the interface weighting (C4b): this batch's child codes at real positions
+        # plus the child level's queue, their content ids, and the content id of every slot's
+        # true child (-1 where there is none).
+        bank = None
+        extra_negatives = None
+        if self.level > 0 and child_ids is not None:
+            with torch.no_grad():
+                real_doc = is_real_doc_position_boolean.bool()
+                bank_codes = F.normalize(doc_sequences[real_doc].detach().float(), p=2, dim=-1)
+                bank_ids = child_ids[real_doc]
+                lower = self.previous_layer
+                cnt = int(lower._drifting_queue_count)
+                if cnt > 0:
+                    bank_codes = torch.cat([bank_codes, lower._drifting_queue[:cnt].float()], dim=0)
+                    bank_ids = torch.cat([bank_ids, lower._drifting_queue_ids[:cnt]], dim=0)
+                T_doc = child_ids.shape[1]
+                pos = original_position[..., 1]
+                in_range = (pos >= 0) & (pos < T_doc)
+                target_ids = child_ids[original_position[..., 0], pos.clamp(0, T_doc - 1)]
+                target_ids = torch.where(in_range, target_ids, torch.full_like(target_ids, -1))
+            bank = {"codes": bank_codes, "ids": bank_ids, "target_ids": target_ids}
+            # Context guesses (C5a): computed outside the checkpointed pass, from the
+            # splitter-derived existence, never fed to the identifiability gate.
+            guess, has_guess = self._mlm_alternatives(input_sequence, is_real_inferred, splitter_existence_share)
+            extra_negatives = {"guess": guess, "has_guess": has_guess, "bank": bank_codes,
+                               "bank_ids": bank_ids, "target_ids": target_ids}
+
         # === Pass 1: structural anchor at t=0 (clean) ===
         # Trains the decode-at-t=0 regime (the ODE's final step, and how a parent's
         # predicted children are decoded) plus the near-data-only structural losses
@@ -1272,6 +1475,7 @@ class ZonkeyLayer(nn.Module):
             clean=True,
             fake_negatives=fake_negatives,
             skip_add_noise=True,
+            extra_negatives=extra_negatives,
         )
 
         # Generative passes (FM, dirty) treat codes as data (Config.DETACH_GENERATIVE_TARGETS):
@@ -1283,10 +1487,11 @@ class ZonkeyLayer(nn.Module):
         gate_codes = clean_compressed.detach()
 
         # === Pass 2: flow-matching denoiser across the whole path ===
-        # t = U(0,1)^T_FM_EXPONENT: slerp keeps cos(x_t, x1) = cos(t*pi/2), so uniform t
-        # spends half of training above 0.71 cosine — too easy. Exponent < 1 shifts the
-        # mass toward the high-noise regime generation actually starts from.
-        t_fm = torch.rand(batch, device=clean_compressed.device, dtype=clean_compressed.dtype) ** Config.T_FM_EXPONENT
+        # The schedule position u = U(0,1)^T_FM_EXPONENT (exponent < 1 shifts mass toward the
+        # high-noise regime generation starts from) is mapped to this level's t through the
+        # effective-SNR schedule (u_to_t), the same map the sampler uses.
+        u_fm = torch.rand(batch, device=clean_compressed.device, dtype=clean_compressed.dtype) ** Config.T_FM_EXPONENT
+        t_fm = self.u_to_t(u_fm)
         x_t_fm = self.add_noise(fm_source, t_fm)
 
         # Train self-conditioning on the exact state distribution used by sampling:
@@ -1307,16 +1512,14 @@ class ZonkeyLayer(nn.Module):
                     self._sphere_log_map(x_t_unit, estimate_unit)
                     / t_fm.reshape(batch, 1).clamp_min(1e-3)
                 )
-                train_steps = max(1, int(Config.SELF_CONDITION_TRAIN_STEPS))
-                delta_t = torch.minimum(
-                    t_fm, torch.full_like(t_fm, 1.0 / train_steps)
-                )
+                # One sampler step: 1/DIFFUSION_STEPS in u, exactly as generate() steps.
+                fm_train_t = self.u_to_t((u_fm - 1.0 / Config.DIFFUSION_STEPS).clamp_min(0.0))
+                delta_t = t_fm - fm_train_t
                 fm_train_x = (
                     self._sphere_exp_map(
                         x_t_unit, preliminary_velocity * delta_t.reshape(batch, 1)
                     ) * self.upwards_norm
                 ).reshape_as(x_t_fm)
-                fm_train_t = (t_fm - delta_t).clamp_min(0.0)
         denoised_fm, fm_losses, is_real_inferred_fm = self.denoise_and_reconstruct(
             fm_train_x, input_sequence, all_sentence_bos_probs, fm_train_t, splitter_existence_share,
             token_ids=token_ids,
@@ -1330,24 +1533,27 @@ class ZonkeyLayer(nn.Module):
             compute_flow_loss=True,
             detach_targets=detach,
             gate_codes=gate_codes,
+            gate_ids=window_ids,
         )
 
         # === Pass 3: DDMM "dirty" denoiser on a self-generated intermediate ===
         # Build a realistic off-path state the sampler actually visits (denoise a noised
-        # vector, then re-compress — same as the generation loop), then train the denoiser
+        # vector, then re-compress, same as the generation loop), then train the denoiser
         # to refine it, with the intermediate also fed back as self-conditioning (this is
-        # exactly the sampler's situation: previous estimate available, noisy input).
-        # t_mid ~ Beta(1,3) (mean 0.25) keeps the intermediate informative about the
-        # original; the reconstruction is additionally weighted by (1 - t_mid) so the
-        # rare uninformative intermediates don't train the decoder to hallucinate.
-        # Dirty refinement is deliberately local. Full-range self-conditioning gave
-        # the network a near-clean recompression even when x_t was almost independent
-        # noise, a shortcut unavailable in the early sampler steps.
+        # the sampler's situation: previous estimate available, noisy input).
+        # t_dirty follows the FM pass's noise distribution, and the intermediate estimate is
+        # always made at an equal or higher noise level, t_mid = u_to_t(u + (1 - u) * b) with
+        # b ~ Beta(1, 3): the self-condition is never sharper than the sampler's previous,
+        # noisier step. Small b teaches small refinements, large b big jumps to the answer;
+        # the identifiability gate drops hopeless high-noise targets, and (1 - t_mid) keeps
+        # down-weighting uninformative intermediates.
         with torch.no_grad():
-            t_mid = self.beta_dist.sample((batch,)).to(clean_compressed.dtype)
+            u_dirty = torch.rand(batch, device=clean_compressed.device, dtype=clean_compressed.dtype) ** Config.T_FM_EXPONENT
+            b_mid = self.beta_dist.sample((batch,)).to(clean_compressed.dtype)
+            t_dirty = self.u_to_t(u_dirty)
+            t_mid = self.u_to_t(u_dirty + (1.0 - u_dirty) * b_mid)
             denoised_mid, _, is_real_mid = self.denoise_and_reconstruct(clean_compressed, noise_level=t_mid)
             recompressed = self.compress(denoised_mid, is_real_mid)
-        t_dirty = Config.DIRTY_T_MAX * torch.rand(batch, device=clean_compressed.device, dtype=clean_compressed.dtype)
         dirty_self_cond = recompressed if Config.USE_SELF_COND else None
         dirty_share = splitter_existence_share * (1.0 - t_mid).unsqueeze(1)
         denoised_dirty, dirty_losses, is_real_inferred_dirty = self.denoise_and_reconstruct(
@@ -1360,6 +1566,7 @@ class ZonkeyLayer(nn.Module):
             self_cond=dirty_self_cond,
             detach_targets=detach,
             gate_codes=gate_codes,
+            gate_ids=window_ids,
         )
 
         interface_sequence_loss = clean_compressed.new_zeros(())
@@ -1371,7 +1578,7 @@ class ZonkeyLayer(nn.Module):
             real_rows = (input_sequence.detach().abs().sum(-1) > 0).to(is_real_inferred.dtype)
             interface_sequence_loss, interface_existence_loss, interface_metrics = (
                 self.calculate_interface_consistency_loss(
-                    denoised_clean, input_sequence, is_real_inferred.detach() * real_rows
+                    denoised_clean, input_sequence, is_real_inferred.detach() * real_rows, bank=bank
                 )
             )
 
@@ -1400,6 +1607,7 @@ class ZonkeyLayer(nn.Module):
             memory_queue=self._drifting_queue[:self._drifting_queue_count]
         )
         self._pending_clean_for_queue = clean_compressed.detach()
+        self._pending_ids_for_queue = window_ids.detach() if window_ids is not None else None
 
         # Create fake negatives for the level above: shuffle input vectors across
         # sequences at each position, then compress to get chimeric compressed vectors.
@@ -1468,9 +1676,14 @@ class ZonkeyLayer(nn.Module):
         is_real_inferred = cum_not_bos / cum_not_bos[:, 0].unsqueeze(1)
         return torch.clamp(is_real_inferred, min=Config.EPS, max=1-Config.EPS)
     
-    def forward(self, input_sequence: torch.Tensor, is_real_doc_position_boolean: torch.Tensor, 
+    def forward(self, input_sequence: torch.Tensor, is_real_doc_position_boolean: torch.Tensor,
                 token_ids: Optional[torch.Tensor] = None, mlm_only: Optional[bool] = False,
-                fake_negatives: Optional[torch.Tensor] = None) -> torch.Tensor:
+                fake_negatives: Optional[torch.Tensor] = None,
+                child_spans: Optional[torch.Tensor] = None,
+                child_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # child_spans [docs, T, 2]: character range [a, b) owned by each input position (None
+        # at level 0, where position p is character p). child_ids [docs, T]: content id of each
+        # input position (None at level 0). Both come from the level below.
         (
             all_sentence_vectors,
             all_sentence_bos_probs,
@@ -1482,18 +1695,38 @@ class ZonkeyLayer(nn.Module):
             original_position,
             patch_loss,
             short_sentence_loss,
+            all_bos_starts,
+            all_owned_end,
         ) = self.segment_splitter(
             input_sequence,
             is_real_doc_position_boolean,
             input_tokens=token_ids,
         )
-        
+
         is_real_inferred = self.bos_probs_to_inferred_real_position(all_sentence_bos_probs) #with learning on the bos probs
 
+        # Character range each kept window owns and its content id (utils/content_id.py).
+        doc_of_window = original_position[:, 0, 0]
+        if child_spans is None:
+            span_a, span_b = all_bos_starts, all_owned_end
+        else:
+            span_a = child_spans[doc_of_window, all_bos_starts, 0]
+            span_b = child_spans[doc_of_window, all_owned_end - 1, 1]
+        window_ids = span_content_id(self._batch_prefix_hash, self._pow_table, doc_of_window,
+                                     span_a, span_b, Config.MAX_DOC_LENGTHS[0])
+
+        # This level's input codes and their ids, for the level above's vocabulary (C4c).
+        if child_ids is not None:
+            real_in = is_real_doc_position_boolean.bool()
+            self._last_doc_codes = F.normalize(input_sequence[real_in].detach().float(), p=2, dim=-1)
+            self._last_doc_ids = child_ids[real_in].detach()
+        else:
+            self._last_doc_codes, self._last_doc_ids = None, None
+
         denoised, compressed, losses, denoised_is_real_inferred, fake_negatives_for_upper = self.training_forward(
-            all_sentence_vectors, 
-            is_real_inferred, 
-            all_sentence_bos_probs, 
+            all_sentence_vectors,
+            is_real_inferred,
+            all_sentence_bos_probs,
             all_p_exist_share,
             token_ids=all_tokens,
             num_sentences_per_doc=num_sentences_per_doc,
@@ -1501,9 +1734,11 @@ class ZonkeyLayer(nn.Module):
             doc_sequences=input_sequence,
             is_real_doc_position_boolean=is_real_doc_position_boolean,
             mlm_only=mlm_only,
-            fake_negatives=fake_negatives)
+            fake_negatives=fake_negatives,
+            window_ids=window_ids,
+            child_ids=child_ids)
         if mlm_only:
-            return None, None, None, losses, None, None, None
+            return None, None, None, losses, None, None, None, None, None
 
 
         num_actual_docs = torch.count_nonzero(num_sentences_per_doc) 
@@ -1520,10 +1755,10 @@ class ZonkeyLayer(nn.Module):
         # at G = 1/N, unlike the old clamp which scored extra compression as "at target"
         # and then cheapened recon when BOS was high (the opposite Lagrangian).
         G = bos_per_position
-        F = G.detach()
+        G_sg = G.detach()  # (named F in the paper; F here would shadow torch.nn.functional)
         N_ratio = 1.0 / max(float(wanted_bos_prob), Config.EPS)
         ratio = (N_ratio / max(N_ratio - 1.0, Config.EPS)) * (
-            (N_ratio - 1.0) * F * G + (1.0 - F) * (1.0 - G)
+            (N_ratio - 1.0) * G_sg * G + (1.0 - G_sg) * (1.0 - G)
         )
         losses["average_bos_loss"] = (ratio - 1.0).clamp_min(0.0) * Config.COMPRESSION_PENALTY[self.level]
 
@@ -1539,6 +1774,8 @@ class ZonkeyLayer(nn.Module):
         compressed_flat = compressed.view(-1, feature_dim)
         compressed_out = compressed.new_zeros(num_docs, max_sentences, feature_dim)
         is_real_out = compressed.new_zeros(num_docs, max_sentences)
+        span_out = torch.zeros(num_docs, max_sentences, 2, dtype=torch.long, device=compressed.device)
+        id_out = torch.full((num_docs, max_sentences), -1, dtype=torch.long, device=compressed.device)
 
         i = 0
         for doc_idx, s in enumerate(num_sentences_per_doc):
@@ -1549,19 +1786,23 @@ class ZonkeyLayer(nn.Module):
                 end = i + s_int
                 compressed_out[doc_idx, :s_int] = compressed_flat[i:end]
                 is_real_out[doc_idx, :s_int] = 1.0
+                span_out[doc_idx, :s_int, 0] = span_a[i:end]
+                span_out[doc_idx, :s_int, 1] = span_b[i:end]
+                id_out[doc_idx, :s_int] = window_ids[i:end]
 
             i += s_original
 
         compressed = compressed_out
         is_real = is_real_out
-        
-        return denoised, is_real_inferred, compressed, losses, stitched_docs, is_real, fake_negatives_for_upper
+
+        # span_out / id_out are the next level's child_spans / child_ids.
+        return denoised, is_real_inferred, compressed, losses, stitched_docs, is_real, fake_negatives_for_upper, span_out, id_out
 
     @torch.no_grad()
     def generate(
-        self, 
+        self,
         batch_size: int = 1,
-        num_diffusion_steps: int = 2,
+        num_diffusion_steps: Optional[int] = None,
         max_length: Optional[int] = None,
         noise_level: float = 1.0,
         fixed_vectors: Optional[torch.Tensor] = None,
@@ -1620,12 +1861,19 @@ class ZonkeyLayer(nn.Module):
             t_start = torch.full((batch_size,), noise_level_scalar, device=device, dtype=x_t.dtype)
 
         # === Integrate the probability-flow ODE (data-prediction / DDIM-on-sphere) ===
+        # The grid is even in schedule position u (u_to_t), the same map training samples
+        # through. num_diffusion_steps=None keeps the training step size: 1/DIFFUSION_STEPS
+        # in u, also for partial starts; 0 means a single evaluation at t_start.
+        u_start = float(self.t_to_u(torch.tensor([float(noise_level_scalar)], dtype=torch.float64))[0])
+        if num_diffusion_steps is None:
+            num_diffusion_steps = max(1, int(round(u_start * Config.DIFFUSION_STEPS)))
         if num_diffusion_steps <= 0:
             # Single denoiser evaluation at t_start (used to decode a known compressed
             # vector, optionally with a little noise).
             denoised, is_real_inferred = self.compressed_to_denoised(x_t, t_start)
         else:
-            ts = torch.linspace(noise_level_scalar, 0.0, num_diffusion_steps + 1, device=device)
+            us = torch.linspace(u_start, 0.0, num_diffusion_steps + 1, dtype=torch.float64)
+            ts = self.u_to_t(us).to(device=device, dtype=torch.float32)
             self_cond = None  # first step has no previous estimate (matches training)
             for step in range(num_diffusion_steps):
                 t_cur = ts[step]

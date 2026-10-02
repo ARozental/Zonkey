@@ -124,7 +124,10 @@ def calculate_reconstruction_loss(
     noise_level=None,
     regression_power=None,
     sample_weight=None,
+    extra_neg_sim=None,
 ):
+    # extra_neg_sim: optional [batch, seq_len, K] cosines of the prediction to extra negatives
+    # (context guesses, mined neighbours), -1 where unavailable; appended after the fakes.
     batch, seq_len, hidden = denoised.shape
     device = denoised.device
     
@@ -261,7 +264,9 @@ def calculate_reconstruction_loss(
             fake_neg_norm = F.normalize(fake_negatives, p=2, dim=-1)
             fake_sim = torch.matmul(denoised_norm, fake_neg_norm.T)  # (N, K)
             neg_sim = torch.cat([neg_sim, fake_sim], dim=1)
-        
+        if extra_neg_sim is not None and extra_neg_sim.shape[-1] > 0:
+            neg_sim = torch.cat([neg_sim, extra_neg_sim.reshape(N, -1).to(neg_sim.dtype)], dim=1)
+
         all_sim = torch.cat([pos_sim.unsqueeze(1), neg_sim], dim=1)
         logits = 2 * torch.atanh(torch.clamp(all_sim, min=Config.EPS-1, max=1-Config.EPS))
         
