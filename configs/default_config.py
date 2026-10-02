@@ -127,7 +127,9 @@ class Config:
     # One-hop interface loss: the parent's predicted child codes are decoded by the child
     # level exactly as generation does, and scored with the child level's own
     # reconstruction loss against the decode of the true child codes. Never unrolls more
-    # than one level, so it is the same code at every depth.
+    # than one level, so it is the same code at every depth. Parent term: child frozen,
+    # weighted by the parent's probability of the true child. Child term: parent detached,
+    # only where the parent's nearest real child code has the true content id.
     INTERFACE_CONSISTENCY_WEIGHT = [0.0, 1.0]
     INTERFACE_CONSISTENCY_SAMPLES = 64
 
@@ -150,6 +152,12 @@ class Config:
     # higher levels (larger D); the invariance it teaches depends on the angle only.
     CLEAN_NOISE_T_RANGE = [1e-4, 3e-2]
     CLEAN_NOISE_EXACT_FRACTION = 0.25
+    # On-manifold margin (ZonkeyLayer._neighbor_margin): this fraction of the noised clean
+    # samples moves toward the nearest real code with a different text instead, by a random
+    # fraction (at most CLEAN_NEIGHBOR_MAX_STEP < 0.5) of the angle between them, so the own
+    # code stays the nearest one. Isotropic noise alone never trains these directions.
+    CLEAN_NEIGHBOR_FRACTION = 0.5
+    CLEAN_NEIGHBOR_MAX_STEP = 0.4
 
     # Generative passes treat codes as data: the FM input/target and the FM/dirty
     # reconstruction targets (child codes, or the char table at level 0) are detached, so

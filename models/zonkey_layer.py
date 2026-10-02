@@ -957,7 +957,7 @@ class ZonkeyLayer(nn.Module):
             sims = d_n @ bank.t()                                  # gradient to the prediction only
             with torch.no_grad():
                 tgt = extra["target_ids"].reshape(-1)
-                same = extra["bank_ids"][None, :] == tgt[:, None]
+                same = (extra["bank_ids"][None, :] == tgt[:, None]) | (extra["bank_ids"][None, :] < 0)
                 masked = sims.detach().masked_fill(same, -2.0)
                 top_val, top = masked.topk(k, dim=-1)
                 ok = (top_val > -1.5) & ((tgt >= 0) & (share.reshape(-1) > 0)).unsqueeze(1)
@@ -993,6 +993,39 @@ class ZonkeyLayer(nn.Module):
             guess = torch.where(m.unsqueeze(-1), out, guess)
             has = has | m
         return guess, has
+
+    def _neighbor_margin(self, codes: torch.Tensor, noisy_codes: torch.Tensor, t_aug: torch.Tensor,
+                         ids: Optional[torch.Tensor]) -> torch.Tensor:
+        """On-manifold half of the clean-pass margin.
+
+        Isotropic noise in D dimensions lands almost entirely off the code manifold, so it
+        never trains the directions toward other real codes, which is where a parent's errors
+        go (185k: 1 deg toward L1's error direction cut L0 word accuracy to 0.65, 1 deg of
+        isotropic noise only to 0.98). For a CLEAN_NEIGHBOR_FRACTION of the noised samples
+        (t_aug > 0), the code moves instead toward its nearest real code with a different
+        content id (this batch plus this level's queue) by a fraction alpha <=
+        CLEAN_NEIGHBOR_MAX_STEP < 0.5 of the angle between them. By the triangle inequality
+        the moved point is still closer to its own code than to any code in that pool, so its
+        text stays the right target. Data-defined (content ids) and the same at every level.
+        The neighbour is detached; the gradient reaches only the window's own code."""
+        frac = float(getattr(Config, "CLEAN_NEIGHBOR_FRACTION", 0.0))
+        max_step = float(getattr(Config, "CLEAN_NEIGHBOR_MAX_STEP", 0.4))
+        if frac <= 0.0 or ids is None:
+            return noisy_codes
+        n = codes.shape[0]
+        flat = F.normalize(codes.reshape(n, -1), p=2, dim=-1)
+        with torch.no_grad():
+            c = flat.detach().float()
+            pool = torch.cat([c, self._drifting_queue.float()], dim=0)
+            pool_ids = torch.cat([ids, self._drifting_queue_ids], dim=0)
+            excluded = (pool_ids[None, :] == ids[:, None]) | (pool_ids[None, :] < 0)
+            excluded[:, :n] |= torch.eye(n, dtype=torch.bool, device=codes.device)
+            nn_sim, nn_idx = (c @ pool.t()).masked_fill(excluded, -2.0).max(dim=-1)
+            use = (torch.rand(n, device=codes.device) < frac) & (t_aug > 0) & (nn_sim > -1.5)
+            alpha = (max_step * torch.rand(n, device=codes.device)).to(flat.dtype)
+            neighbor = pool[nn_idx].to(flat.dtype)
+        moved = (self._slerp(flat, neighbor, alpha) * self.upwards_norm).view_as(codes)
+        return torch.where(use.view(n, *([1] * (codes.dim() - 1))), moved, noisy_codes)
 
     def _sample_clean_noise_t(self, n: int, device, dtype) -> torch.Tensor:
         """t_aug for the clean pass: log-uniform in CLEAN_NOISE_T_RANGE, and exactly 0 for a
@@ -1075,13 +1108,17 @@ class ZonkeyLayer(nn.Module):
         generation decodes them (t=0), and the decode is scored with level n-1's OWN
         reconstruction scoring against the decode of the paired true child code (the
         teacher, no grad): character CE over the char table when level n-1 is 0, CE over a
-        vocabulary of real level n-2 codes otherwise. The child decoder is frozen for the
-        student decode, so the gradient reaches only level n: choosing content is the
-        parent's job, and the child's tolerance to near-misses comes from its own clean-pass
-        noise. Each sample is weighted by p, the parent's probability of the true child
-        under the child-code bank (same logit as the reconstruction), so the interface only
-        refines correct picks. Positions are sampled by this level's inferred existence,
-        i.e. the children generation keeps.
+        vocabulary of real level n-2 codes otherwise. Two terms:
+        - parent term: the child decoder is frozen, so this gradient reaches only level n
+          (choosing content is the parent's job); each sample is weighted by p, the parent's
+          probability of the true child under the child-code bank (same logit as the
+          reconstruction), so it refines correct picks;
+        - child term: level n is detached and the child learns to read level n's actual
+          near-misses, only on slots where level n picked the right content (its nearest
+          real child code has the true content id), so the child is never taught to read
+          one text's code as another's.
+        Positions are sampled by this level's inferred existence, i.e. the children
+        generation keeps.
         """
         metrics = {}
         if self.level == 0:
@@ -1106,22 +1143,38 @@ class ZonkeyLayer(nn.Module):
         t0 = torch.zeros(num_samples, device=predicted.device, dtype=predicted.dtype)
 
         # p: the parent's probability of the true child (C4b), entries of the same content id
-        # merged; 0 for slots without a valid target id. No gradient.
+        # merged; 0 for slots without a valid target id. right_pick: the parent's nearest real
+        # child code has the true content id, i.e. it chose the right content. No gradient.
         with torch.no_grad():
             if bank is not None and bank["codes"].shape[0] > 0:
                 tgt_ids = bank["target_ids"].reshape(-1)[sample_indices]
                 pred_n = F.normalize(predicted_flat.detach().float(), p=2, dim=-1)
-                logits = 2 * torch.atanh((pred_n @ bank["codes"].t()).clamp(-1 + 1e-6, 1 - 1e-6))
+                cos_bank = pred_n @ bank["codes"].t()
+                empty = bank["ids"][None, :] < 0                  # unfilled queue slots
+                logits = 2 * torch.atanh(cos_bank.clamp(-1 + 1e-6, 1 - 1e-6)).masked_fill(empty, float("-inf"))
                 probs = torch.softmax(logits, dim=-1)
                 same = (bank["ids"][None, :] == tgt_ids[:, None]) & (tgt_ids[:, None] >= 0)
                 p = (probs * same.to(probs.dtype)).sum(-1).clamp(0.0, 1.0)
+                nearest = cos_bank.masked_fill(empty, -2.0).argmax(-1)
+                right_pick = ((bank["ids"][nearest] == tgt_ids) & (tgt_ids >= 0)).to(p.dtype)
             else:
                 p = torch.ones(num_samples, device=predicted.device)
+                right_pick = torch.ones(num_samples, device=predicted.device)
+            metrics["metric_interface_p"] = p.mean().detach()
+            metrics["metric_interface_right_pick"] = right_pick.mean().detach()
 
         with torch.no_grad():
             teacher_sequence, teacher_real = lower.compressed_to_denoised(target, t0, self_cond=None)
+        # Parent term (C4a, C4b): the child is frozen, so this gradient reaches only this level.
         with _frozen_parameters(lower):
             student_sequence, student_real = lower.compressed_to_denoised(predicted, t0, self_cond=None)
+        # Child term: the child learns to read this level's actual near-misses as the true
+        # child, but only on slots where this level picked the right content, so it is never
+        # taught to read one text's code as another text. This level is detached here. At 185k
+        # 97% of the children L0 misread were such near-misses (the parent's prediction was
+        # closest to the right code, ~1.5 deg away), and L0 was far more fragile along these
+        # directions than along random ones (word acc 0.65 vs 0.98 at 1 deg).
+        child_sequence, child_real = lower.compressed_to_denoised(predicted.detach(), t0, self_cond=None)
 
         # Content weight: the teacher's existence on the positions generation keeps.
         keep = (teacher_real > 0.1).to(teacher_real.dtype)
@@ -1133,6 +1186,10 @@ class ZonkeyLayer(nn.Module):
             sequence_loss, _ = calculate_token_loss(
                 teacher_ids, student_sequence, content_weight, lower.previous_layer, detach_table=True,
                 sample_weight=p)
+            child_loss, _ = calculate_token_loss(
+                teacher_ids, child_sequence, content_weight, lower.previous_layer, detach_table=True,
+                sample_weight=right_pick)
+            sequence_loss = sequence_loss + child_loss
             with torch.no_grad():
                 # Measured only where the teacher decode is confident (char prob >= 0.5 under
                 # the loss's 2*atanh(cos) logits): while level 0 still decodes every code to
@@ -1148,18 +1205,20 @@ class ZonkeyLayer(nn.Module):
                         word_ok = ((student_ids == teacher_ids) | ~kept).all(-1)
                         metrics["metric_child_word_acc"] = word_ok[words].float().mean().detach()
         else:
-            sequence_loss = self._interface_vocab_ce(lower, student_sequence, teacher_sequence, content_weight, p)
+            sequence_loss = (self._interface_vocab_ce(lower, student_sequence, teacher_sequence, content_weight, p)
+                             + self._interface_vocab_ce(lower, child_sequence, teacher_sequence, content_weight, right_pick))
             with torch.no_grad():
                 cos = F.cosine_similarity(student_sequence.detach(), teacher_sequence, dim=-1)
                 metrics["metric_child_cos"] = ((cos * content_weight).sum() / content_weight.sum().clamp_min(Config.EPS)).detach()
 
         teacher_prob = teacher_real.clamp(Config.EPS, 1.0 - Config.EPS)
-        student_prob = student_real.clamp(Config.EPS, 1.0 - Config.EPS)
-        existence_kl = (
-            bce(student_prob, teacher_prob, reduction="none")
-            - bce(teacher_prob, teacher_prob, reduction="none")
-        )
-        existence_loss = (existence_kl[:, 1:].mean(-1) * p).mean()
+
+        def existence_kl(real):
+            prob = real.clamp(Config.EPS, 1.0 - Config.EPS)
+            kl = bce(prob, teacher_prob, reduction="none") - bce(teacher_prob, teacher_prob, reduction="none")
+            return kl[:, 1:].mean(-1)
+
+        existence_loss = (existence_kl(student_real) * p).mean() + (existence_kl(child_real) * right_pick).mean()
         return sequence_loss, existence_loss, metrics
 
     @staticmethod
@@ -1174,21 +1233,23 @@ class ZonkeyLayer(nn.Module):
         grand = lower.previous_layer
         if V is None or V_ids is None:
             return student_sequence.sum() * 0.0
-        cnt = int(getattr(grand, "_drifting_queue_count", 0)) if grand is not None else 0
-        if cnt > 0:
-            V = torch.cat([V, grand._drifting_queue[:cnt].to(V.dtype)], dim=0)
-            V_ids = torch.cat([V_ids, grand._drifting_queue_ids[:cnt]], dim=0)
+        if grand is not None and getattr(grand, "_drifting_queue_ids", None) is not None:
+            # Whole queue buffer; unfilled slots have id -1 and are masked below (a slice by
+            # the fill count would recompile under torch.compile every step until it is full).
+            V = torch.cat([V, grand._drifting_queue.to(V.dtype)], dim=0)
+            V_ids = torch.cat([V_ids, grand._drifting_queue_ids], dim=0)
         if V.shape[0] == 0:
             return student_sequence.sum() * 0.0
         n, L, D = student_sequence.shape
         V = F.normalize(V.detach().float(), p=2, dim=-1)
+        empty = V_ids[None, :] < 0
         with torch.no_grad():
             t_n = F.normalize(teacher_sequence.reshape(n * L, D).float(), p=2, dim=-1)
-            teacher_class = V_ids[(t_n @ V.t()).argmax(-1)]
+            teacher_class = V_ids[(t_n @ V.t()).masked_fill(empty, -2.0).argmax(-1)]
             same = V_ids[None, :] == teacher_class[:, None]
             valid = teacher_class >= 0
         s_n = F.normalize(student_sequence.reshape(n * L, D).float(), p=2, dim=-1)
-        logits = 2 * torch.atanh((s_n @ V.t()).clamp(-1 + 1e-6, 1 - 1e-6))
+        logits = 2 * torch.atanh((s_n @ V.t()).clamp(-1 + 1e-6, 1 - 1e-6)).masked_fill(empty, float("-inf"))
         ce = torch.logsumexp(logits, dim=-1) - torch.logsumexp(logits.masked_fill(~same, float("-inf")), dim=-1)
         ce = torch.where(valid, ce, torch.zeros_like(ce)).reshape(n, L)
         w = content_weight * valid.reshape(n, L).to(content_weight.dtype)
@@ -1439,10 +1500,11 @@ class ZonkeyLayer(nn.Module):
                 bank_codes = F.normalize(doc_sequences[real_doc].detach().float(), p=2, dim=-1)
                 bank_ids = child_ids[real_doc]
                 lower = self.previous_layer
-                cnt = int(lower._drifting_queue_count)
-                if cnt > 0:
-                    bank_codes = torch.cat([bank_codes, lower._drifting_queue[:cnt].float()], dim=0)
-                    bank_ids = torch.cat([bank_ids, lower._drifting_queue_ids[:cnt]], dim=0)
+                # Whole queue buffer; unfilled slots carry id -1 and are masked where used. A
+                # slice by the fill count made torch.compile recompile this frame every step
+                # until the queue was full, then give up and run it eagerly.
+                bank_codes = torch.cat([bank_codes, lower._drifting_queue.float()], dim=0)
+                bank_ids = torch.cat([bank_ids, lower._drifting_queue_ids], dim=0)
                 T_doc = child_ids.shape[1]
                 pos = original_position[..., 1]
                 in_range = (pos >= 0) & (pos < T_doc)
@@ -1467,6 +1529,7 @@ class ZonkeyLayer(nn.Module):
         t_clean = torch.zeros(batch, device=clean_compressed.device, dtype=clean_compressed.dtype)
         t_aug = self._sample_clean_noise_t(batch, clean_compressed.device, clean_compressed.dtype)
         clean_input = self.add_noise(clean_compressed, t_aug)
+        clean_input = self._neighbor_margin(clean_compressed, clean_input, t_aug, window_ids)
         denoised_clean, clean_losses, is_real_inferred = self.denoise_and_reconstruct(
             clean_input, input_sequence, all_sentence_bos_probs, t_clean, splitter_existence_share,
             token_ids=token_ids,
