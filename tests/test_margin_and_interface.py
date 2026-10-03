@@ -40,8 +40,9 @@ def test_neighbor_margin_stays_in_own_cell():
     t_aug = torch.full((n,), 0.01)
     t_aug[:4] = 0.0                                   # exact samples are never moved
     noisy = codes.detach() * 1.0
-    moved = ZonkeyLayer._neighbor_margin(layer, codes, noisy, t_aug, ids)
+    moved, used = ZonkeyLayer._neighbor_margin(layer, codes, noisy, t_aug, ids)
     assert torch.equal(moved[:4], noisy[:4]), "exact samples must stay exact"
+    assert not used[:4].any() and used[4:].all(), "the mask must name exactly the moved windows"
     m = F.normalize(moved.detach().reshape(n, -1), dim=-1)
     own = F.normalize(codes.detach().reshape(n, -1), dim=-1)
     pool = torch.cat([own, layer._drifting_queue[:150]])
@@ -61,8 +62,8 @@ def test_neighbor_margin_off_keeps_noise():
     layer = _fake_layer(10, 8, filled=5)
     codes = torch.randn(6, 2, 4)
     noisy = torch.randn(6, 2, 4)
-    out = ZonkeyLayer._neighbor_margin(layer, codes, noisy, torch.full((6,), 0.01), torch.arange(6))
-    assert torch.equal(out, noisy)
+    out, used = ZonkeyLayer._neighbor_margin(layer, codes, noisy, torch.full((6,), 0.01), torch.arange(6))
+    assert torch.equal(out, noisy) and not used.any()
     Config.CLEAN_NEIGHBOR_FRACTION = 0.5
     print("margin: fraction 0 leaves the isotropic noise untouched")
 

@@ -56,6 +56,35 @@ def aggregate_leveled_losses(leveled_losses):
         raise RuntimeError("aggregate_leveled_losses: no loss tensors")
     return total, level_totals
 
+
+@torch.no_grad()
+def aggregate_progress(leveled_losses):
+    """loss/progress: aggregated exactly like aggregate_leveled_losses (same terms, same
+    per-level mean and LEVEL_LOSS_WEIGHT), except that each term with a "metric_progress_<term>"
+    entry uses that value instead. Those are the terms that grow harder or heavier as the model
+    improves (gated and extra-negative reconstructions, p/right_pick-weighted interface), scored
+    on a fixed task, so this number going down means the model is still learning."""
+    total = None
+    level_totals = []
+    weights = getattr(Config, "LEVEL_LOSS_WEIGHT", None)
+    for l, losses in enumerate(leveled_losses):
+        vals = []
+        for name, value in losses.items():
+            if name in METRIC_LOSS_KEYS or name.startswith("metric_"):
+                continue
+            t = _as_loss_tensor(losses.get("metric_progress_" + name, value))
+            if t is not None:
+                vals.append(t.detach())
+        if not vals:
+            level_totals.append(None)
+            continue
+        lvl = torch.stack(vals).mean()
+        if weights is not None and l < len(weights):
+            lvl = lvl * weights[l]
+        level_totals.append(lvl)
+        total = lvl if total is None else total + lvl
+    return total, level_totals
+
 class PlZonkey(pl.LightningModule):
     def __init__(self, writer=None):
         super().__init__()
@@ -371,6 +400,12 @@ class PlZonkey(pl.LightningModule):
 
         if should_log and self.tb_writer is not None:
             self.tb_writer.add_scalar("loss/total", float(total_loss.item()), log_step)
+            # The fixed-task version of loss/total (see aggregate_progress).
+            progress_total, progress_levels = aggregate_progress(leveled_losses)
+            self.tb_writer.add_scalar("loss/progress", float(progress_total.item()), log_step)
+            for l, value in enumerate(progress_levels):
+                if value is not None:
+                    self.tb_writer.add_scalar(f"loss/progress_{l}", float(value.item()), log_step)
             # Learning rate of each group (Muon group first, as before; Adam group separately).
             for group in optimizer.param_groups:
                 tag = "training/learning_rate" if group.get("use_muon", True) else "training/learning_rate_adam"

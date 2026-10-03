@@ -27,9 +27,13 @@ def calculate_token_loss(
     regression_power=None,
     sample_weight=None,
     detach_table=False,
+    metric_out=None,
+    metric_sample_weight=None,
 ):
     # detach_table: the char table is a target here (generative passes, interface loss),
     # so this loss trains the decoder only and never moves the embeddings.
+    # metric_out: optional dict; receives "value", the same loss (no grad) with
+    # metric_sample_weight in place of sample_weight (the loss/progress metric).
     B, L, D = encoded_sequences.shape
     V = token_embedding_layer.weight.shape[0]
     BL = B * L
@@ -106,6 +110,12 @@ def calculate_token_loss(
         w = splitter_existence_share
         if sample_weight is not None:
             w = w * sample_weight.reshape(-1, 1).to(dtype=w.dtype)
+        if metric_out is not None:
+            with torch.no_grad():
+                w_ref = splitter_existence_share
+                if metric_sample_weight is not None:
+                    w_ref = w_ref * metric_sample_weight.reshape(-1, 1).to(dtype=w_ref.dtype)
+                metric_out["value"] = ((loss.detach() * w_ref).sum() / (splitter_existence_share.sum() + Config.EPS)).detach()
         # Divide by un-gated existence so (1-t)^p actually shrinks the scalar, not just re-averages.
         loss = (loss * w).sum() / (splitter_existence_share.sum() + Config.EPS)
         return loss, None
@@ -125,9 +135,13 @@ def calculate_reconstruction_loss(
     regression_power=None,
     sample_weight=None,
     extra_neg_sim=None,
+    metric_out=None,
+    metric_sample_weight=None,
 ):
     # extra_neg_sim: optional [batch, seq_len, K] cosines of the prediction to extra negatives
     # (context guesses, mined neighbours), -1 where unavailable; appended after the fakes.
+    # metric_out: optional dict; receives "value", the loss (no grad) without the extra
+    # negatives and with metric_sample_weight in place of sample_weight (loss/progress).
     batch, seq_len, hidden = denoised.shape
     device = denoised.device
     
@@ -254,35 +268,66 @@ def calculate_reconstruction_loss(
             sampled_indices[collision_mask] = torch.multinomial(sample_probs, num_collisions, replacement=True)
             collision_mask = (sampled_indices == self_indices)
         
-        # Compute full similarity matrix: (N, N) — much smaller than
-        # gathering (N, num_neg, hidden) and doing elementwise multiply+sum.
-        full_sim = torch.matmul(denoised_norm, target_norm.T)
-        neg_sim = torch.gather(full_sim, 1, sampled_indices)
-        del full_sim
-        
+        fake_neg_norm = None
         if fake_negatives is not None and fake_negatives.shape[0] > 0:
             fake_neg_norm = F.normalize(fake_negatives, p=2, dim=-1)
-            fake_sim = torch.matmul(denoised_norm, fake_neg_norm.T)  # (N, K)
-            neg_sim = torch.cat([neg_sim, fake_sim], dim=1)
-        if extra_neg_sim is not None and extra_neg_sim.shape[-1] > 0:
-            neg_sim = torch.cat([neg_sim, extra_neg_sim.reshape(N, -1).to(neg_sim.dtype)], dim=1)
 
-        all_sim = torch.cat([pos_sim.unsqueeze(1), neg_sim], dim=1)
-        logits = 2 * torch.atanh(torch.clamp(all_sim, min=Config.EPS-1, max=1-Config.EPS))
-        
-        ce_loss = F.cross_entropy(logits, torch.zeros(N, dtype=torch.long, device=device), reduction='none')
-        ce_loss = ce_loss.reshape(batch, seq_len)
+        def contrastive_ce(d_n, t_n, extra):
+            # Compute full similarity matrix: (N, N), much smaller than
+            # gathering (N, num_neg, hidden) and doing elementwise multiply+sum.
+            full_sim = torch.matmul(d_n, t_n.T)
+            neg = torch.gather(full_sim, 1, sampled_indices)
+            del full_sim
+            if fake_neg_norm is not None:
+                neg = torch.cat([neg, torch.matmul(d_n, fake_neg_norm.T)], dim=1)  # (N, K)
+            if extra is not None:
+                neg = torch.cat([neg, extra.reshape(N, -1).to(neg.dtype)], dim=1)
+            pos = torch.sum(d_n * t_n, dim=-1)
+            all_sim = torch.cat([pos.unsqueeze(1), neg], dim=1)
+            logits = 2 * torch.atanh(torch.clamp(all_sim, min=Config.EPS-1, max=1-Config.EPS))
+            return F.cross_entropy(logits, torch.zeros(N, dtype=torch.long, device=device), reduction='none')
+
+        if extra_neg_sim is not None and extra_neg_sim.shape[-1] > 0:
+            # The extra negatives (context guesses, mined neighbours) are detached and take
+            # most of the softmax mass. In one CE with the targets they would keep the pull of
+            # each target (a real child code) toward the prediction and almost remove the push
+            # between the in-batch targets, which squeezed the child level's codes (L0 nearest
+            # neighbour ~6 deg instead of ~13 deg). So they only sharpen the prediction (targets
+            # detached in that CE), and the child codes get the gradient of the in-batch CE
+            # without them (prediction detached), exactly as before the extras existed. The
+            # value is that of the CE with the extras.
+            ce_loss = contrastive_ce(denoised_norm, target_norm.detach(), extra_neg_sim)
+            ce_child = contrastive_ce(denoised_norm.detach(), target_norm, None)
+            ce_plain = ce_child.detach()
+            ce_loss = ce_loss + (ce_child - ce_plain)
+        else:
+            ce_loss = contrastive_ce(denoised_norm, target_norm, None)
+            ce_plain = ce_loss.detach()
+
         pos_cos = pos_sim.reshape(batch, seq_len)
-        ce_loss = _regression_blend(ce_loss, pos_cos, noise_level, regression_power)
-        # Absolute pull to the positive. atanh-InfoNCE logits are unbounded, but the
-        # softmax still saturates once the positive beats easy negatives — (1-cos)
-        # keeps a gradient all the way to the manifold.
         direct_w = float(getattr(Config, "DIRECT_COSINE_WEIGHT", 0.0))
-        if direct_w != 0.0:
-            ce_loss = ce_loss + direct_w * (1.0 - pos_cos)
+
+        def finish(ce, cos):
+            ce = _regression_blend(ce.reshape(batch, seq_len), cos, noise_level, regression_power)
+            # Absolute pull to the positive. atanh-InfoNCE logits are unbounded, but the
+            # softmax still saturates once the positive beats easy negatives; (1-cos)
+            # keeps a gradient all the way to the manifold.
+            if direct_w != 0.0:
+                ce = ce + direct_w * (1.0 - cos)
+            return ce
+
+        ce_loss = finish(ce_loss, pos_cos)
         w = splitter_existence_share * sequence_weight
         if sample_weight is not None:
             w = w * sample_weight.reshape(-1, 1).to(dtype=w.dtype)
         total_loss = (ce_loss * w).sum() / (splitter_existence_share.sum() + Config.EPS)
+
+        if metric_out is not None:
+            with torch.no_grad():
+                w_ref = splitter_existence_share * sequence_weight
+                if metric_sample_weight is not None:
+                    w_ref = w_ref * metric_sample_weight.reshape(-1, 1).to(dtype=w_ref.dtype)
+                ref = finish(ce_plain, pos_cos.detach())
+                metric_out["value"] = ((ref * w_ref).sum() / (splitter_existence_share.sum() + Config.EPS)).detach()
 
         return total_loss, None

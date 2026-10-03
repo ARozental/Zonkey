@@ -835,6 +835,10 @@ class ZonkeyLayer(nn.Module):
             if gate_p != 0.0:
                 t = noise_level.clamp(0.0, 1.0).reshape(-1)
                 sample_weight = (1.0 - t).clamp(min=0.0) ** gate_p
+        # loss/progress scores the reconstruction without the identifiability gate (it lets in
+        # more samples as the model improves, which raises the gated loss) and without the
+        # extra negatives (they get harder as the model improves): (1-t)^p only.
+        progress_weight = sample_weight
         identifiable = None
         if (not clean) and gate_codes is not None and gate_ids is not None and getattr(Config, "IDENTIFIABILITY_GATE", False):
             with torch.no_grad():
@@ -842,12 +846,14 @@ class ZonkeyLayer(nn.Module):
                 identifiable = self._identifiability(estimate, gate_codes, gate_ids)
             sample_weight = identifiable if sample_weight is None else sample_weight * identifiable
 
+        progress = {}
         target_sequence = input_sequence.detach() if detach_targets else input_sequence
         if self.level == 0:
             reconstruction_loss, _ = calculate_token_loss(
                 token_ids, denoised, splitter_existence_share, self.previous_layer,
                 noise_level=noise_level, regression_power=Config.REGRESSION_T_POWER,
-                sample_weight=sample_weight, detach_table=detach_targets)
+                sample_weight=sample_weight, detach_table=detach_targets,
+                metric_out=progress, metric_sample_weight=progress_weight)
         else:
             extra_neg_sim = None
             if extra_negatives is not None:
@@ -860,7 +866,8 @@ class ZonkeyLayer(nn.Module):
                 fake_negatives=fake_negatives,
                 noise_level=noise_level, regression_power=Config.REGRESSION_T_POWER,
                 sample_weight=sample_weight,
-                extra_neg_sim=extra_neg_sim)
+                extra_neg_sim=extra_neg_sim,
+                metric_out=progress, metric_sample_weight=progress_weight)
 
         dbos_ce_loss = bce(is_real_inferred, is_real_label, reduction='none')[:, 1:].mean() - bce(is_real_label, is_real_label, reduction='none')[:, 1:].mean()
 
@@ -868,6 +875,10 @@ class ZonkeyLayer(nn.Module):
             "reconstruction_loss": reconstruction_loss,
             "bos_loss": dbos_ce_loss * Config.EXISTS_WEIGHT[self.level],
         }
+        if "value" in progress:
+            # Not a loss term and not "metric_"-prefixed: training_forward scales it like
+            # reconstruction_loss and logs it as metric_progress_<name>.
+            losses["progress_reconstruction_loss"] = progress["value"]
         if identifiable is not None:
             losses["metric_identifiable"] = identifiable.mean().detach()
         if clean:
@@ -995,8 +1006,9 @@ class ZonkeyLayer(nn.Module):
         return guess, has
 
     def _neighbor_margin(self, codes: torch.Tensor, noisy_codes: torch.Tensor, t_aug: torch.Tensor,
-                         ids: Optional[torch.Tensor]) -> torch.Tensor:
-        """On-manifold half of the clean-pass margin.
+                         ids: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """On-manifold half of the clean-pass margin. Returns the decoder input and a [n] bool
+        mask of the windows that were moved (the child metrics are split by it).
 
         Isotropic noise in D dimensions lands almost entirely off the code manifold, so it
         never trains the directions toward other real codes, which is where a parent's errors
@@ -1010,9 +1022,9 @@ class ZonkeyLayer(nn.Module):
         The neighbour is detached; the gradient reaches only the window's own code."""
         frac = float(getattr(Config, "CLEAN_NEIGHBOR_FRACTION", 0.0))
         max_step = float(getattr(Config, "CLEAN_NEIGHBOR_MAX_STEP", 0.4))
-        if frac <= 0.0 or ids is None:
-            return noisy_codes
         n = codes.shape[0]
+        if frac <= 0.0 or ids is None:
+            return noisy_codes, torch.zeros(n, dtype=torch.bool, device=codes.device)
         flat = F.normalize(codes.reshape(n, -1), p=2, dim=-1)
         with torch.no_grad():
             c = flat.detach().float()
@@ -1025,7 +1037,7 @@ class ZonkeyLayer(nn.Module):
             alpha = (max_step * torch.rand(n, device=codes.device)).to(flat.dtype)
             neighbor = pool[nn_idx].to(flat.dtype)
         moved = (self._slerp(flat, neighbor, alpha) * self.upwards_norm).view_as(codes)
-        return torch.where(use.view(n, *([1] * (codes.dim() - 1))), moved, noisy_codes)
+        return torch.where(use.view(n, *([1] * (codes.dim() - 1))), moved, noisy_codes), use
 
     def _sample_clean_noise_t(self, n: int, device, dtype) -> torch.Tensor:
         """t_aug for the clean pass: log-uniform in CLEAN_NOISE_T_RANGE, and exactly 0 for a
@@ -1101,6 +1113,7 @@ class ZonkeyLayer(nn.Module):
         target_lower_codes: torch.Tensor,
         position_weights: torch.Tensor,
         bank: Optional[dict] = None,
+        displaced: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         """Make this level's predicted child codes decode like the real child codes.
 
@@ -1119,6 +1132,11 @@ class ZonkeyLayer(nn.Module):
           one text's code as another's.
         Positions are sampled by this level's inferred existence, i.e. the children
         generation keeps.
+        displaced: [windows] bool, the windows whose clean-pass input _neighbor_margin moved
+        toward another code. The metrics (child accuracy, p, right_pick) are logged for the
+        other windows, the generation case, and with a "_displaced" suffix for these.
+        Also returns, in metrics, the unweighted losses (p and right_pick replaced by 1) under
+        "progress_interface_*" for loss/progress; training_forward takes them out.
         """
         metrics = {}
         if self.level == 0:
@@ -1134,6 +1152,11 @@ class ZonkeyLayer(nn.Module):
         num_samples = min(int(Config.INTERFACE_CONSISTENCY_SAMPLES), valid_count)
         sample_probs = flat_weights / flat_weights.sum().clamp_min(Config.EPS)
         sample_indices = torch.multinomial(sample_probs, num_samples, replacement=False)
+        if displaced is not None:
+            sample_displaced = displaced.reshape(-1)[sample_indices // position_weights.shape[1]]
+        else:
+            sample_displaced = torch.zeros(num_samples, dtype=torch.bool, device=sample_indices.device)
+        groups = (("", ~sample_displaced), ("_displaced", sample_displaced))
 
         lower = self.previous_layer
         predicted_flat = predicted_lower_codes.reshape(-1, self.d_model)[sample_indices]
@@ -1160,8 +1183,10 @@ class ZonkeyLayer(nn.Module):
             else:
                 p = torch.ones(num_samples, device=predicted.device)
                 right_pick = torch.ones(num_samples, device=predicted.device)
-            metrics["metric_interface_p"] = p.mean().detach()
-            metrics["metric_interface_right_pick"] = right_pick.mean().detach()
+            for suffix, m in groups:
+                if bool(m.any()):
+                    metrics["metric_interface_p" + suffix] = p[m].mean().detach()
+                    metrics["metric_interface_right_pick" + suffix] = right_pick[m].mean().detach()
 
         with torch.no_grad():
             teacher_sequence, teacher_real = lower.compressed_to_denoised(target, t0, self_cond=None)
@@ -1191,25 +1216,40 @@ class ZonkeyLayer(nn.Module):
                 sample_weight=right_pick)
             sequence_loss = sequence_loss + child_loss
             with torch.no_grad():
+                progress_sequence = (
+                    calculate_token_loss(teacher_ids, student_sequence.detach(), content_weight,
+                                         lower.previous_layer, detach_table=True)[0]
+                    + calculate_token_loss(teacher_ids, child_sequence.detach(), content_weight,
+                                           lower.previous_layer, detach_table=True)[0])
                 # Measured only where the teacher decode is confident (char prob >= 0.5 under
                 # the loss's 2*atanh(cos) logits): while level 0 still decodes every code to
                 # the same characters, student and teacher would agree trivially.
                 teacher_prob = torch.softmax(2 * torch.atanh(teacher_cos.clamp(-1 + 1e-6, 1 - 1e-6)), -1).amax(-1)
                 kept = keep.bool() & (teacher_prob >= 0.5)
                 student_ids = (F.normalize(student_sequence.detach(), p=2, dim=-1) @ table.t()).argmax(-1)
-                if bool(kept.any()):
-                    correct = (student_ids == teacher_ids) & kept
-                    metrics["metric_child_char_acc"] = (correct.sum() / kept.sum()).detach()
-                    words = kept.any(-1) & (kept == keep.bool()).all(-1)   # every kept char confident
-                    if bool(words.any()):
-                        word_ok = ((student_ids == teacher_ids) | ~kept).all(-1)
-                        metrics["metric_child_word_acc"] = word_ok[words].float().mean().detach()
+                correct = (student_ids == teacher_ids) & kept
+                words = kept.any(-1) & (kept == keep.bool()).all(-1)   # every kept char confident
+                word_ok = ((student_ids == teacher_ids) | ~kept).all(-1)
+                for suffix, m in groups:
+                    kept_m = kept & m[:, None]
+                    if bool(kept_m.any()):
+                        metrics["metric_child_char_acc" + suffix] = (correct[m].sum() / kept_m.sum()).detach()
+                    words_m = words & m
+                    if bool(words_m.any()):
+                        metrics["metric_child_word_acc" + suffix] = word_ok[words_m].float().mean().detach()
         else:
             sequence_loss = (self._interface_vocab_ce(lower, student_sequence, teacher_sequence, content_weight, p)
                              + self._interface_vocab_ce(lower, child_sequence, teacher_sequence, content_weight, right_pick))
             with torch.no_grad():
+                ones = torch.ones_like(p)
+                progress_sequence = (
+                    self._interface_vocab_ce(lower, student_sequence.detach(), teacher_sequence, content_weight, ones)
+                    + self._interface_vocab_ce(lower, child_sequence.detach(), teacher_sequence, content_weight, ones))
                 cos = F.cosine_similarity(student_sequence.detach(), teacher_sequence, dim=-1)
-                metrics["metric_child_cos"] = ((cos * content_weight).sum() / content_weight.sum().clamp_min(Config.EPS)).detach()
+                for suffix, m in groups:
+                    w_m = content_weight * m[:, None].to(content_weight.dtype)
+                    if bool(m.any()):
+                        metrics["metric_child_cos" + suffix] = ((cos * w_m).sum() / w_m.sum().clamp_min(Config.EPS)).detach()
 
         teacher_prob = teacher_real.clamp(Config.EPS, 1.0 - Config.EPS)
 
@@ -1219,6 +1259,10 @@ class ZonkeyLayer(nn.Module):
             return kl[:, 1:].mean(-1)
 
         existence_loss = (existence_kl(student_real) * p).mean() + (existence_kl(child_real) * right_pick).mean()
+        with torch.no_grad():
+            metrics["progress_interface_sequence_loss"] = progress_sequence.detach()
+            metrics["progress_interface_existence_loss"] = (
+                existence_kl(student_real.detach()).mean() + existence_kl(child_real.detach()).mean()).detach()
         return sequence_loss, existence_loss, metrics
 
     @staticmethod
@@ -1529,7 +1573,7 @@ class ZonkeyLayer(nn.Module):
         t_clean = torch.zeros(batch, device=clean_compressed.device, dtype=clean_compressed.dtype)
         t_aug = self._sample_clean_noise_t(batch, clean_compressed.device, clean_compressed.dtype)
         clean_input = self.add_noise(clean_compressed, t_aug)
-        clean_input = self._neighbor_margin(clean_compressed, clean_input, t_aug, window_ids)
+        clean_input, margin_moved = self._neighbor_margin(clean_compressed, clean_input, t_aug, window_ids)
         denoised_clean, clean_losses, is_real_inferred = self.denoise_and_reconstruct(
             clean_input, input_sequence, all_sentence_bos_probs, t_clean, splitter_existence_share,
             token_ids=token_ids,
@@ -1641,7 +1685,8 @@ class ZonkeyLayer(nn.Module):
             real_rows = (input_sequence.detach().abs().sum(-1) > 0).to(is_real_inferred.dtype)
             interface_sequence_loss, interface_existence_loss, interface_metrics = (
                 self.calculate_interface_consistency_loss(
-                    denoised_clean, input_sequence, is_real_inferred.detach() * real_rows, bank=bank
+                    denoised_clean, input_sequence, is_real_inferred.detach() * real_rows, bank=bank,
+                    displaced=margin_moved,
                 )
             )
 
@@ -1715,6 +1760,25 @@ class ZonkeyLayer(nn.Module):
             interface_weight = Config.INTERFACE_CONSISTENCY_WEIGHT[self.level]
             losses["interface_sequence_loss"] = interface_sequence_loss * interface_weight
             losses["interface_existence_loss"] = interface_existence_loss * interface_weight
+
+        # loss/progress (PlZonkey): the same sum as loss/total, with the terms whose difficulty
+        # or weight rises as the model improves replaced by a fixed-task version, logged here as
+        # metric_progress_<term> with the same scale as <term>: reconstructions without the
+        # identifiability gate and without the extra negatives, and the interface losses with
+        # p and right_pick replaced by 1.
+        progress_scale = {
+            "clean_reconstruction_loss": (clean_losses, Config.CLEAN_RECONSTRUCTION_WEIGHT[self.level]),
+            "fm_reconstruction_loss": (fm_losses, Config.DIRTY_RECONSTRUCTION_WEIGHT[self.level]),
+            "dirty_reconstruction_loss": (dirty_losses, Config.DIRTY_RECONSTRUCTION_WEIGHT[self.level]),
+        }
+        for name, (pass_losses, scale) in progress_scale.items():
+            if "progress_reconstruction_loss" in pass_losses:
+                losses["metric_progress_" + name] = pass_losses["progress_reconstruction_loss"] * scale
+        for name in ("interface_sequence_loss", "interface_existence_loss"):
+            value = interface_metrics.pop("progress_" + name, None)
+            if value is not None and self.level > 0:
+                losses["metric_progress_" + name] = value * Config.INTERFACE_CONSISTENCY_WEIGHT[self.level]
+
         for metric_name, metric_value in clean_losses.items():
             if metric_name.startswith("metric_"):
                 losses[metric_name] = metric_value
