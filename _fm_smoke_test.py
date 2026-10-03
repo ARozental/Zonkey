@@ -85,8 +85,10 @@ probe = probe * model.layers[0].upwards_norm
 with torch.no_grad():
     model.layers[0].compressed_to_denoised(probe, torch.zeros(2))
 hook.remove()
+# The code tokens are the last CV tokens of the prompt [time, self-condition, code x CV].
+code_end = model.layers[0].prompt_len
 assert torch.allclose(
-    captured_denoiser_input["x"][:, 2:2 + Config.COMPRESSION_VECTORS[0]], probe
+    captured_denoiser_input["x"][:, code_end - Config.COMPRESSION_VECTORS[0]:code_end], probe
 )
 
 # Muon receives only 2-D hidden matrices; Conv1d and prediction heads stay AdamW.

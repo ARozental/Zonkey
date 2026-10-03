@@ -16,6 +16,9 @@ from torch.distributions import Beta
 
 bce = F.binary_cross_entropy
 
+# Decoder/denoiser prompt is [time, self-condition, code x CV]: 2 tokens precede the CV code tokens.
+PROMPT_EXTRA_TOKENS = 2
+
 
 def _mark_batch_dynamic(*tensors):
     """Inputs of the compiled transformer stacks (PlZonkey, COMPILE_TRANSFORMER_STACKS) get a
@@ -155,13 +158,15 @@ class ZonkeyLayer(nn.Module):
         
 
 
-        # Prompt mask: [time, self_cond, compressed x CV] -> CV+2 always-real positions.
-        self.ones = torch.ones(1,Config.COMPRESSION_VECTORS[level]+2,device=Config.DEVICE)
+        # Prompt [time, self_cond, compressed x CV]: always-real positions ahead of the sequence,
+        # the same length for decoding and for MLM-style inputs (_mlm_denoiser_prefix).
+        self.prompt_len = Config.COMPRESSION_VECTORS[level] + PROMPT_EXTRA_TOKENS
+        self.ones = torch.ones(1, self.prompt_len, device=Config.DEVICE)
         self.denoiser = TransformerEncoder(
             d_model = Config.D_MODEL[level],
             n_heads = Config.NUM_HEADS[level],
             d_ff = Config.D_MODEL[level]*Config.FF_DIM_RATIO,
-            max_seq_len = self.max_seq_len+Config.COMPRESSION_VECTORS[level]+2,
+            max_seq_len = self.max_seq_len + self.prompt_len,
             dropout = Config.DROPOUT,
             num_layers = Config.NUM_DENOISER_LAYERS[level]
             )
@@ -175,7 +180,7 @@ class ZonkeyLayer(nn.Module):
             d_model = Config.D_MODEL[level],
             n_heads = Config.NUM_HEADS[level],
             d_ff = Config.D_MODEL[level]*Config.FF_DIM_RATIO,
-            max_seq_len = self.max_seq_len+Config.COMPRESSION_VECTORS[level]+2,
+            max_seq_len = self.max_seq_len + self.prompt_len,
             dropout = Config.DROPOUT,
             use_rezero = False,
             decoder = True,
@@ -442,7 +447,7 @@ class ZonkeyLayer(nn.Module):
             compressed
         ], dim=1)
 
-        prompt_len = 2 + Config.COMPRESSION_VECTORS[self.level]
+        prompt_len = prompt.shape[1]
         if getattr(Config, "PARALLEL_DRAFT", False):
             # One causal pass over [prompt; learned queries]. Each draft position reads the
             # code through attention; nothing is fed back, so the draft cannot accumulate
@@ -1030,10 +1035,10 @@ class ZonkeyLayer(nn.Module):
 
     def _mlm_denoiser_prefix(self, batch: int, dtype) -> torch.Tensor:
         """The denoiser's prompt for sequence (MLM-style) inputs: [time at t=0, null
-        self-condition, the compressor's CLS vectors in place of a code], the same CV + 2
-        token layout as compressed_to_denoised's [time, self-condition, code x CV]. The
-        sequence then sits at the same positions (CV + 2 onward) in both uses, so what the
-        shared denoiser learns from MLM lines up with what it does when it decodes."""
+        self-condition, the compressor's CLS vectors in place of a code], the same
+        self.prompt_len-token layout as compressed_to_denoised's [time, self-condition,
+        code x CV]. The sequence then starts at position self.prompt_len in both uses, so what
+        the shared denoiser learns from MLM lines up with what it does when it decodes."""
         zeros = torch.zeros(batch, device=self.null_self_cond.device)
         time_tok = self.time_embedding(zeros).to(dtype).unsqueeze(1)
         sc_tok = self.null_self_cond.to(dtype).view(1, 1, -1).expand(batch, 1, -1)
