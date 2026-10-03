@@ -10,11 +10,25 @@ from losses.reconstruction import calculate_reconstruction_loss,calculate_token_
 from utils.helper_functions import calculate_mean_similarity,expected_l2_norm,calculate_spherical_uniformity_loss,compute_improved_coverage_loss,arc_cosine_similarity_seq
 from splitter.segment_splitter import SegmentSplitter
 from splitter.stitcher import Stitcher
-from utils.content_id import span_content_id
+from utils.content_id import span_content_id, slot_source_ids
 from torch.distributions import Beta
 
 
 bce = F.binary_cross_entropy
+
+
+def _mark_batch_dynamic(*tensors):
+    """Inputs of the compiled transformer stacks (PlZonkey, COMPILE_TRANSFORMER_STACKS) get a
+    dynamic batch dim from the first call. The stacks also run inside the checkpointed passes:
+    if the first compiled graph were specialized to one batch size, the next new size (e.g. the
+    interface's 128 samples) would add a general graph that dynamo tries first, and a pass
+    recomputed in backward would run a different graph than in its forward (CheckpointError:
+    different number of saved tensors). No-op inside compiled code and for batch <= 1."""
+    if torch.compiler.is_compiling():
+        return
+    for t in tensors:
+        if torch.is_tensor(t) and t.dim() > 0 and t.shape[0] > 1:
+            torch._dynamo.maybe_mark_dynamic(t, 0)
 
 
 @contextlib.contextmanager
@@ -379,6 +393,7 @@ class ZonkeyLayer(nn.Module):
         x0 = torch.cat([self.compressor_cls_emd.expand(x0.shape[0], -1, -1), x0], dim=1)
         existence_probs = torch.cat([self.compressor_cls_existence_probs.expand(x0.shape[0], -1), existence_probs], dim=1)
 
+        _mark_batch_dynamic(x0, existence_probs)
         x = self.compressor(x0, existence_probs)
 
         compressed = x[:, :Config.COMPRESSION_VECTORS[self.level]]
@@ -434,7 +449,10 @@ class ZonkeyLayer(nn.Module):
             # (the 27-step unroll summed every earlier increment into each position and its
             # norm grew with position, 9.5k -> 22k at L0 vs a working scale of 16).
             queries = self.draft_queries.expand(batch_size, -1, -1).to(prompt.dtype)
-            drafted = self.decompressor.decode(torch.cat([prompt, queries], dim=1))[:, prompt_len:, :]
+            # Through __call__ (forward is decode) so a compiled decompressor is used (PlZonkey).
+            draft_in = torch.cat([prompt, queries], dim=1)
+            _mark_batch_dynamic(draft_in)
+            drafted = self.decompressor(draft_in)[:, prompt_len:, :]
             vectors = F.normalize(drafted, p=2, dim=-1) * self.dim_norm
         else:
             # Legacy 27-step self-feeding unroll (kept so old checkpoints decode as trained).
@@ -449,6 +467,7 @@ class ZonkeyLayer(nn.Module):
             self.ones.expand(decompressed.shape[0], -1),
             is_real_inferred
         ], dim=1)
+        _mark_batch_dynamic(decompressed, cum_not_eos_expanded)
         denoised = self.denoiser(decompressed, cum_not_eos_expanded)
         denoised = denoised[:, prompt_len:, :]
         denoised = F.normalize(denoised, p=2, dim=-1) * self.dim_norm
@@ -867,7 +886,8 @@ class ZonkeyLayer(nn.Module):
                 noise_level=noise_level, regression_power=Config.REGRESSION_T_POWER,
                 sample_weight=sample_weight,
                 extra_neg_sim=extra_neg_sim,
-                metric_out=progress, metric_sample_weight=progress_weight)
+                metric_out=progress, metric_sample_weight=progress_weight,
+                source_ids=slot_source_ids(original_position))
 
         dbos_ce_loss = bce(is_real_inferred, is_real_label, reduction='none')[:, 1:].mean() - bce(is_real_label, is_real_label, reduction='none')[:, 1:].mean()
 
@@ -989,21 +1009,36 @@ class ZonkeyLayer(nn.Module):
         B, L, D = input_sequence.shape
         frac = float(getattr(Config, "MLM_ALT_FRACTION", 0.25))
         passes = int(getattr(Config, "MLM_ALT_PASSES", 2))
-        cv = Config.COMPRESSION_VECTORS[self.level]
         r = torch.rand(B, L, device=input_sequence.device)
         guess = torch.zeros_like(input_sequence)
         has = torch.zeros(B, L, dtype=torch.bool, device=input_sequence.device)
         mask_vec = self.mask_vector.view(1, 1, D).to(input_sequence.dtype)
-        existence = torch.cat([self.compressor_cls_existence_probs.expand(B, -1), is_real_inferred], dim=1)
+        prefix = self._mlm_denoiser_prefix(B, input_sequence.dtype)
+        P = prefix.shape[1]
+        existence = torch.cat([torch.ones(B, P, device=is_real_inferred.device, dtype=is_real_inferred.dtype),
+                               is_real_inferred], dim=1)
         for k in range(passes):
             m = (share > 0) & (r >= k * frac) & (r < (k + 1) * frac)
             x = torch.where(m.unsqueeze(-1), mask_vec.expand(B, L, D), input_sequence)
-            x = torch.cat([self.compressor_cls_emd.expand(B, -1, -1).to(x.dtype), x], dim=1)
-            out = self.denoiser(x, existence)[:, cv:]
+            x = torch.cat([prefix, x], dim=1)
+            _mark_batch_dynamic(x, existence)
+            out = self.denoiser(x, existence)[:, P:]
             out = F.normalize(out, p=2, dim=-1) * self.dim_norm
             guess = torch.where(m.unsqueeze(-1), out, guess)
             has = has | m
         return guess, has
+
+    def _mlm_denoiser_prefix(self, batch: int, dtype) -> torch.Tensor:
+        """The denoiser's prompt for sequence (MLM-style) inputs: [time at t=0, null
+        self-condition, the compressor's CLS vectors in place of a code], the same CV + 2
+        token layout as compressed_to_denoised's [time, self-condition, code x CV]. The
+        sequence then sits at the same positions (CV + 2 onward) in both uses, so what the
+        shared denoiser learns from MLM lines up with what it does when it decodes."""
+        zeros = torch.zeros(batch, device=self.null_self_cond.device)
+        time_tok = self.time_embedding(zeros).to(dtype).unsqueeze(1)
+        sc_tok = self.null_self_cond.to(dtype).view(1, 1, -1).expand(batch, 1, -1)
+        cls = self.compressor_cls_emd.expand(batch, -1, -1).to(dtype)
+        return torch.cat([time_tok, sc_tok, cls], dim=1)
 
     def _neighbor_margin(self, codes: torch.Tensor, noisy_codes: torch.Tensor, t_aug: torch.Tensor,
                          ids: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1348,14 +1383,24 @@ class ZonkeyLayer(nn.Module):
                 corrupted_input
             )
         x = corrupted_input
-        x = torch.cat([self.compressor_cls_emd.expand(x.shape[0], -1, -1), x], dim=1)
-        is_real_inferred = torch.cat([self.compressor_cls_existence_probs.expand(x.shape[0], -1), is_real_inferred], dim=1)
-
         if use_compressor:
+            # The compressor's own layout: [CLS x CV; sequence], as in compress().
+            prefix_len = Config.COMPRESSION_VECTORS[self.level]
+            x = torch.cat([self.compressor_cls_emd.expand(x.shape[0], -1, -1), x], dim=1)
+            is_real_inferred = torch.cat([self.compressor_cls_existence_probs.expand(x.shape[0], -1), is_real_inferred], dim=1)
+            _mark_batch_dynamic(x, is_real_inferred)
             x = self.compressor(x, is_real_inferred)
         else:
+            # The denoiser's decode layout (see _mlm_denoiser_prefix).
+            prefix = self._mlm_denoiser_prefix(x.shape[0], x.dtype)
+            prefix_len = prefix.shape[1]
+            x = torch.cat([prefix, x], dim=1)
+            is_real_inferred = torch.cat([
+                torch.ones(x.shape[0], prefix_len, device=is_real_inferred.device, dtype=is_real_inferred.dtype),
+                is_real_inferred], dim=1)
+            _mark_batch_dynamic(x, is_real_inferred)
             x = self.denoiser(x, is_real_inferred)
-        x = x[:,Config.COMPRESSION_VECTORS[self.level]:]
+        x = x[:, prefix_len:]
         encoder_output = F.normalize(x, p=2, dim=-1) * self.dim_norm
 
         doc_mask = is_real_doc_position_boolean.reshape(-1)
@@ -1704,25 +1749,30 @@ class ZonkeyLayer(nn.Module):
         )
 
         # Coverage loss: encourages spread of compressed vectors on the sphere. Only the
-        # filled part of the queue participates (zero rows would corrupt the NN search).
+        # filled part of the queue participates (zero rows would corrupt the NN search): the
+        # whole buffer is passed with a mask of its filled (non-zero) rows. A slice by the
+        # fill count made torch.compile recompile this frame at every new count until it hit
+        # the recompile limit and ran the rest of the run uncompiled.
         # READ-ONLY here: the queue is *not* mutated inside this forward, because under
-        # gradient checkpointing this function is recomputed during backward — mutating
+        # gradient checkpointing this function is recomputed during backward; mutating
         # the queue/count here would make the recompute see a different count than the
         # original forward (shape mismatch). We stash this batch's vectors and push them
         # after backward (PlZonkey.training_step -> push_clean_to_queue).
         clean_uniformity = compute_improved_coverage_loss(
             clean_compressed, doc_ids=doc_ids,
-            memory_queue=self._drifting_queue[:self._drifting_queue_count]
+            memory_queue=self._drifting_queue,
+            memory_valid=self._drifting_queue.abs().amax(dim=-1) > 0,
         )
         self._pending_clean_for_queue = clean_compressed.detach()
         self._pending_ids_for_queue = window_ids.detach() if window_ids is not None else None
 
         # Create fake negatives for the level above: shuffle input vectors across
         # sequences at each position, then compress to get chimeric compressed vectors.
-        # E.g. at level 0 this shuffles chars to make fake words for level 1.
+        # E.g. at level 0 this shuffles chars to make fake words for level 1. The top level
+        # has no level above to use them, so it skips this.
         num_fake = Config.NUM_FAKE_NEGATIVES[self.level]
         batch_size_c = input_sequence.shape[0]
-        if num_fake > 0 and batch_size_c > 1:
+        if num_fake > 0 and batch_size_c > 1 and self.level < Config.AGENT_LEVELS - 1:
             num_fake = min(num_fake, batch_size_c)
             seq_len_c = input_sequence.shape[1]
             device = input_sequence.device
@@ -2021,9 +2071,11 @@ class ZonkeyLayer(nn.Module):
                 x_t = (
                     self._sphere_exp_map(x_t_unit, step_tangent) * self.upwards_norm
                 ).view(batch_size, compression_vectors, d_model)
-            # Final clean decode at t=0 for the sharpest token vectors.
+            # Final clean decode at t=0 for the sharpest token vectors, with the null
+            # self-condition token: decoding at t=0 is trained only by the clean pass, which
+            # never has a self-condition (the FM pass reaches t=0 in ~0.1% of its samples).
             final_t = torch.zeros(batch_size, device=device)
-            denoised, is_real_inferred = self.compressed_to_denoised(x_t, final_t, self_cond=self_cond)
+            denoised, is_real_inferred = self.compressed_to_denoised(x_t, final_t, self_cond=None)
 
         bos_probability_final = self.compute_bos_probability(denoised)
         is_real_inferred_final = self.bos_probs_to_inferred_real_position(bos_probability_final)

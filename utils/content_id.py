@@ -46,3 +46,13 @@ def span_content_id(prefix_hash_b: torch.Tensor, pow_tab: torch.Tensor, doc: tor
     h = torch.remainder(prefix_hash_b[doc, b_c] - ha, HASH_MOD)
     ids = h * (max_len + 1) + (b_c - a_c)                 # length folded in; below 2**41
     return torch.where(ok, ids, torch.full_like(ids, -1))
+
+
+def slot_source_ids(original_position):
+    """[windows, slots] id of the document position each window slot holds (document and
+    position packed into one int64), or None. Unlike a content id this is the instance, not
+    the text: windows overlap, so one child sits in the slots of several windows, and equal
+    source ids mean the very same vector."""
+    if original_position is None:
+        return None
+    return original_position[..., 0].long() * (1 << 32) + original_position[..., 1].long()

@@ -184,3 +184,8 @@ class Config:
     # Cheap no-grad diagnostics logged as level_n/metric_* every N optimizer steps.
     DIAGNOSTICS_EVERY_N_STEPS = 250
 
+    # Compile each level's compressor, decompressor and denoiser in place (PlZonkey), so
+    # they also run compiled inside the checkpointed denoise passes, which execute outside
+    # torch.compile. Same math; set False to fall back if a torch version misbehaves.
+    COMPILE_TRANSFORMER_STACKS = True
+

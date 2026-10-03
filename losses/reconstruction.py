@@ -137,11 +137,15 @@ def calculate_reconstruction_loss(
     extra_neg_sim=None,
     metric_out=None,
     metric_sample_weight=None,
+    source_ids=None,
 ):
     # extra_neg_sim: optional [batch, seq_len, K] cosines of the prediction to extra negatives
     # (context guesses, mined neighbours), -1 where unavailable; appended after the fakes.
     # metric_out: optional dict; receives "value", the loss (no grad) without the extra
     # negatives and with metric_sample_weight in place of sample_weight (loss/progress).
+    # source_ids: optional [batch, seq_len] id of the document position each target slot holds.
+    # Windows overlap, so one child sits in the slots of several windows; a random negative
+    # with the target's source id would be the target vector itself, and is redrawn.
     batch, seq_len, hidden = denoised.shape
     device = denoised.device
     
@@ -255,19 +259,29 @@ def calculate_reconstruction_loss(
         target_norm = F.normalize(target_flat, p=2, dim=-1)
         
         pos_sim = torch.sum(denoised_norm * target_norm, dim=-1)
-        
+
         sample_probs = is_real_flat.float() / (is_real_flat.float().sum() + Config.EPS)
         sampled_indices = torch.multinomial(
             sample_probs, N * num_negatives, replacement=True
         ).reshape(N, num_negatives)
-        
+
         self_indices = torch.arange(N, device=device).unsqueeze(1)
-        collision_mask = (sampled_indices == self_indices)
-        while collision_mask.any():
-            num_collisions = collision_mask.sum().item()
+        if source_ids is not None:
+            src = source_ids.reshape(-1).to(device)
+
+            def collisions(idx):
+                return src[idx] == src.unsqueeze(1)   # includes idx == self
+        else:
+            def collisions(idx):
+                return idx == self_indices
+        collision_mask = collisions(sampled_indices)
+        for _ in range(64):   # each round redraws only the colliding entries; a few rounds suffice
+            if not bool(collision_mask.any()):
+                break
+            num_collisions = int(collision_mask.sum().item())
             sampled_indices[collision_mask] = torch.multinomial(sample_probs, num_collisions, replacement=True)
-            collision_mask = (sampled_indices == self_indices)
-        
+            collision_mask = collisions(sampled_indices)
+
         fake_neg_norm = None
         if fake_negatives is not None and fake_negatives.shape[0] > 0:
             fake_neg_norm = F.normalize(fake_negatives, p=2, dim=-1)

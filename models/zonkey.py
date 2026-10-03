@@ -91,6 +91,19 @@ class PlZonkey(pl.LightningModule):
         self.automatic_optimization = False
         self.model = Zonkey()
         self.model.compile()
+        if getattr(Config, "COMPILE_TRANSFORMER_STACKS", False):
+            # The denoise passes run outside dynamo (torch.utils.checkpoint disables it for
+            # everything it calls, and in "passes" scope the pass is wrapped in
+            # torch._dynamo.disable), so the stacks inside them ran uncompiled, about half of
+            # all compute. A module compiled in place still runs compiled there; called from
+            # an already compiled frame it is simply inlined. Parameter names are unchanged.
+            for layer in self.model.layers:
+                for stack in (layer.compressor, layer.decompressor, layer.denoiser):
+                    stack.compile()
+            # Every stack shares nn.Module._call_impl, and each level, grad mode and batch
+            # shape is its own compiled variant: the default limit of 8 per frame would be
+            # used up and the rest would silently run uncompiled.
+            torch._dynamo.config.recompile_limit = max(int(torch._dynamo.config.recompile_limit), 64)
         self.tb_writer = writer
         # EMA of weights (generation samples from the EMA copy). Stored on CPU to
         # keep GPU memory free; updated in place (one persistent buffer, not realloc).

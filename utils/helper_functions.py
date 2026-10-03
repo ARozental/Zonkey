@@ -321,13 +321,15 @@ def compute_improved_coverage_loss(
     z: torch.Tensor,
     doc_ids: Optional[torch.Tensor] = None,
     memory_queue: Optional[torch.Tensor] = None,   # (Q, flat_dim) — already flattened + normalized
+    memory_valid: Optional[torch.Tensor] = None,   # (Q,) bool, False for unfilled queue rows
 ) -> torch.Tensor:
     """Document-aware nearest-neighbor entropy (KoLeo) loss.
-    
+
     - z shape: (B, C, D) → flattened to (B, flat_dim = C*D) exactly as you already do
     - Nearest-neighbor search **only across different documents** (same-doc vectors are ignored)
-    - Optional memory queue (_drifting_queue) for global coverage on small batches
-    - Pure dot-product on the sphere, no cdist, no extra arguments
+    - Optional memory queue (_drifting_queue) for global coverage on small batches; rows with
+      memory_valid False never count as neighbours (pass the whole buffer, no slicing)
+    - Pure dot-product on the sphere, no cdist
     """
     B = z.shape[0]
     z_flat = z.view(B, -1)                                      # (B, flat_dim)
@@ -351,6 +353,8 @@ def compute_improved_coverage_loss(
     if mem_size > 0:
         eye = torch.eye(B, dtype=torch.bool, device=z.device)
         invalid[:, mem_size:] = eye
+        if memory_valid is not None:
+            invalid[:, :mem_size] |= ~memory_valid.view(1, -1)
     else:
         invalid |= torch.eye(B, dtype=torch.bool, device=z.device)
 
@@ -368,17 +372,17 @@ def compute_improved_coverage_loss(
         else:
             invalid |= same_doc
 
-    valid_rows = (~invalid).any(dim=1)
-    if not bool(valid_rows.any()):
-        return z_norm.sum() * 0.0
-
     # Nearest neighbor on the unit sphere. KoLeo maximizes local distance by
     # minimizing -log(distance); average per sample rather than a batch-wide
     # logsumexp whose baseline and gradients depend strongly on batch size.
+    # Rows without any valid neighbour are left out of the mean (masked, not indexed, so the
+    # frame has no data-dependent shape; 0 when no row has a neighbour, as before).
+    valid_rows = (~invalid).any(dim=1).to(z_norm.dtype)
     sim = sim.masked_fill(invalid, -1e9)
-    max_sim_nn = torch.max(sim[valid_rows], dim=1)[0].clamp(-1.0, 1.0)
+    max_sim_nn = torch.max(sim, dim=1)[0].clamp(-1.0, 1.0)
     nearest_distance = torch.sqrt((2.0 - 2.0 * max_sim_nn).clamp_min(Config.EPS))
-    return -torch.log(nearest_distance.clamp_min(Config.EPS)).mean()
+    per_row = -torch.log(nearest_distance.clamp_min(Config.EPS))
+    return (per_row * valid_rows).sum() / valid_rows.sum().clamp_min(1.0)
 
 
 def compute_drifting_loss(

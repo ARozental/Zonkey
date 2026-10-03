@@ -8,6 +8,7 @@ from models.transformer import TransformerEncoderLayer
 from configs.default_config import Config
 from losses.reconstruction import calculate_reconstruction_loss, calculate_token_loss
 from utils.helper_functions import expected_l2_norm
+from utils.content_id import slot_source_ids
 """
 This is a module that stitches together the denoised sequences into a single sequence.
 It takes denoised_input_sequences <sentences_batch, sentence_len, d_model> and returns <doc_batch, doc_len, d_model>
@@ -168,19 +169,20 @@ class Stitcher(nn.Module):
         
         return interval_loss
     
-    def get_sequence_loss(self, inferred_input_sequence1, original_input_sequence1, p_exist_share1, all_tokens=None, is_real_inferred1=None, previous_denoised1=None):
+    def get_sequence_loss(self, inferred_input_sequence1, original_input_sequence1, p_exist_share1, all_tokens=None, is_real_inferred1=None, previous_denoised1=None, source_ids1=None):
         """
-        This works at a single doc level now. 
+        This works at a single doc level now.
         """
-        
+
         if self.level > 0:
             loss,_ = calculate_reconstruction_loss(
-                denoised=inferred_input_sequence1, 
+                denoised=inferred_input_sequence1,
                 is_real_inferred=is_real_inferred1,
-                target_sequences=original_input_sequence1, 
-                splitter_existence_share=p_exist_share1, 
-                previous_denoised=previous_denoised1, 
-                num_negatives=63
+                target_sequences=original_input_sequence1,
+                splitter_existence_share=p_exist_share1,
+                previous_denoised=previous_denoised1,
+                num_negatives=63,
+                source_ids=source_ids1,
             )
         else:
             loss, _ = calculate_token_loss(all_tokens, inferred_input_sequence1, p_exist_share1, self.token_embedding_layer)
@@ -198,7 +200,8 @@ class Stitcher(nn.Module):
         original_input_sequence1=None, 
         p_exist_share1=None,
         all_tokens=None,
-        previous_denoised1=None
+        previous_denoised1=None,
+        source_ids1=None,
         ):
         """
         input_sequences are of shape [batch, seq_len, d_model]
@@ -218,7 +221,7 @@ class Stitcher(nn.Module):
         
         k = denoised2_start_position.round().clamp(0, self.max_seq_len).long().view(batch_size)
         position_loss = self.get_position_loss(denoised2_start_position, inferred_denoised2_start_position, p_exist_share1)
-        sequence_loss = self.get_sequence_loss(inferred_input_sequence1, original_input_sequence1, p_exist_share1, all_tokens=all_tokens, is_real_inferred1=denoised_is_real_position1, previous_denoised1=previous_denoised1)
+        sequence_loss = self.get_sequence_loss(inferred_input_sequence1, original_input_sequence1, p_exist_share1, all_tokens=all_tokens, is_real_inferred1=denoised_is_real_position1, previous_denoised1=previous_denoised1, source_ids1=source_ids1)
 
         
        
@@ -327,20 +330,21 @@ class Stitcher(nn.Module):
             p_exist_batch = all_p_exist_share[left_indices] if all_p_exist_share is not None else None
             tokens_batch = all_tokens[left_indices] if all_tokens is not None else None
             previous_denoised1_batch = previous_denoised[left_indices] if previous_denoised is not None else None
-            
+            source_ids1_batch = slot_source_ids(original_position[left_indices]) if original_position is not None else None
+
             # Call Merge
             inferred_batch, pos_losses, seq_losses, k_batch = self.merge_2_sequences(
                 seq1_batch, is_real1_batch, seq2_batch, is_real2_batch,
                 delta_batch, original_batch, p_exist_batch, all_tokens=tokens_batch,
-                previous_denoised1=previous_denoised1_batch
+                previous_denoised1=previous_denoised1_batch,
+                source_ids1=source_ids1_batch,
             )
-            
-            # Accumulate Losses
-            total_position_loss = pos_losses.sum()
-            if seq_losses.numel() > 1:
-                total_sequence_loss = seq_losses.sum()
-            else:
-                total_sequence_loss = seq_losses
+
+            # Mean over pairs. The position loss comes per pair; the sequence loss is already
+            # a mean over every position of every pair, so it is not divided again (it was
+            # divided by the number of pairs a second time, reading ~380x too small at L0).
+            total_position_loss = pos_losses.mean()
+            total_sequence_loss = seq_losses.mean()
             
             # --- Reconstruct Output ---
             current_pair_idx = 0
@@ -386,14 +390,6 @@ class Stitcher(nn.Module):
                 current_pair_idx += count
 
 
-        total_pairs = 0
-        if multi_sent_mask.any():
-            total_pairs = (num_seq_per_doc_filtered[multi_sent_mask] - 1).sum().item()
-            
-        if total_pairs > 0:
-            total_position_loss = total_position_loss / total_pairs
-            total_sequence_loss = total_sequence_loss / total_pairs # Assuming seq loss is per-pair
-            
         return all_patches, total_position_loss, total_sequence_loss
 
 

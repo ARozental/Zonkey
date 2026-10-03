@@ -149,55 +149,29 @@ class DecoderAttention(nn.Module):
             cache_len = kv_cache['k'].shape[2]
             Q = self.pos(Q, seq_len, offset=cache_len)
             K = self.pos(K, seq_len, offset=cache_len)
-            
+
             # Concatenate with cached K, V
             K = torch.cat([kv_cache['k'], K], dim=2)
             V = torch.cat([kv_cache['v'], V], dim=2)
-            
+
             # Update total sequence length for masking
             total_seq_len = K.shape[2]
-        else:
-            # Normal forward pass
-            Q = self.pos(Q, seq_len)
-            K = self.pos(K, seq_len)
-            total_seq_len = seq_len
-                
-        # Compute attention scores
-        scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
 
-        
-        # Pre-allocate mask if we'll need it
-        mask = None
-        if mask is None:
-            mask = self.zeros.expand_as(scores)
-            
-        if kv_cache is not None:
-            # Only mask the new query positions against future keys
+            # Compute attention scores; only mask the new query positions against future keys
+            scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
             causal = torch.triu(
                 self.ones.expand(seq_len, total_seq_len)  * float('-inf'),
-                # torch.ones(seq_len, total_seq_len, device=x.device, dtype=scores.dtype) * float('-inf'),
                 diagonal=cache_len + 1
             )
+            scores = scores + causal.unsqueeze(0).unsqueeze(0)
+            attn_weights = F.softmax(scores, dim=-1).to(scores.dtype)
+            attn_output = torch.matmul(attn_weights, V)
         else:
-            causal = torch.triu(
-                self.ones.expand(seq_len, total_seq_len)  * float('-inf'),
-                # torch.ones(total_seq_len, total_seq_len, device=x.device, dtype=scores.dtype) * float('-inf'),
-                diagonal=1
-            )
-        mask = mask + causal.unsqueeze(0).unsqueeze(0)
-        
-        # Apply combined mask if any
-        if mask is not None:
-            scores = scores + mask
-        
-        # Apply softmax and dropout
-        attn_weights = F.softmax(scores, dim=-1).to(scores.dtype)
-        
-        # attn_weights = torch.nan_to_num(attn_weights, 0.0)  # More efficient than where + isfinite
-        # attn_weights = self.dropout(attn_weights)
-        
-        # Apply attention to values
-        attn_output = torch.matmul(attn_weights, V)
+            # Normal forward pass: plain causal attention (dropout was never applied here), the
+            # same math as an explicit -inf upper-triangle mask, in one fused kernel.
+            Q = self.pos(Q, seq_len)
+            K = self.pos(K, seq_len)
+            attn_output = F.scaled_dot_product_attention(Q, K, V, is_causal=True, scale=self.scale)
         
         # === XSA: main trick from https://arxiv.org/abs/2603.09078 (Exclusive Self-Attention) ===
         # Make attention output orthogonal to the token's own value vector (2 lines, drop-in)
