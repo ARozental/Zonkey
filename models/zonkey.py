@@ -543,8 +543,9 @@ class PlZonkey(pl.LightningModule):
                             noise_level=Config.NOISE_LAST_STEP_SIZE[level], existance_cutoff=0.1,
                             lower_t=0.0)
                         print(f"random seq from level {level}: ")
+                        # None: this level's SAMPLE_STEPS and SAMPLER (see default_config).
                         self.model.generate_sequence_from_level_N(
-                            level, num_diffusion_steps=Config.DIFFUSION_STEPS, noise_level=1.0,
+                            level, num_diffusion_steps=None, noise_level=1.0,
                             existance_cutoff=0.1, lower_t=0.0)
 
 

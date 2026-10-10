@@ -1980,6 +1980,13 @@ class ZonkeyLayer(nn.Module):
         # span_out / id_out are the next level's child_spans / child_ids.
         return denoised, is_real_inferred, compressed, losses, stitched_docs, is_real, fake_negatives_for_upper, span_out, id_out
 
+    def _level_setting(self, name: str, default):
+        """This level's entry of a per-level Config list, or `default` when unset."""
+        values = getattr(Config, name, None)
+        if values is None or self.level >= len(values) or values[self.level] is None:
+            return default
+        return values[self.level]
+
     @torch.no_grad()
     def generate(
         self,
@@ -2042,13 +2049,18 @@ class ZonkeyLayer(nn.Module):
             x_t = noise_flat.view(batch_size, compression_vectors, d_model)
             t_start = torch.full((batch_size,), noise_level_scalar, device=device, dtype=x_t.dtype)
 
-        # === Integrate the probability-flow ODE (data-prediction / DDIM-on-sphere) ===
+        # === Sample from t_start down to 0 (data prediction on the sphere) ===
         # The grid is even in schedule position u (u_to_t), the same map training samples
-        # through. num_diffusion_steps=None keeps the training step size: 1/DIFFUSION_STEPS
-        # in u, also for partial starts; 0 means a single evaluation at t_start.
+        # through. num_diffusion_steps=None uses this level's SAMPLE_STEPS for a start from pure
+        # noise (DIFFUSION_STEPS if unset), scaled by u_start for partial starts; 0 means a
+        # single evaluation at t_start. The update between steps is this level's SAMPLER.
         u_start = float(self.t_to_u(torch.tensor([float(noise_level_scalar)], dtype=torch.float64))[0])
         if num_diffusion_steps is None:
-            num_diffusion_steps = max(1, int(round(u_start * Config.DIFFUSION_STEPS)))
+            full_steps = self._level_setting("SAMPLE_STEPS", Config.DIFFUSION_STEPS)
+            num_diffusion_steps = max(1, int(round(u_start * full_steps)))
+        sampler = self._level_setting("SAMPLER", "ode")
+        if sampler not in ("ode", "renoise"):
+            raise ValueError(f"SAMPLER[{self.level}] must be 'ode' or 'renoise', got {sampler!r}")
         if num_diffusion_steps <= 0:
             # Single denoiser evaluation at t_start (used to decode a known compressed
             # vector, optionally with a little noise).
@@ -2066,16 +2078,26 @@ class ZonkeyLayer(nn.Module):
                 x1_hat = self.compress(denoised, is_real_inferred)
                 if Config.USE_SELF_COND:
                     self_cond = x1_hat  # feed this step's estimate to the next step
-                # Integrate the same backward tangent field used by the flow loss.
-                # If x1_hat is exact this equals the old delta_t/t SLERP; unlike endpoint
-                # cosine training, the learned objective now measures this actual field.
                 x_t_unit = F.normalize(x_t.reshape(batch_size, -1), p=2, dim=-1)
                 x1_unit = F.normalize(x1_hat.reshape(batch_size, -1), p=2, dim=-1)
-                velocity = self._sphere_log_map(x_t_unit, x1_unit) / t_cur.clamp(min=1e-3)
-                step_tangent = velocity * (t_cur - t_next)
-                x_t = (
-                    self._sphere_exp_map(x_t_unit, step_tangent) * self.upwards_norm
-                ).view(batch_size, compression_vectors, d_model)
+                if sampler == "renoise":
+                    # Re-noise this step's estimate to the next noise level with fresh noise:
+                    # the next state is "estimate + noise at t_next" with the estimate as the
+                    # self-condition, exactly the dirty pass's training input (at any step size),
+                    # so the sampler never leaves the states the model was trained on.
+                    if float(t_next) > 0:
+                        x_t = self.add_noise(x1_hat, t_next.expand(batch_size))
+                    else:
+                        x_t = (x1_unit * self.upwards_norm).view(batch_size, compression_vectors, d_model)
+                else:
+                    # Integrate the same backward tangent field used by the flow loss.
+                    # If x1_hat is exact this equals the old delta_t/t SLERP; unlike endpoint
+                    # cosine training, the learned objective now measures this actual field.
+                    velocity = self._sphere_log_map(x_t_unit, x1_unit) / t_cur.clamp(min=1e-3)
+                    step_tangent = velocity * (t_cur - t_next)
+                    x_t = (
+                        self._sphere_exp_map(x_t_unit, step_tangent) * self.upwards_norm
+                    ).view(batch_size, compression_vectors, d_model)
             # Final clean decode at t=0 for the sharpest token vectors, with the null
             # self-condition token: decoding at t=0 is trained only by the clean pass, which
             # never has a self-condition (the FM pass reaches t=0 in ~0.1% of its samples).

@@ -184,6 +184,15 @@ class Config:
     # Cheap no-grad diagnostics logged as level_n/metric_* every N optimizer steps.
     DIAGNOSTICS_EVERY_N_STEPS = 250
 
+    # Generation only (ZonkeyLayer.generate from noise; training never uses it). SAMPLER per
+    # level: "ode" follows the probability-flow ODE from the current state; "renoise" predicts
+    # the clean code at every step and re-noises it to the next noise level with fresh noise,
+    # the input the dirty pass trains on. SAMPLE_STEPS: steps for a start from pure noise.
+    # At 1.06M (EMA, 96 samples, share of words in a word list): L1 ode 0.44, renoise 0.75 at 30
+    # steps, 0.88 at 100 (real text 0.90); L0 ode 0.61, renoise 0.50, so L0 stays on the ODE.
+    SAMPLER = ["ode", "renoise"]
+    SAMPLE_STEPS = [30, 100]
+
     # Compile each level's compressor, decompressor and denoiser in place (PlZonkey), so
     # they also run compiled inside the checkpointed denoise passes, which execute outside
     # torch.compile. Same math; set False to fall back if a torch version misbehaves.
