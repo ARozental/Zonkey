@@ -225,6 +225,92 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
         return loss
 
 
+class FastSingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
+    """SingleDeviceMuonWithAuxAdam with the same update and the same per-parameter state (so
+    checkpoints load either way), batched: the momentum and Adam moments are updated with foreach
+    ops over the whole group, and the Newton-Schulz iteration runs once per group of same-shape
+    matrices, stacked. The per-parameter loop launched ~25 kernels per matrix (~12k per step)."""
+    def __init__(self, param_groups):
+        for group in param_groups:
+            assert "use_muon" in group
+            if group["use_muon"]:
+                group["lr"] = group.get("lr", 0.02)
+                group["momentum"] = group.get("momentum", 0.95)
+                group["weight_decay"] = group.get("weight_decay", 0)
+                assert set(group.keys()) == set(["params", "lr", "momentum", "weight_decay", "use_muon"])
+            else:
+                group["lr"] = group.get("lr", 3e-4)
+                group["betas"] = group.get("betas", (0.9, 0.95))
+                group["eps"] = group.get("eps", 1e-10)
+                group["weight_decay"] = group.get("weight_decay", 0)
+                assert set(group.keys()) == set(["params", "lr", "betas", "eps", "weight_decay", "use_muon"])
+        super().__init__(param_groups, dict())
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            params = list(group["params"])
+            if not params:
+                continue
+            for p in params:
+                if p.grad is None:
+                    p.grad = torch.zeros_like(p)
+            grads = [p.grad for p in params]
+            lr, wd = group["lr"], group["weight_decay"]
+            if group["use_muon"]:
+                bufs = []
+                for p in params:
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["momentum_buffer"] = torch.zeros_like(p)
+                    bufs.append(state["momentum_buffer"])
+                beta = group["momentum"]
+                torch._foreach_lerp_(bufs, grads, 1 - beta)
+                torch._foreach_lerp_(grads, bufs, beta)          # nesterov, in place as muon_update
+                by_shape = {}
+                for i, p in enumerate(params):
+                    by_shape.setdefault(tuple(p.shape), []).append(i)
+                updates = [None] * len(params)
+                for shape, idx in by_shape.items():
+                    G = torch.stack([grads[i].reshape(shape[0], -1) for i in idx])
+                    U = zeropower_via_newtonschulz5(G, steps=5)
+                    U *= max(1, G.size(-2) / G.size(-1)) ** 0.5
+                    U = U.to(params[idx[0]].dtype)                    # foreach needs one dtype
+                    for j, i in enumerate(idx):
+                        updates[i] = U[j].reshape(params[i].shape)
+                if wd:
+                    torch._foreach_mul_(params, 1 - lr * wd)
+                torch._foreach_add_(params, updates, alpha=-lr)
+            else:
+                b1, b2 = group["betas"]
+                by_step = {}
+                for p in params:
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["exp_avg"] = torch.zeros_like(p)
+                        state["exp_avg_sq"] = torch.zeros_like(p)
+                        state["step"] = 0
+                    state["step"] += 1
+                    by_step.setdefault(state["step"], []).append(p)
+                for step, ps in by_step.items():
+                    m = [self.state[p]["exp_avg"] for p in ps]
+                    v = [self.state[p]["exp_avg_sq"] for p in ps]
+                    g = [p.grad for p in ps]
+                    torch._foreach_lerp_(m, g, 1 - b1)
+                    torch._foreach_lerp_(v, torch._foreach_mul(g, g), 1 - b2)
+                    denom = torch._foreach_sqrt(torch._foreach_div(v, 1 - b2 ** step))
+                    torch._foreach_add_(denom, group["eps"])
+                    upd = torch._foreach_div(torch._foreach_div(m, 1 - b1 ** step), denom)
+                    if wd:
+                        torch._foreach_mul_(ps, 1 - lr * wd)
+                    torch._foreach_add_(ps, upd, alpha=-lr)
+        return loss
+
+
 class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
     """
     Non-distributed variant of MuonWithAuxAdam.

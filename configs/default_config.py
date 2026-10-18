@@ -192,9 +192,45 @@ class Config:
     # steps, 0.88 at 100 (real text 0.90); L0 ode 0.61, renoise 0.50, so L0 stays on the ODE.
     SAMPLER = ["ode", "renoise"]
     SAMPLE_STEPS = [30, 100]
+    # renoise only: re-noise to SAMPLE_RENOISE_SCALE * t_next (label t_next); < 1 is a lower
+    # sampling temperature. 2.09M L1: 0.84/0.73 at 1.0, 0.91/0.85 at 0.8 (100 steps).
+    SAMPLE_RENOISE_SCALE = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 
     # Compile each level's compressor, decompressor and denoiser in place (PlZonkey), so
     # they also run compiled inside the checkpointed denoise passes, which execute outside
     # torch.compile. Same math; set False to fall back if a torch version misbehaves.
     COMPILE_TRANSFORMER_STACKS = True
+
+    # Per-level LR multipliers (both optimizer groups), e.g. [0.3, 0.3, 1.0] when a new level is
+    # trained on top of trained ones. None: one LR for all levels (and the old optimizer layout).
+    LEVEL_LR_SCALE = None
+
+    # ---- Speed (same method) ----
+    # Batched Muon/Adam step (muon.FastSingleDeviceMuonWithAuxAdam): same update, same state.
+    FAST_OPTIMIZER = True
+    # bf16 autocast inside the transformer stacks only; their outputs and every loss stay fp32.
+    STACK_BF16 = False
+
+    # ---- Component switches (defaults = the full method; the ablations turn them off) ----
+    # Stitcher: training losses (clean-pass position/sequence, null_*) and generation assembly.
+    # Off: windows are assembled by ASSEMBLY ("align": cut where the next window's first positions
+    # match, "concat": existence > ASSEMBLY_CUTOFF). On the 2.09M model (exact L1 reconstruction):
+    # stitcher 0.896, stitcher without its refinement 0.896, align 0.833, concat 0.333.
+    STITCHER = True
+    STITCHER_REFINE = True          # cross-attention refinement of the overlap (no measured effect)
+    STITCHER_SEQUENCE_LOSS = True   # reconstruction of the refined overlap (clean pass)
+    STITCHER_NULL_LOSSES = True     # position/sequence losses on the input windows themselves
+    ASSEMBLY = "align"
+    ASSEMBLY_MATCH_WEIGHT = 4.0
+    ASSEMBLY_MATCH_LEN = 4
+    ASSEMBLY_CUTOFF = 0.5
+    # The three MLM losses per level (clean via denoiser and compressor, MLM on the clean decode).
+    MLM_LOSSES = True
+    # Generative passes. FM_PASS: the flow-matching pass (true-code-centered input, flow loss).
+    # DIRTY_TRUE_CODE_PROB: share of the dirty pass's samples centered on the true code with a
+    # null self-condition instead of on the model's estimate (1 pass covering both cases).
+    # DIRTY_FLOW_LOSS: the flow-velocity loss on the dirty pass's estimate as well.
+    FM_PASS = True
+    DIRTY_TRUE_CODE_PROB = 0.0
+    DIRTY_FLOW_LOSS = False
 

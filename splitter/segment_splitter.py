@@ -23,7 +23,7 @@ class LinearEncoder(nn.Module):
             d_model=d_model,
             n_heads=Config.NUM_HEADS[level],
             d_ff=d_model * Config.FF_DIM_RATIO,
-            max_seq_len=Config.MAX_DOC_LENGTHS[level],
+            max_seq_len=Config.MAX_DOC_LENGTHS[level] * child_tokens(level),
             dropout=Config.DROPOUT,
             num_layers=1,
             window_size=Config.MAX_SEQ_LENGTHS[level]
@@ -50,7 +50,7 @@ class LinearEncoder(nn.Module):
         
         self.proj = nn.Linear(d_model+4*self.cnn_features, 1)
         self.bias = nn.Parameter(torch.zeros(1),requires_grad=True)
-        self.initial_bias = nn.Parameter(inverse_sigmoid(torch.tensor(2/Config.MAX_SEQ_LENGTHS[self.level],device=Config.DEVICE)),requires_grad=False)
+        self.initial_bias = nn.Parameter(inverse_sigmoid(torch.tensor(2 * child_tokens(level) / Config.MAX_SEQ_LENGTHS[self.level],device=Config.DEVICE)),requires_grad=False)
         self.sqrt_d = math.sqrt(Config.D_MODEL[level])
     
     def forward(self, x):
@@ -85,16 +85,31 @@ class LinearEncoder(nn.Module):
         x = x.squeeze(-1)
         return x
 
+def child_tokens(level):
+    """Tokens per child at `level`: a child (one code of level-1, CV x d values) is read as
+    CV[level-1] * D[level-1] / D[level] consecutive tokens of width D[level] (1 when the level
+    widens by CV, CV when it keeps the width). Level 0 reads one character per token."""
+    if level == 0:
+        return 1
+    total = Config.COMPRESSION_VECTORS[level - 1] * Config.D_MODEL[level - 1]
+    assert total % Config.D_MODEL[level] == 0, f"level {level}: child code {total} not a multiple of D_MODEL {Config.D_MODEL[level]}"
+    return total // Config.D_MODEL[level]
+
+
 class SegmentSplitter(nn.Module):
     def __init__(self, level, max_num_sentences=70):
         super().__init__()
         self.level = level
         self.d_model = Config.D_MODEL[level]
-        self.max_seq_len = Config.MAX_DOC_LENGTHS[level]
+        # Positions are tokens; a level with k tokens per child places boundaries only at child
+        # starts (multiples of k) and every length below is in tokens (multiples of k).
+        self.k = child_tokens(level)
+        self.max_seq_len = Config.MAX_DOC_LENGTHS[level] * self.k
         self.max_sentence_length = Config.MAX_SEQ_LENGTHS[level]
+        assert self.max_sentence_length % self.k == 0, "MAX_SEQ_LENGTHS (tokens) must be a multiple of the child tokens"
         min_len = getattr(Config, "MIN_SEGMENT_LENGTH", [None] * (level + 1))
         min_len = min_len[level] if level < len(min_len) else None
-        self.min_sentence_length = int(min_len) if min_len is not None else Config.COMPRESSION_VECTORS[level]
+        self.min_sentence_length = int(min_len) if min_len is not None else Config.COMPRESSION_VECTORS[level] * self.k
         self.max_num_sentences = max_num_sentences #per batch
         # Per-document cap: a document never needs more segments than the level above
         # consumes (MAX_DOC_LENGTHS[level+1]); the old `// 2` cap let two long documents
@@ -305,6 +320,11 @@ class SegmentSplitter(nn.Module):
             bos_probs = torch.ones_like(bos_probs)
         bos_probs[:, 0] = 1
         bos_probs = torch.clip(bos_probs, Config.EPS, 1 - Config.EPS)
+        child_start = None
+        if self.k > 1:
+            # Boundaries only between children: the other tokens of a child never start a window.
+            child_start = (torch.arange(full_seq_len, device=bos_probs.device) % self.k == 0).unsqueeze(0)
+            bos_probs = torch.where(child_start, bos_probs, torch.full_like(bos_probs, Config.EPS))
         bos_probs = bos_probs * is_real_position
         
         device = input_sequence.device
@@ -317,6 +337,8 @@ class SegmentSplitter(nn.Module):
             my_random = torch.rand_like(bos_probs)
         my_random[:, 0] = 0  # Forces the first token to be BOS
         is_bos_by_random = my_random < bos_probs
+        if child_start is not None:
+            is_bos_by_random = is_bos_by_random & child_start
 
         patch_loss = self.compute_mean_p_no_bos_patch(bos_probs, is_real_position, max_sentence_length)
         patch_loss = patch_loss + self.compute_mean_p_no_bos_patch(bos_probs, is_real_position, max_sentence_length+1)
@@ -488,8 +510,9 @@ class SegmentSplitter(nn.Module):
             current_idx += num_sent_b
 
         if total_num_sentences > 0:
-            # bos_per_position = all_sentence_bos_probs.sum() / all_sentence_is_real.sum()
-            bos_per_position = (bos_probs[:,1:] * is_real_position[:,1:]).sum() / is_real_position[:,1:].sum()
+            # Boundary rate per child (per position at k = 1): only child starts can be boundaries.
+            counted = is_real_position[:, 1:] if child_start is None else is_real_position[:, 1:] * child_start[:, 1:]
+            bos_per_position = (bos_probs[:,1:] * counted).sum() / counted.sum()
         
         all_p_exist_weight = all_p_exist_share * all_sentence_is_real
         # num_main_total = total_num_sentences

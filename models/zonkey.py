@@ -12,7 +12,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from configs.default_config import Config
 from models.zonkey_layer import ZonkeyLayer
 from utils.content_id import prefix_hash_tensor, pow_table
-from muon import SingleDeviceMuonWithAuxAdam, MuonWithAuxAdam
+from muon import SingleDeviceMuonWithAuxAdam, MuonWithAuxAdam, FastSingleDeviceMuonWithAuxAdam
 import torch.distributed as dist
 
 # Detached / logging-only keys. Including them in the mean rescales real losses
@@ -259,7 +259,7 @@ class PlZonkey(pl.LightningModule):
                 # Lightning restored optimizer state clobbers base_lr with the OLD
                 # checkpoint value; re-assert it from the CURRENT config (peak LRs).
                 group["base_lr"] = (Config.MUON_LR if group.get("use_muon")
-                                    else Config.LEARNING_RATE)
+                                    else Config.LEARNING_RATE) * float(group.get("level_lr_scale", 1.0))
                 group["lr"] = group["base_lr"] * factor
         print(f"LR schedule: {getattr(Config, 'LR_SCHEDULE', 'cosine')}, schedule step {self._schedule_step()}, "
               f"factor {factor:.4f}, horizon {Config.LR_DECAY_STEPS}, floor {Config.MIN_LR_RATIO}")
@@ -324,7 +324,7 @@ class PlZonkey(pl.LightningModule):
         if 'optimizer_states' in checkpoint:
             for opt_state in checkpoint['optimizer_states']:
                 for group in opt_state.get('param_groups', []):
-                    new_lr = Config.MUON_LR if group.get('use_muon') else Config.LEARNING_RATE
+                    new_lr = (Config.MUON_LR if group.get('use_muon') else Config.LEARNING_RATE) * float(group.get('level_lr_scale', 1.0))
                     group['lr'] = new_lr
                     group['base_lr'] = new_lr
 
@@ -591,28 +591,45 @@ class PlZonkey(pl.LightningModule):
             # NOTE: Muon's lr is in spectral-norm units (~0.005-0.05), NOT Adam scale.
             # base_lr is stored per group; the warmup schedule multiplies it instead of
             # overwriting every group with the Adam-scale LEARNING_RATE.
-            param_groups = []
-            if hidden_matrix_params:
-                param_groups.append(dict(params=hidden_matrix_params, lr=Config.MUON_LR,
-                                        momentum=Config.MUON_MOMENTUM,
-                                        weight_decay=float(getattr(Config, "MUON_WEIGHT_DECAY", 0.0)),
-                                        use_muon=True))
-            if other_params:
-                param_groups.append(dict(params=other_params, lr=Config.LEARNING_RATE,
-                                        eps=Config.EPS, use_muon=False))
+            # LEVEL_LR_SCALE (e.g. [0.3, 0.3, 1.0] for a new level on trained ones): one Muon and
+            # one Adam group per level; all 1 keeps the two groups (and old optimizer states).
+            scales = list(getattr(Config, "LEVEL_LR_SCALE", None) or [])
+            per_level = any(float(s) != 1.0 for s in scales)
+            level_of = {id(p): (int(n.split(".")[1]) if n.startswith("layers.") else 0)
+                        for n, p in self.model.named_parameters()}
+            buckets = sorted({level_of[id(p)] for p in hidden_matrix_params + other_params}) if per_level else [None]
+            param_groups, group_scales = [], []
+            for lvl in buckets:
+                s = float(scales[lvl]) if per_level and lvl < len(scales) else 1.0
+                hm = [p for p in hidden_matrix_params if lvl is None or level_of[id(p)] == lvl]
+                ot = [p for p in other_params if lvl is None or level_of[id(p)] == lvl]
+                if hm:
+                    param_groups.append(dict(params=hm, lr=Config.MUON_LR * s,
+                                            momentum=Config.MUON_MOMENTUM,
+                                            weight_decay=float(getattr(Config, "MUON_WEIGHT_DECAY", 0.0)),
+                                            use_muon=True))
+                    group_scales.append(s)
+                if ot:
+                    param_groups.append(dict(params=ot, lr=Config.LEARNING_RATE * s,
+                                            eps=Config.EPS, use_muon=False))
+                    group_scales.append(s)
             
             # Detect if we're in distributed training mode
             is_distributed = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
             
             if is_distributed:
                 optimizer = MuonWithAuxAdam(param_groups)
+            elif getattr(Config, "FAST_OPTIMIZER", True):
+                # Same update and state layout, batched (muon.py); checkpoints load either way.
+                optimizer = FastSingleDeviceMuonWithAuxAdam(param_groups)
             else:
                 optimizer = SingleDeviceMuonWithAuxAdam(param_groups)
             # Muon's __init__ asserts exact group keys, so base_lr is attached after
             # construction. The warmup schedule multiplies base_lr per group instead of
             # overwriting every group with the (Adam-scale) LEARNING_RATE.
-            for group in optimizer.param_groups:
-                group["base_lr"] = Config.MUON_LR if group.get("use_muon") else Config.LEARNING_RATE
+            for group, s in zip(optimizer.param_groups, group_scales):
+                group["level_lr_scale"] = s
+                group["base_lr"] = (Config.MUON_LR if group.get("use_muon") else Config.LEARNING_RATE) * s
         else:
             # Use standard AdamW for all parameters
             params = [p for p in self.model.parameters() if p.requires_grad]
@@ -637,6 +654,46 @@ class Zonkey(nn.Module):
                 self.layers.append(ZonkeyLayer(i,self.layers[i-1]))
 
 
+
+    def assemble(self, level, seq, existence_mask, is_real_inferred):
+        """Windows -> document (1, len, d). With the stitcher: its inferred overlaps and the last
+        window cut at its own existence. Without (Config.STITCHER False): each window's existing
+        positions in order (a window owns the text up to its own end of existence)."""
+        layer = self.layers[level]
+        if layer.k > 1:      # whole children: k tokens each, existence read at each child's start
+            seq, is_real_inferred = layer.as_children(seq), is_real_inferred[:, ::layer.k]
+            existence_mask = existence_mask[:, ::layer.k]
+        if getattr(Config, "STITCHER", True):
+            doc, _, _ = layer.stitcher(seq, is_real_inferred, torch.tensor([seq.shape[0]], dtype=torch.long, device=seq.device))
+            return self._clip_to_last_segment(doc, level, existence_mask)
+        n, L = is_real_inferred.shape
+        # The last window (never followed) is cut at its existence mask, as the stitcher does.
+        last_len = existence_mask[-1].sum().clamp_min(1).long().view(1)
+        if getattr(Config, "ASSEMBLY", "align") == "align" and n > 1:
+            # Windows overlap and their ends are soft where the split was uncertain: cut window i
+            # where window i+1 begins, scored by the probability that window i ends there
+            # (its existence drop) plus how well its next positions match window i+1's first ones.
+            e = is_real_inferred.clamp(1e-6, 1.0)
+            drop = torch.cat([e[:, :-1] - e[:, 1:], e[:, -1:]], dim=1).clamp_min(1e-6)   # P(end after position j)
+            log_end = torch.log(drop)                                     # [n, L]: cut after j -> next starts at j+1
+            m = min(int(getattr(Config, "ASSEMBLY_MATCH_LEN", 4)), L)
+            a = F.normalize(seq[:-1], dim=-1)                             # [n-1, L, d]
+            b = F.normalize(seq[1:, :m], dim=-1)                          # [n-1, m, d]
+            score = torch.zeros(n - 1, L, device=seq.device)
+            for j in range(m):                                            # match of a[s + j] with b[j]
+                sim = (a[:, j:] * b[:, j:j + 1]).sum(-1)                  # start s in [0, L - j)
+                score[:, :L - j] += sim
+            beta = float(getattr(Config, "ASSEMBLY_MATCH_WEIGHT", 2.0))
+            start_score = torch.full((n - 1, L), float("-inf"), device=seq.device)
+            start_score[:, 1:] = log_end[:-1, :-1] + beta * score[:, 1:]   # next window starts at s >= 1
+            cut = start_score.argmax(-1)                                  # [n-1]
+            lengths = torch.cat([cut, last_len])
+        else:
+            # A position belongs to this window when its existence is above one half.
+            lengths = torch.cat([(is_real_inferred[:-1] > float(getattr(Config, "ASSEMBLY_CUTOFF", 0.5))).sum(-1).clamp_min(1),
+                                 last_len])
+        keep = torch.arange(L, device=seq.device).unsqueeze(0) < lengths.unsqueeze(1)
+        return seq[keep].unsqueeze(0)
 
     def _clip_to_last_segment(self, doc, level, existence_mask):
         """Trim a stitched document (1, max_doc_len, d) to its real content.
@@ -700,7 +757,10 @@ class Zonkey(nn.Module):
             fixed_compressed_vectors=fixed_compressed_vectors,
             noise_level=torch.tensor(noise_level, dtype=torch.float32, device=Config.DEVICE),
             existance_cutoff=existance_cutoff)
-        doc = initial_seq.squeeze(0)[0:existence_mask.bool().sum().item(),:] # <actual_len,d_model>
+        if self.layers[N].k > 1:
+            doc = self.assemble(N, initial_seq, existence_mask, is_real_inferred_final).squeeze(0)
+        else:
+            doc = initial_seq.squeeze(0)[0:existence_mask.bool().sum().item(),:] # <actual_len,d_model>
         if lower_t is None:
             # A completed parent denoise predicts clean child codes. Its structured
             # model error is not forward-diffusion noise with a known time label.
@@ -719,10 +779,7 @@ class Zonkey(nn.Module):
                     child_len = int(existence_mask[child_idx].sum().item())
                     print(f"  child {child_idx}: ", end="")
                     self.print_char_sequence(seq[child_idx, :child_len])
-            doc,_,_ = self.layers[N].stitcher(seq, is_real_inferred, torch.tensor([seq.shape[0]], dtype=torch.long, device=seq.device))
-
-            doc = self._clip_to_last_segment(doc, N, existence_mask)
-            doc = doc.squeeze(0)
+            doc = self.assemble(N, seq, existence_mask, is_real_inferred).squeeze(0)
         self.print_char_sequence(doc[:100])
         return doc
 
@@ -738,9 +795,7 @@ class Zonkey(nn.Module):
                 num_diffusion_steps=0,
                 existance_cutoff=existance_cutoff
             )
-            doc, _, _ = self.layers[level].stitcher(seq, is_real_inferred, torch.tensor([seq.shape[0]], dtype=torch.long, device=seq.device))
-            doc = self._clip_to_last_segment(doc, level, existence_mask)
-            doc = doc.squeeze(0)
+            doc = self.assemble(level, seq, existence_mask, is_real_inferred).squeeze(0)
         self.print_char_sequence(doc[:100])
         return doc
 

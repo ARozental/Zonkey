@@ -1,9 +1,34 @@
+import contextlib
 import torch
+import torch.utils.checkpoint
 import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import Optional, Tuple, Dict, Literal, Callable
 from configs.default_config import Config
+
+
+_LAYER_CHECKPOINT_OFF = [0]   # > 0 inside zonkey_layer._frozen_parameters (see below)
+
+
+def _checkpoint_layers():
+    """GRADIENT_CHECKPOINT_SCOPE "stack_layers": each transformer layer of every stack is
+    checkpointed inside the (compiled) stack, so the recompute is part of the compiled backward
+    and never looks a graph up in dynamo's cache again (the pass-level checkpoint did, and with
+    several batch sizes in flight it could pick a different graph: CheckpointError).
+    Not inside a temporary parameter freeze: the recompute in backward would see the parameters
+    trainable again (different requires_grad, CheckpointError in eager mode)."""
+    return (bool(Config.USE_GRADIENT_CHECKPOINTING)
+            and getattr(Config, "GRADIENT_CHECKPOINT_SCOPE", "all") == "stack_layers"
+            and torch.is_grad_enabled() and _LAYER_CHECKPOINT_OFF[0] == 0)
+
+
+def _stack_precision():
+    """bf16 autocast inside the transformer stacks when Config.STACK_BF16 (outputs are returned in
+    float32, so every loss, norm and cosine outside the stacks stays float32)."""
+    if getattr(Config, "STACK_BF16", False) and torch.cuda.is_available():
+        return torch.autocast("cuda", dtype=torch.bfloat16)
+    return contextlib.nullcontext()
 
 class RotaryPositionalEncoding(nn.Module):
     """Rotary Positional Encoding (RoPE) - Optimized version."""
@@ -734,53 +759,42 @@ class Transformer(nn.Module):
             existence_probs: Either float probabilities (normal mode) or boolean mask (linear mode)
             is_linear: If True, uses linear attention and treats existence_probs as boolean mask
         """
-        if noise_level is None:
-            for i, layer in enumerate(self.layers):
-                # Store residual for scaling
-                residual = x
-                
-                if not is_linear and layer.compute_eos_fn is not None:
-                    existence_probs, layer_out = layer.encode(x, existence_probs, is_linear=is_linear)
-                    x = layer_out
-                else:
-                    existence_probs, x = layer.encode(x, existence_probs, is_linear=is_linear)
-                
-                # Apply ReZero scaling if enabled (makes changes very small initially)
-                # if self.residual_scales is not None:
-                #     # x = residual + scale * (x - residual)
-                #     # This ensures the layer starts as near-identity
-                #     x = residual + self.residual_scales[i] * (x - residual)
-        else:
-            i=0
-            while i < len(self.layers)-1:
-                existence_probs, layer_out_clean = self.layers[i].encode(x, existence_probs, is_linear=is_linear)
-                existence_probs, layer_out_noisy = self.layers[i+1].encode(x, existence_probs, is_linear=is_linear)
-                
-                noise_level = noise_level.view(-1,1,1)
-                x = layer_out_clean*(1-noise_level) + layer_out_noisy*noise_level
-                i += 2
+        with _stack_precision():
+            if noise_level is None:
+                ckpt = _checkpoint_layers()
+                for i, layer in enumerate(self.layers):
+                    if ckpt:
+                        existence_probs, x = torch.utils.checkpoint.checkpoint(
+                            layer.encode, x, existence_probs, is_linear, use_reentrant=False)
+                    else:
+                        existence_probs, x = layer.encode(x, existence_probs, is_linear=is_linear)
+            else:
+                i=0
+                while i < len(self.layers)-1:
+                    existence_probs, layer_out_clean = self.layers[i].encode(x, existence_probs, is_linear=is_linear)
+                    existence_probs, layer_out_noisy = self.layers[i+1].encode(x, existence_probs, is_linear=is_linear)
 
-
-
-        x = self.last_layer_norm(x)
-        return x
+                    noise_level = noise_level.view(-1,1,1)
+                    x = layer_out_clean*(1-noise_level) + layer_out_noisy*noise_level
+                    i += 2
+            x = self.last_layer_norm(x)
+        return x.float()
     
     def forward(self, x: torch.Tensor, existence_probs: torch.Tensor, is_linear: bool = False, noise_level: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Forward method - matches Transformer behavior exactly."""
         return self.encode(x, existence_probs, is_linear=is_linear, noise_level=noise_level)
-    
+
     def decode(self, x: torch.Tensor) -> torch.Tensor:
         """Decode method - matches TransformerDecoder behavior exactly."""
-        for i, layer in enumerate(self.layers):
-            # Store residual for scaling
-            residual = x
-            x, _ = layer.decode(x)  # Ignore cache for full decode
-            
-            # Apply ReZero scaling if enabled
-            # if self.residual_scales is not None:
-            #     x = residual + self.residual_scales[i] * (x - residual)
-        x = self.last_layer_norm(x)
-        return x
+        with _stack_precision():
+            ckpt = _checkpoint_layers()
+            for i, layer in enumerate(self.layers):
+                if ckpt:
+                    x, _ = torch.utils.checkpoint.checkpoint(layer.decode, x, use_reentrant=False)
+                else:
+                    x, _ = layer.decode(x)  # Ignore cache for full decode
+            x = self.last_layer_norm(x)
+        return x.float()
     
     def generate(self, prompt: torch.Tensor, n: int):
         """
