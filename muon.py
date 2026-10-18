@@ -253,7 +253,10 @@ class FastSingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
         for group in self.param_groups:
-            params = list(group["params"])
+            # Frozen parameters (requires_grad False, e.g. a level under FREEZE_LEVELS_UNTIL) are
+            # skipped: no momentum carry-over, no weight decay. Unused trainable ones get zero
+            # gradients, as in SingleDeviceMuonWithAuxAdam.
+            params = [p for p in group["params"] if p.requires_grad]
             if not params:
                 continue
             for p in params:

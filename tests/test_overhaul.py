@@ -120,6 +120,38 @@ def test_level_lr_groups():
     print("LEVEL_LR_SCALE: one Muon and one Adam group per level with scaled LRs; None keeps 2 groups")
 
 
+def test_level_freezing_schedule():
+    from models.zonkey import PlZonkey
+    _three_level_config()
+    Config.USE_MUON = True
+    Config.LEVEL_LR_SCALE = None
+    Config.FREEZE_LEVELS_UNTIL = [10, 10, 0]
+    torch.manual_seed(3)
+    pl = PlZonkey()
+    opt = pl.configure_optimizers()["optimizer"]
+    ema_len = len(pl._ema_params())
+    pl._apply_level_freezing(0)
+    m = pl.model
+    assert m.layers[0].frozen and m.layers[1].frozen and not m.layers[2].frozen
+    l0 = m.layers[0].compressor.layers[0].ff[0].weight
+    l2 = m.layers[2].compressor.layers[0].ff[0].weight
+    assert not l0.requires_grad and l2.requires_grad
+    assert not m.layers[0].compressor_cls_existence_probs.requires_grad
+    before0, before2 = l0.detach().clone(), l2.detach().clone()
+    for p in m.parameters():
+        if p.requires_grad:
+            p.grad = torch.randn_like(p)
+    opt.step()
+    assert torch.equal(l0, before0), "a frozen level must not move (no momentum, no decay)"
+    assert not torch.equal(l2, before2)
+    assert len(pl._ema_params()) == ema_len, "the EMA list stays fixed"
+    pl._apply_level_freezing(10)
+    assert not m.layers[0].frozen and l0.requires_grad
+    assert not m.layers[0].compressor_cls_existence_probs.requires_grad, "fixed parameters stay fixed"
+    Config.FREEZE_LEVELS_UNTIL = None
+    print("FREEZE_LEVELS_UNTIL: frozen levels do not move, unfreeze on schedule, EMA list fixed")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

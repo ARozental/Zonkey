@@ -117,7 +117,30 @@ class PlZonkey(pl.LightningModule):
         self._run_start_step = 0
 
     def _ema_params(self):
-        return [p for p in self.model.parameters() if p.requires_grad]
+        # Fixed at the first call: the EMA list must not change when levels are frozen for a while
+        # (FREEZE_LEVELS_UNTIL) or the interface freezes the child level during a forward.
+        if getattr(self, "_ema_param_list", None) is None:
+            self._ema_param_list = [p for p in self.model.parameters() if p.requires_grad]
+        return self._ema_param_list
+
+    def _apply_level_freezing(self, step: int):
+        """FREEZE_LEVELS_UNTIL [n0, n1, ...]: level l is frozen (only encodes, no losses, no
+        updates) while the schedule step is below n_l, e.g. a new top level trained on finished
+        lower levels before everything trains together."""
+        until = getattr(Config, "FREEZE_LEVELS_UNTIL", None)
+        if not until:
+            return
+        trainable = {id(p) for p in self._ema_params()}   # fixes the EMA list before any change
+        for l, layer in enumerate(self.model.layers):
+            frozen = l < len(until) and bool(until[l]) and step < int(until[l])
+            if frozen == layer.frozen:
+                continue
+            layer.frozen = frozen
+            for n, p in self.model.named_parameters():
+                own = n.startswith(f"layers.{l}.") or (l == 0 and n.startswith("token_embedding_layer."))
+                if own and id(p) in trainable:      # never touch the fixed (requires_grad False) ones
+                    p.requires_grad_(not frozen)
+            print(f"level {l} {'frozen' if frozen else 'unfrozen'} at step {step}")
 
     def load_ema_state(self, ema_state):
         """Restore EMA weights only if they match the current parameter list exactly;
@@ -344,6 +367,7 @@ class PlZonkey(pl.LightningModule):
         optimizer = self.optimizers()
 
         log_step = self._schedule_step()
+        self._apply_level_freezing(log_step)
         diag_every = int(getattr(Config, "DIAGNOSTICS_EVERY_N_STEPS", 0) or 0)
         diag = diag_every > 0 and log_step % diag_every == 0
         for layer in self.model.layers:

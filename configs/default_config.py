@@ -204,6 +204,10 @@ class Config:
     # Per-level LR multipliers (both optimizer groups), e.g. [0.3, 0.3, 1.0] when a new level is
     # trained on top of trained ones. None: one LR for all levels (and the old optimizer layout).
     LEVEL_LR_SCALE = None
+    # Per-level step until which that level is frozen (only encodes: no losses, no updates), e.g.
+    # [20000, 20000, 0]: a new level 2 learns on finished levels 0 and 1 first (they stay intact
+    # and steps are cheap), then all levels train together. None: never frozen.
+    FREEZE_LEVELS_UNTIL = None
 
     # ---- Speed (same method) ----
     # Batched Muon/Adam step (muon.FastSingleDeviceMuonWithAuxAdam): same update, same state.
