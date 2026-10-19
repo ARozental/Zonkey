@@ -3,6 +3,9 @@ import sys
 import argparse
 import json
 from pathlib import Path
+# Before torch allocates: with the default allocator, fragmentation reserved ~30 GB for a 24 GB peak
+# at large batches and WDDM started paging. setdefault keeps a value set in the environment.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import torch
 torch.set_float32_matmul_precision("high")
 

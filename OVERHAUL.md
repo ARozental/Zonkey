@@ -9,6 +9,8 @@ Same method, faster:
 - MLM and level >= 1 reconstruction losses no longer build all-pairs similarity matrices (O(batch^2),
   8 GB at batch 24): masked positions only, row chunks.
 - bf16 (`STACK_BF16`) exists but stays off: from scratch it brings back the "eeee" tails.
+- `scripts/train.py` allocates in expandable segments; the memory figures below assume it (with the
+  default allocator a 24 GB peak reserved ~30 GB and WDDM started paging).
 
 Minimal method (switches; defaults keep the old full method):
 - `STITCHER_REFINE/STITCHER_SEQUENCE_LOSS/STITCHER_NULL_LOSSES: false`: only the stitcher's cut and its
@@ -26,6 +28,9 @@ Three levels:
 - `LEVEL_LR_SCALE`: per-level learning-rate multipliers.
 
 ## Runs
+
+The run configs train for up to 4 epochs (`MAX_EPOCHS`, as in `single_gpu_config.json`; the default
+of 1 would stop a batch-48 run after ~127k steps) and save every 10k steps.
 
 Start a new architecture from the 2.09M checkpoint (its EMA weights, matched by name):
 
@@ -55,5 +60,14 @@ level-1 numbers of the configs tried at 3k steps, at twice the throughput of ful
 Level 0 codes need far fewer than their 1024 dimensions (99.4% of words survive projection onto
 256 principal directions with the unchanged decoder, 95% onto 128); level 1 codes need ~1024-2048
 of 4096. So 4 x 128 per word and 4 x 512 per phrase is enough capacity.
+
+## Evaluation and baselines
+
+    python scripts/evaluate.py <ckpt> --param_file <its config>   # generation word rates, held-out reconstruction
+    python scripts/ar_baseline.py --out ar_baseline.json           # autoregressive baseline: same data, batch, optimizer
+    python scripts/capacity_test.py <2-level ckpt>                 # how many dimensions the codes need (PCA projection)
+
+Word rate = share of generated words that occur in a vocabulary of real words (`utils/evaluation.py`);
+real text scores ~0.93 (all words) / 0.90 (words of 4+ letters).
 
 Tests (CPU): `tests/test_overhaul.py`, `tests/test_fast_optimizer.py` and the existing ones.

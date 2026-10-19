@@ -76,6 +76,7 @@
     ],
     "SAVE_EVERY_N_STEPS": 10000,
     "PRINT_EVERY_N_STEPS": 5000,
+    "MAX_EPOCHS": 4,
     "COMPRESSION_PENALTY": [
         0.01,
         0.01,
@@ -212,6 +213,6 @@
         3.2,
         3.2
     ],
-    "NUM_WORKERS": 6,
+    "NUM_WORKERS": 12,
     "FREEZE_LEVELS_UNTIL": null
 }
