@@ -47,4 +47,13 @@ Two levels from scratch, minimal method, windows of 16 positions, batch 24 (~19.
 0.29/0.00, 18% less memory, 13% faster. The 2.09M decoders are sized for 27, so this is for runs
 from scratch.)
 
+Two levels from scratch at half width (128 / 512, 61M parameters), batch 36 (~25 GB peak): the best
+level-1 numbers of the configs tried at 3k steps, at twice the throughput of full width:
+
+    python scripts/train.py --param_file configs/overhaul_l2_half.json
+
+Level 0 codes need far fewer than their 1024 dimensions (99.4% of words survive projection onto
+256 principal directions with the unchanged decoder, 95% onto 128); level 1 codes need ~1024-2048
+of 4096. So 4 x 128 per word and 4 x 512 per phrase is enough capacity.
+
 Tests (CPU): `tests/test_overhaul.py`, `tests/test_fast_optimizer.py` and the existing ones.
