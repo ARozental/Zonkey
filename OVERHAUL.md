@@ -32,6 +32,12 @@ Three levels:
 The run configs train for up to 4 epochs (`MAX_EPOCHS`, as in `single_gpu_config.json`; the default
 of 1 would stop a batch-48 run after ~127k steps) and save every 10k steps.
 
+Three levels from scratch, all levels training from step 0, half width (128 / 512 / 512), batch 36
+(worst case 24.9 GB from `--calibrate`, ~26.5 GB with optimizer and EMA); the LR decays over the
+whole 4 epochs (680k steps):
+
+    python scripts/train.py --param_file configs/overhaul_l3_scratch.json
+
 Start a new architecture from the 2.09M checkpoint (its EMA weights, matched by name):
 
     python scripts/ema_to_weights.py checkpoints/20261018-074944/epoch=1-step=2090000.ckpt init_2090k_ema.ckpt
