@@ -6,8 +6,8 @@
         20
     ],
     "MAX_SEQ_LENGTHS": [
-        27,
-        27
+        16,
+        16
     ],
     "BATCH_SIZE": 24,
     "NUM_UPWARD_LAYERS": [
@@ -120,8 +120,8 @@
         1.0
     ],
     "TARGET_BOS_PROB": [
-        null,
-        null,
+        0.14814814814814814,
+        0.14814814814814814,
         null,
         null,
         null,

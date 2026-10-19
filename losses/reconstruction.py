@@ -287,11 +287,10 @@ def calculate_reconstruction_loss(
             fake_neg_norm = F.normalize(fake_negatives, p=2, dim=-1)
 
         def contrastive_ce(d_n, t_n, extra):
-            # Compute full similarity matrix: (N, N), much smaller than
-            # gathering (N, num_neg, hidden) and doing elementwise multiply+sum.
-            full_sim = torch.matmul(d_n, t_n.T)
-            neg = torch.gather(full_sim, 1, sampled_indices)
-            del full_sim
+            # Similarities in row chunks (N x N in one piece is O(batch^2): 2.7 GB at level 1 with
+            # batch 48), gathered at the sampled negatives; same values as one matmul.
+            neg = torch.cat([torch.gather(torch.matmul(d_n[a:a + 8192], t_n.T), 1, sampled_indices[a:a + 8192])
+                             for a in range(0, N, 8192)], dim=0)
             if fake_neg_norm is not None:
                 neg = torch.cat([neg, torch.matmul(d_n, fake_neg_norm.T)], dim=1)  # (N, K)
             if extra is not None:

@@ -1491,6 +1491,42 @@ class ZonkeyLayer(nn.Module):
         
         encoder_output_flat = encoder_output.reshape(-1, hidden_dim)
         original_position_flat = original_position.reshape(-1, 2)
+
+        fake_neg_norm = None
+        if fake_negatives is not None and fake_negatives.shape[0] > 0:
+            fake_neg_norm = F.normalize(fake_negatives, p=2, dim=-1)
+        if previous_denoised is None:
+            # Only the masked positions carry loss, so only they are scored (same value as before).
+            # The all-queries x all-document-positions similarity matrix was O(batch^2): ~8 GB in one
+            # allocation at batch 24, which failed under WSL ("CUDA driver error: device not ready").
+            # Row chunks bound what remains.
+            sel = replace_mask.reshape(-1).nonzero().squeeze(1)
+            denom = replace_mask.float().sum() + Config.EPS
+            if sel.numel() == 0:
+                return encoder_output_flat.sum() * 0.0
+            q_norm = F.normalize(encoder_output_flat[sel], p=2, dim=-1)
+            targets_norm = F.normalize(doc_sequences_flat, p=2, dim=-1)
+            pos_ix = original_position_flat[sel, 0] * doc_seq_len + original_position_flat[sel, 1]
+            sample_probs = doc_mask.float()
+            sample_probs = sample_probs / (sample_probs.sum() + Config.EPS)
+            sampled = torch.multinomial(sample_probs, sel.numel() * num_negatives, replacement=True
+                                        ).reshape(sel.numel(), num_negatives)
+            collision = sampled == pos_ix.unsqueeze(1)
+            while collision.any():
+                sampled[collision] = torch.multinomial(sample_probs, int(collision.sum().item()), replacement=True)
+                collision = sampled == pos_ix.unsqueeze(1)
+            ces = []
+            for a in range(0, sel.numel(), 8192):
+                qs = q_norm[a:a + 8192]
+                sim = qs @ targets_norm.T
+                parts = [sim.gather(1, pos_ix[a:a + 8192].unsqueeze(1)), sim.gather(1, sampled[a:a + 8192])]
+                if fake_neg_norm is not None:
+                    parts.append(qs @ fake_neg_norm.T)
+                logits = 2 * torch.atanh(torch.clamp(torch.cat(parts, dim=1), min=Config.EPS - 1, max=1 - Config.EPS))
+                ces.append(F.cross_entropy(logits, torch.zeros(qs.shape[0], dtype=torch.long, device=device), reduction='none'))
+            ce = torch.cat(ces)
+            return (ce * splitter_existence_share.reshape(-1)[sel]).sum() / denom
+
         N_queries = encoder_output_flat.shape[0]
         
         encoder_output_norm = F.normalize(encoder_output_flat, p=2, dim=-1)
