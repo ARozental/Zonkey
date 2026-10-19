@@ -41,9 +41,9 @@ class Stitcher(nn.Module):
         self.token_embedding_layer = token_embedding_layer
         self.dim_norm = expected_l2_norm(self.d_model)
         
-        # Scratch space for assembled documents (generation only). Not persistent: it is all
-        # zeros, it used to add ~0.6 GB to every checkpoint, and its shape depends on config.
-        self.register_buffer('_output_buffer', torch.zeros(self.max_sequences, self.max_doc_len, self.d_model), persistent=False)
+        # Assembled documents (generation only) are allocated per call: a buffer for
+        # MAX_SEQUENCES_PER_BATCH documents held 3.5 GB of GPU memory at level 0 (6656 x 1024 x 128)
+        # while generation assembles a handful.
         # Per document, where the last (never-merged) segment was placed by the last
         # assembling forward. Generation uses it to cut that segment at its own existence.
         self.last_segment_start = []
@@ -280,12 +280,9 @@ class Stitcher(nn.Module):
 
         if not assemble:
             all_patches = None
-        elif num_docs <= self.max_sequences:
-            all_patches = self._output_buffer[:num_docs, :self.max_doc_len, :d_model].detach()
-            all_patches.fill_(0)
         else:
-            all_patches = torch.zeros(num_docs, self.max_doc_len, d_model, 
-                                     device=denoised_input_sequences.device, dtype=denoised_input_sequences.dtype)
+            all_patches = torch.zeros(num_docs, self.max_doc_len, d_model,
+                                      device=denoised_input_sequences.device, dtype=denoised_input_sequences.dtype)
         
         stitched_len = torch.full((num_docs,), seq_len, device=denoised_input_sequences.device, dtype=torch.long)
         if assemble:

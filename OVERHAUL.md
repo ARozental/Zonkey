@@ -10,6 +10,8 @@ Same method, faster:
   8 GB at batch 24): masked positions only, and `gathered_dot` (losses/reconstruction.py) computes
   only the scored entries. torch.gather saves its whole input for backward, so the row-chunked
   version still kept every chunk until backward (3-level batch 36 worst case 27.0 -> 17.6 GB).
+- The stitcher's generation-only buffer (MAX_SEQUENCES_PER_BATCH x MAX_DOC_LENGTHS x d: 3.5 GB of
+  zeros at level 0 with 1024-char documents) is allocated per call instead.
 - bf16 (`STACK_BF16`) exists but stays off: from scratch it brings back the "eeee" tails.
 - `scripts/train.py` allocates in expandable segments; the memory figures below assume it (with the
   default allocator a 24 GB peak reserved ~30 GB and WDDM started paging).
@@ -41,8 +43,11 @@ the configs below the first were measured with the hard negatives off and before
 both together lower them.
 
 Three levels from scratch, all levels training from step 0, half width (128 / 512 / 512), hard
-negatives on, batch 52 (worst case 24.3 GB from `--calibrate`, ~26.5 GB with optimizer and EMA);
-the LR decays over the whole 4 epochs (470k steps):
+negatives on, documents of 2048 characters (63% of articles fit whole, 42% at 1024; per-document
+caps 272 / 44 / 12), batch 38. `MAX_SEQUENCES_PER_BATCH` [8160, 1320, 360] is the memory budget:
+worst case 24.9 GB from `--calibrate`, ~28.5 GB on nvidia-smi with optimizer and EMA. An average
+batch fills ~78% of it; only a batch ~3 sigma above average overflows, and then its last documents
+skip that step. The LR decays over the whole 4 epochs (640k steps):
 
     python scripts/train.py --param_file configs/overhaul_l3_scratch.json
 
