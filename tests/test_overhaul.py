@@ -1,5 +1,5 @@
 """CPU checks for the overhaul's new pieces: tokens per child, per-child normalization, splitter
-boundaries only at child starts, the alignment assembly, per-level LR groups.
+boundaries only at child starts, the alignment assembly, per-level LR groups, hard negatives per child.
 
 Run: python tests/test_overhaul.py
 """
@@ -150,6 +150,85 @@ def test_level_freezing_schedule():
     assert not m.layers[0].compressor_cls_existence_probs.requires_grad, "fixed parameters stay fixed"
     Config.FREEZE_LEVELS_UNTIL = None
     print("FREEZE_LEVELS_UNTIL: frozen levels do not move, unfreeze on schedule, EMA list fixed")
+
+
+def test_gathered_dot_matches_gather_of_matmul():
+    from losses.reconstruction import gathered_dot
+    torch.manual_seed(6)
+    a = torch.randn(10, 8, dtype=torch.float64, requires_grad=True)
+    b = torch.randn(7, 8, dtype=torch.float64, requires_grad=True)
+    index = torch.randint(0, 7, (10, 5))
+    index[0] = 3                                                 # repeated picks accumulate
+    up = torch.randn(10, 5, dtype=torch.float64)
+    ref = torch.gather(a @ b.t(), 1, index)
+    ga, gb = torch.autograd.grad((ref * up).sum(), (a, b))
+    out = gathered_dot(a, b, index, chunk=3)                     # chunks of 3, 3, 3, 1 rows
+    ha, hb = torch.autograd.grad((out * up).sum(), (a, b))
+    assert torch.allclose(out, ref) and torch.allclose(ha, ga) and torch.allclose(hb, gb)
+    assert torch.autograd.gradcheck(lambda x, y: gathered_dot(x, y, index, chunk=4), (a, b))
+    assert torch.autograd.grad(gathered_dot(a, b.detach(), index).sum(), a)[0].shape == a.shape
+    assert gathered_dot(a[:0], b, index[:0]).shape == (0, 5)
+    print("gathered_dot: the values and gradients of gather(a @ b.T), without the full matrix")
+
+
+def test_context_guesses_are_whole_children():
+    from models.zonkey import Zonkey
+    _three_level_config()
+    Config.MLM_ALT_PASSES, Config.MLM_ALT_FRACTION = 1, 0.5
+    torch.manual_seed(4)
+    m = Zonkey()
+    l2 = m.layers[2]
+    k, D, B, C = l2.k, Config.D_MODEL[2], 3, 4
+    seq = l2.norm_tokens(torch.randn(B, C * k, D))
+    real = torch.ones(B, C * k)
+    share = torch.ones(B, C * k)
+    share[:, -k:] = 0.0                                          # the last child is owned by no window
+    guess, has = l2._mlm_alternatives(seq, real, share)
+    assert guess.shape == (B, C, k * D) and has.shape == (B, C), (guess.shape, has.shape)
+    assert bool(has.any()) and not bool(has[:, -1].any()), has
+    # One pass: the guess is the denoiser's output with exactly the guessed children masked (all k tokens).
+    masked = has.repeat_interleave(k, dim=1).unsqueeze(-1)
+    x = torch.where(masked, l2.mask_vector.view(1, 1, D).expand(B, C * k, D), seq)
+    prefix = l2._mlm_denoiser_prefix(B, seq.dtype)
+    P = prefix.shape[1]
+    with torch.no_grad():
+        out = l2.denoiser(torch.cat([prefix, x], dim=1), torch.cat([torch.ones(B, P), real], dim=1))[:, P:]
+    expected = l2.as_children(l2.norm_tokens(out))
+    assert torch.allclose(guess[has], expected[has], atol=1e-5)
+    assert torch.allclose(guess[has].norm(dim=-1), torch.full((int(has.sum()),), l2.child_norm), atol=1e-3)
+    g1, h1 = m.layers[1]._mlm_alternatives(torch.randn(B, 6, Config.D_MODEL[1]), torch.ones(B, 6), torch.ones(B, 6))
+    assert g1.shape == (B, 6, Config.D_MODEL[1]) and h1.shape == (B, 6)
+    Config.MLM_ALT_PASSES, Config.MLM_ALT_FRACTION = 2, 0.25
+    print("context guesses at k = 4: whole children masked, guessed and normalized per child")
+
+
+def test_hard_negatives_reach_every_level_above_0():
+    from models.zonkey import Zonkey, aggregate_leveled_losses
+    _three_level_config()
+    # 4 complementary passes of 1/4: every owned child gets a guess (the default 2 x 1/4 guesses half).
+    Config.MLM_ALT_PASSES, Config.MLM_ALT_FRACTION, Config.MINED_NEGATIVES_K = 4, 0.25, 4
+    torch.manual_seed(5)
+    m = Zonkey()
+    seen = {}
+    for lvl in (1, 2):
+        layer = m.layers[lvl]
+
+        def spy(den, share, extra, orig=layer._extra_negative_sims, lvl=lvl):
+            sims = orig(den, share, extra)
+            seen[lvl] = (den.shape[-1], sims.shape[-1], int((share > 0).sum()), int((sims[..., 0] > -1).sum()),
+                         int((sims[..., 1:] > -1).sum()))
+            return sims
+        layer._extra_negative_sims = spy
+    texts = torch.randint(1, Config.TOKENIZER_VOCAB_SIZE_CHARS, (2, Config.MAX_DOC_LENGTHS[0]))
+    _, losses = m.forward({"full_texts": texts})
+    aggregate_leveled_losses(losses)[0].backward()
+    for lvl in (1, 2):
+        assert lvl in seen, f"level {lvl}: no extra negatives"
+        width, cols, owned, guessed, mined = seen[lvl]
+        assert width == m.layers[lvl].k * Config.D_MODEL[lvl], (lvl, width)
+        assert cols == 1 + 4 and guessed == owned > 0 and mined > 0, (lvl, seen[lvl])
+    Config.MLM_ALT_PASSES, Config.MINED_NEGATIVES_K = 2, 16
+    print("clean reconstruction at levels 1 and 2 gets a context guess and mined neighbours per child:", seen)
 
 
 if __name__ == "__main__":

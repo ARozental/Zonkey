@@ -7,7 +7,9 @@ Same method, faster:
 - `GRADIENT_CHECKPOINT_SCOPE: "stack_layers"`: per-layer checkpointing inside the compiled stacks.
   Pass-level checkpointing with compiled stacks crashed at batch >= 6 (CheckpointError).
 - MLM and level >= 1 reconstruction losses no longer build all-pairs similarity matrices (O(batch^2),
-  8 GB at batch 24): masked positions only, row chunks.
+  8 GB at batch 24): masked positions only, and `gathered_dot` (losses/reconstruction.py) computes
+  only the scored entries. torch.gather saves its whole input for backward, so the row-chunked
+  version still kept every chunk until backward (3-level batch 36 worst case 27.0 -> 17.6 GB).
 - bf16 (`STACK_BF16`) exists but stays off: from scratch it brings back the "eeee" tails.
 - `scripts/train.py` allocates in expandable segments; the memory figures below assume it (with the
   default allocator a 24 GB peak reserved ~30 GB and WDDM started paging).
@@ -15,14 +17,17 @@ Same method, faster:
 Minimal method (switches; defaults keep the old full method):
 - `STITCHER_REFINE/STITCHER_SEQUENCE_LOSS/STITCHER_NULL_LOSSES: false`: only the stitcher's cut and its
   position loss remain (the refinement changed no decode of the 2.09M model).
-- `MLM_ALT_PASSES: 0`, `MINED_NEGATIVES_K: 0`, `NUM_FAKE_NEGATIVES: 0`: no extra negatives.
+- The hard negatives stay, as in the 2.09M run: `MLM_ALT_PASSES: 2` (context guesses for half the
+  children), `MINED_NEGATIVES_K: 16`, `NUM_FAKE_NEGATIVES: [8, 0, ...]`. Without them the
+  reconstruction losses go to ~0 while the model does not learn to generate.
 - `FM_PASS: false`, `DIRTY_TRUE_CODE_PROB: 0.5`, `DIRTY_FLOW_LOSS: true`: one generative pass (the
   DDMM pass, half of its samples centered on the true code with the null self-condition, flow loss).
 - `MLM_LOSSES: true` stays: without it level 1 learns far worse.
 
 Three levels:
 - A level that keeps its child's width reads each child code as its CV vectors (CV tokens per child);
-  boundaries only between children; all losses compare whole children.
+  boundaries only between children; all losses compare whole children, and the hard negatives
+  (context guesses, mined neighbours) are whole children too.
 - `FREEZE_LEVELS_UNTIL`: a level only encodes (no losses, no updates) until a step. A new level must
   learn on frozen trained levels first: trained jointly from the start it wrecks them.
 - `LEVEL_LR_SCALE`: per-level learning-rate multipliers.
@@ -30,11 +35,14 @@ Three levels:
 ## Runs
 
 The run configs train for up to 4 epochs (`MAX_EPOCHS`, as in `single_gpu_config.json`; the default
-of 1 would stop a batch-48 run after ~127k steps) and save every 10k steps.
+of 1 would stop a batch-48 run after ~127k steps) and save every 10k steps (the first one every
+25k). The memory figures of
+the configs below the first were measured with the hard negatives off and before `gathered_dot`;
+both together lower them.
 
-Three levels from scratch, all levels training from step 0, half width (128 / 512 / 512), batch 36
-(worst case 24.9 GB from `--calibrate`, ~26.5 GB with optimizer and EMA); the LR decays over the
-whole 4 epochs (680k steps):
+Three levels from scratch, all levels training from step 0, half width (128 / 512 / 512), hard
+negatives on, batch 52 (worst case 24.3 GB from `--calibrate`, ~26.5 GB with optimizer and EMA);
+the LR decays over the whole 4 epochs (470k steps):
 
     python scripts/train.py --param_file configs/overhaul_l3_scratch.json
 

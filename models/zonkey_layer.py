@@ -7,7 +7,7 @@ import models.transformer as _transformer
 from typing import Tuple, Optional
 import math
 import torch.nn.functional as F
-from losses.reconstruction import calculate_reconstruction_loss,calculate_token_loss
+from losses.reconstruction import calculate_reconstruction_loss,calculate_token_loss,gathered_dot
 from utils.helper_functions import calculate_mean_similarity,expected_l2_norm,calculate_spherical_uniformity_loss,compute_improved_coverage_loss,arc_cosine_similarity_seq
 from splitter.segment_splitter import SegmentSplitter, child_tokens
 from splitter.stitcher import Stitcher
@@ -1039,14 +1039,17 @@ class ZonkeyLayer(nn.Module):
         k = int(getattr(Config, "MINED_NEGATIVES_K", 0))
         if bank is not None and bank.shape[0] > 0 and k > 0:
             k = min(k, bank.shape[0])
-            sims = d_n @ bank.t()                                  # gradient to the prediction only
-            with torch.no_grad():
+            with torch.no_grad():   # the search, in row chunks; only the k picked cosines carry a gradient
                 tgt = extra["target_ids"].reshape(-1)
-                same = (extra["bank_ids"][None, :] == tgt[:, None]) | (extra["bank_ids"][None, :] < 0)
-                masked = sims.detach().masked_fill(same, -2.0)
-                top_val, top = masked.topk(k, dim=-1)
-                ok = (top_val > -1.5) & ((tgt >= 0) & (share.reshape(-1) > 0)).unsqueeze(1)
-            mined = sims.gather(1, top)
+                top_vals, tops = [], []
+                for a in range(0, max(B * L, 1), 4096):
+                    same = (extra["bank_ids"][None, :] == tgt[a:a + 4096, None]) | (extra["bank_ids"][None, :] < 0)
+                    v, i = (d_n[a:a + 4096] @ bank.t()).masked_fill(same, -2.0).topk(k, dim=-1)
+                    top_vals.append(v)
+                    tops.append(i)
+                top = torch.cat(tops)
+                ok = (torch.cat(top_vals) > -1.5) & ((tgt >= 0) & (share.reshape(-1) > 0)).unsqueeze(1)
+            mined = gathered_dot(d_n, bank, top)                   # gradient to the prediction only
             cols.append(torch.where(ok, mined, torch.full_like(mined, -1.0)))
         if not cols:
             return None
@@ -1057,30 +1060,32 @@ class ZonkeyLayer(nn.Module):
                           share: torch.Tensor):
         """Context guesses for the reconstruction's extra negatives (C5a), no grad.
 
-        MLM_ALT_PASSES complementary masks over the slots with share > 0, each masking a
+        MLM_ALT_PASSES complementary masks over the children with share > 0, each masking a
         MLM_ALT_FRACTION of them with the MASK vector only, run through exactly the denoiser
-        path of calculate_mlm_loss. Returns guess [B, L, D] and has_guess [B, L]."""
+        path of calculate_mlm_loss: a child's k tokens are masked together and its guess is
+        normalized per child. Returns guess [B, L // k, k * D] and has_guess [B, L // k]."""
         B, L, D = input_sequence.shape
         frac = float(getattr(Config, "MLM_ALT_FRACTION", 0.25))
         passes = int(getattr(Config, "MLM_ALT_PASSES", 2))
-        r = torch.rand(B, L, device=input_sequence.device)
+        unit_share = share[:, ::self.k]
+        r = torch.rand(unit_share.shape, device=input_sequence.device)
         guess = torch.zeros_like(input_sequence)
-        has = torch.zeros(B, L, dtype=torch.bool, device=input_sequence.device)
+        has = torch.zeros(unit_share.shape, dtype=torch.bool, device=input_sequence.device)
         mask_vec = self.mask_vector.view(1, 1, D).to(input_sequence.dtype)
         prefix = self._mlm_denoiser_prefix(B, input_sequence.dtype)
         P = prefix.shape[1]
         existence = torch.cat([torch.ones(B, P, device=is_real_inferred.device, dtype=is_real_inferred.dtype),
                                is_real_inferred], dim=1)
-        for k in range(passes):
-            m = (share > 0) & (r >= k * frac) & (r < (k + 1) * frac)
-            x = torch.where(m.unsqueeze(-1), mask_vec.expand(B, L, D), input_sequence)
+        for i in range(passes):
+            m = (unit_share > 0) & (r >= i * frac) & (r < (i + 1) * frac)
+            m_tok = m.repeat_interleave(self.k, dim=1).unsqueeze(-1)
+            x = torch.where(m_tok, mask_vec.expand(B, L, D), input_sequence)
             x = torch.cat([prefix, x], dim=1)
             _mark_batch_dynamic(x, existence)
-            out = self.denoiser(x, existence)[:, P:]
-            out = F.normalize(out, p=2, dim=-1) * self.dim_norm
-            guess = torch.where(m.unsqueeze(-1), out, guess)
+            out = self.norm_tokens(self.denoiser(x, existence)[:, P:])
+            guess = torch.where(m_tok, out, guess)
             has = has | m
-        return guess, has
+        return self.as_children(guess), has
 
     def _mlm_denoiser_prefix(self, batch: int, dtype) -> torch.Tensor:
         """The denoiser's prompt for sequence (MLM-style) inputs: [time at t=0, null
@@ -1499,7 +1504,7 @@ class ZonkeyLayer(nn.Module):
             # Only the masked positions carry loss, so only they are scored (same value as before).
             # The all-queries x all-document-positions similarity matrix was O(batch^2): ~8 GB in one
             # allocation at batch 24, which failed under WSL ("CUDA driver error: device not ready").
-            # Row chunks bound what remains.
+            # gathered_dot computes only the scored entries (positive first, then the negatives).
             sel = replace_mask.reshape(-1).nonzero().squeeze(1)
             denom = replace_mask.float().sum() + Config.EPS
             if sel.numel() == 0:
@@ -1515,16 +1520,11 @@ class ZonkeyLayer(nn.Module):
             while collision.any():
                 sampled[collision] = torch.multinomial(sample_probs, int(collision.sum().item()), replacement=True)
                 collision = sampled == pos_ix.unsqueeze(1)
-            ces = []
-            for a in range(0, sel.numel(), 8192):
-                qs = q_norm[a:a + 8192]
-                sim = qs @ targets_norm.T
-                parts = [sim.gather(1, pos_ix[a:a + 8192].unsqueeze(1)), sim.gather(1, sampled[a:a + 8192])]
-                if fake_neg_norm is not None:
-                    parts.append(qs @ fake_neg_norm.T)
-                logits = 2 * torch.atanh(torch.clamp(torch.cat(parts, dim=1), min=Config.EPS - 1, max=1 - Config.EPS))
-                ces.append(F.cross_entropy(logits, torch.zeros(qs.shape[0], dtype=torch.long, device=device), reduction='none'))
-            ce = torch.cat(ces)
+            sims = gathered_dot(q_norm, targets_norm, torch.cat([pos_ix.unsqueeze(1), sampled], dim=1))
+            if fake_neg_norm is not None:
+                sims = torch.cat([sims, q_norm @ fake_neg_norm.T], dim=1)
+            logits = 2 * torch.atanh(torch.clamp(sims, min=Config.EPS - 1, max=1 - Config.EPS))
+            ce = F.cross_entropy(logits, torch.zeros(sel.numel(), dtype=torch.long, device=device), reduction='none')
             return (ce * splitter_existence_share.reshape(-1)[sel]).sum() / denom
 
         N_queries = encoder_output_flat.shape[0]
@@ -1725,12 +1725,13 @@ class ZonkeyLayer(nn.Module):
                     target_ids = torch.where(target_ids >= 0, target_ids // self.k, target_ids)[:, ::self.k]
             bank = {"codes": bank_codes, "ids": bank_ids, "target_ids": target_ids}
             # Context guesses (C5a): computed outside the checkpointed pass, from the
-            # splitter-derived existence, never fed to the identifiability gate.
+            # splitter-derived existence, never fed to the identifiability gate. At k > 1 the
+            # guesses, the bank and the target ids are whole children, like the loss they join.
             extra_negatives = {"bank": bank_codes, "bank_ids": bank_ids, "target_ids": target_ids}
-            if int(getattr(Config, "MLM_ALT_PASSES", 2)) > 0 and self.k == 1:
+            if int(getattr(Config, "MLM_ALT_PASSES", 2)) > 0:
                 guess, has_guess = self._mlm_alternatives(input_sequence, is_real_inferred, splitter_existence_share)
                 extra_negatives.update(guess=guess, has_guess=has_guess)
-            if (int(getattr(Config, "MINED_NEGATIVES_K", 0)) <= 0 and "guess" not in extra_negatives) or self.k > 1:
+            if int(getattr(Config, "MINED_NEGATIVES_K", 0)) <= 0 and "guess" not in extra_negatives:
                 extra_negatives = None
 
         # === Pass 1: structural anchor at t=0 (clean) ===
