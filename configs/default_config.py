@@ -26,15 +26,15 @@ class Config:
     LEARNING_RATE = 3e-4
     # LR schedule (manual optimization → applied per optimizer step by PlZonkey._lr_factor).
     # LEARNING_RATE and MUON_LR are PEAK values: do not lower them by hand, the schedule
-    # decays both groups. factor = warmup(steps since this run started) * cosine(schedule step),
+    # decays both groups. factor = warmup(steps since this run started) * decay(schedule step),
     # where schedule step = global_step + offset. A full resume restores global_step, so the
     # schedule continues where it stopped; a weights-only resume (Lightning restarts
     # global_step at 0) takes the offset from the checkpoint's saved schedule step
     # automatically (run_trainer.py), so it continues too.
-    LR_SCHEDULE = "cosine"       # "cosine" or "constant"
+    LR_SCHEDULE = "cosine"       # "cosine", "exponential" (geometric, 1 -> MIN_LR_RATIO) or "constant"
     WARMUP_STEPS = 1000          # linear warmup at the start of a fresh run
     RESUME_WARMUP_STEPS = 500    # short re-warmup after any resume (restored optimizer state can be stale)
-    LR_DECAY_STEPS = 300000      # cosine horizon in schedule steps; flat at MIN_LR_RATIO afterwards
+    LR_DECAY_STEPS = 300000      # decay horizon in schedule steps; flat at MIN_LR_RATIO afterwards
     MIN_LR_RATIO = 0.1           # final LR = peak * MIN_LR_RATIO
     LR_SCHEDULE_OFFSET = 0       # set only to override the automatic weights-only resume offset
     DROPOUT = 0.0

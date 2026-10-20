@@ -55,7 +55,8 @@ caps 272 / 44 / 12), batch 38. `MAX_SEQUENCES_PER_BATCH` [8160, 1320, 360] is th
 worst case 24.9 GB from `--calibrate`, ~28.5 GB on nvidia-smi with optimizer and EMA (measured
 before `ONE_LEVEL_GRADIENTS`, whose second level-1 compressor pass adds an estimated 0.6-0.8 GB). An average
 batch fills ~78% of it; only a batch ~3 sigma above average overflows, and then its last documents
-skip that step. The LR decays over the whole 4 epochs (640k steps):
+skip that step. The LR starts at 1/3 of the other configs' (Muon 0.00167, Adam 6.7e-5) and decays
+exponentially to 0.1x over the whole 4 epochs (640k steps):
 
     python scripts/train.py --param_file configs/overhaul_l3_scratch.json
 

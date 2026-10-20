@@ -294,15 +294,19 @@ class PlZonkey(pl.LightningModule):
         RESUME_WARMUP_STEPS after a resume), times the schedule evaluated at the schedule
         step (global_step + offset), so a resumed run continues the same curve instead of
         restarting it. cosine: from 1 down to MIN_LR_RATIO over LR_DECAY_STEPS, then flat.
+        exponential: the same endpoints, multiplied by a constant factor every step.
         """
         since_start = int(self.global_step) - int(getattr(self, "_run_start_step", 0))
         resumed = (int(getattr(self, "_run_start_step", 0)) + int(self._schedule_offset)) > 0
         warmup = int(getattr(Config, "RESUME_WARMUP_STEPS", 0)) if resumed else int(getattr(Config, "WARMUP_STEPS", 0))
         warm = min(1.0, (since_start + 1) / max(1, warmup))
-        if str(getattr(Config, "LR_SCHEDULE", "cosine")).lower() == "constant":
+        schedule = str(getattr(Config, "LR_SCHEDULE", "cosine")).lower()
+        if schedule == "constant":
             return warm
         progress = min(1.0, self._schedule_step() / max(1, int(Config.LR_DECAY_STEPS)))
         floor = float(Config.MIN_LR_RATIO)
+        if schedule == "exponential":
+            return warm * floor ** progress
         cosine = floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.pi * progress))
         return warm * cosine
 
