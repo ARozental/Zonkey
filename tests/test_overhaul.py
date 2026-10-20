@@ -1,5 +1,6 @@
 """CPU checks for the overhaul's new pieces: tokens per child, per-child normalization, splitter
-boundaries only at child starts, the alignment assembly, per-level LR groups, hard negatives per child.
+boundaries only at child starts, the alignment assembly, per-level LR groups, hard negatives per child,
+losses reaching one level down only.
 
 Run: python tests/test_overhaul.py
 """
@@ -229,6 +230,67 @@ def test_hard_negatives_reach_every_level_above_0():
         assert cols == 1 + 4 and guessed == owned > 0 and mined > 0, (lvl, seen[lvl])
     Config.MLM_ALT_PASSES, Config.MINED_NEGATIVES_K = 2, 16
     print("clean reconstruction at levels 1 and 2 gets a context guess and mined neighbours per child:", seen)
+
+
+def test_window_bos_probs_match_the_splitter_layout():
+    from models.zonkey import Zonkey
+    _three_level_config()
+    torch.manual_seed(9)
+    m = Zonkey()
+    for lvl, T in ((1, Config.MAX_DOC_LENGTHS[1]), (2, Config.MAX_DOC_LENGTHS[2] * 4)):
+        sp = m.layers[lvl].segment_splitter
+        seq = torch.randn(3, T, Config.D_MODEL[lvl])
+        real = torch.ones(3, T)
+        real[1, T // 2:] = 0                                     # windows that run past a document's end
+        out = sp(seq, real)
+        bos, _ = sp.bos_probabilities(seq, real)
+        assert torch.equal(sp.window_bos_probs(bos, out[7], out[2]), out[1]), lvl
+    print("window_bos_probs rebuilds the splitter's window BOS probabilities exactly (k = 1 and k = 4)")
+
+
+def test_losses_reach_one_level_down():
+    import random
+    from models.zonkey import Zonkey, aggregate_leveled_losses
+    _three_level_config()
+    torch.manual_seed(7)
+    m = Zonkey()
+    texts = torch.randint(1, Config.TOKENIZER_VOCAB_SIZE_CHARS, (2, Config.MAX_DOC_LENGTHS[0]))
+    level_of = {}                                   # a layer's parameters include the levels below it
+    for lvl in range(3):
+        for p in m.layers[lvl].parameters():
+            level_of.setdefault(id(p), lvl)
+    params = list(m.parameters())
+
+    def run(one_level, levels):
+        Config.ONE_LEVEL_GRADIENTS = one_level
+        m.zero_grad(set_to_none=True)
+        torch.manual_seed(8)
+        random.seed(8)
+        codes, losses = m.forward({"full_texts": texts})
+        totals = aggregate_leveled_losses(losses)[1]
+        sum(totals[lvl] for lvl in levels).backward()
+        grads = {id(p): p.grad.detach().clone() if p.grad is not None else torch.zeros_like(p) for p in params}
+        return [c.detach() for c in codes], torch.stack([t.detach() for t in totals]), grads
+
+    def size(grads, lvl):
+        return sum(float(g.norm()) for i, g in grads.items() if level_of[i] == lvl)
+
+    codes_old, totals_old, g2_old = run(False, [2])
+    codes_new, totals_new, g2_new = run(True, [2])
+    assert torch.allclose(totals_new, totals_old) and all(torch.allclose(a, b) for a, b in zip(codes_new, codes_old))
+    assert size(g2_old, 0) > 0 and size(g2_new, 0) == 0, "level 2's losses must not reach level 0"
+    assert size(g2_new, 1) > 0
+    for i, g in g2_new.items():
+        if level_of[i] > 0:                         # levels 1 and 2 get exactly the gradients they got before
+            assert torch.allclose(g, g2_old[i], rtol=1e-4, atol=1e-7)
+    assert any(float(g2_new[id(p)].norm()) > 0 for p in m.layers[1].segment_splitter.parameters())
+    _, _, g01_old = run(False, [0, 1])
+    _, _, gall_new = run(True, [0, 1, 2])
+    for i, g in gall_new.items():
+        if level_of[i] == 0:                        # level 1's losses still reach level 0 in full
+            assert torch.allclose(g, g01_old[i], rtol=1e-4, atol=1e-7)
+    Config.ONE_LEVEL_GRADIENTS = True
+    print("ONE_LEVEL_GRADIENTS: level 2's losses train levels 2 and 1 as before and give level 0 no gradient")
 
 
 if __name__ == "__main__":

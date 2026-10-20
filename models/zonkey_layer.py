@@ -1635,9 +1635,12 @@ class ZonkeyLayer(nn.Module):
                          fake_negatives: Optional[torch.Tensor] = None,
                          window_ids: Optional[torch.Tensor] = None,
                          child_ids: Optional[torch.Tensor] = None,
+                         upward_is_real: Optional[torch.Tensor] = None,
                          ) -> torch.Tensor:
         # window_ids [windows]: content id of each window (this level's codes).
         # child_ids [docs, T]: content id of each input position (None at level 0).
+        # upward_is_real [windows, L]: existence for the codes passed up (forward,
+        # Config.ONE_LEVEL_GRADIENTS); None: the codes passed up are clean_compressed itself.
         input_sequence = self.norm_tokens(input_sequence)
 
         use_mlm = bool(getattr(Config, "MLM_LOSSES", True))
@@ -1689,6 +1692,9 @@ class ZonkeyLayer(nn.Module):
         
         # original_is_real = is_real_inferred
         clean_compressed = self.compress(input_sequence, is_real_inferred)
+        # The same codes for the level above, with no path into the level below.
+        upward_compressed = (clean_compressed if upward_is_real is None
+                             else self.compress(input_sequence.detach(), upward_is_real))
         doc_ids = original_position[:,0,0]
         batch = clean_compressed.shape[0]
 
@@ -2001,7 +2007,7 @@ class ZonkeyLayer(nn.Module):
                 label = self.bos_probs_to_inferred_real_position(all_sentence_bos_probs)
                 losses.update(self._code_diagnostics(clean_compressed.detach(), input_sequence, label, token_ids))
 
-        return denoised_clean[:input_sequence.shape[0]], clean_compressed, losses, is_real_inferred, fake_negatives_for_upper
+        return denoised_clean[:input_sequence.shape[0]], upward_compressed, losses, is_real_inferred, fake_negatives_for_upper
     
     def bos_probs_to_inferred_real_position(self, bos_probs: torch.Tensor) -> torch.Tensor:
         # Clamp bos_probs to minimum to prevent float32 precision loss in cumsum
@@ -2089,6 +2095,15 @@ class ZonkeyLayer(nn.Module):
             packed, is_real, span_out, id_out = self._pack_for_next_level(
                 compressed, num_sentences_per_doc, span_a, span_b, window_ids)
             return None, is_real_inferred, packed, {}, None, is_real, None, span_out, id_out
+        # Config.ONE_LEVEL_GRADIENTS: the existence of the codes passed up, from the BOS classifier
+        # run again on a detached copy of the input (training_forward compresses with it), so the
+        # level above trains this level's splitter and compressor but nothing below them.
+        upward_is_real = None
+        if (bool(getattr(Config, "ONE_LEVEL_GRADIENTS", True)) and 0 < self.level < Config.AGENT_LEVELS - 1
+                and not mlm_only and input_sequence.requires_grad and torch.is_grad_enabled()):
+            bos_up, _ = self.segment_splitter.bos_probabilities(input_sequence.detach(), is_real_doc_position_boolean)
+            upward_is_real = self.bos_probs_to_inferred_real_position(
+                self.segment_splitter.window_bos_probs(bos_up, original_position, all_sentence_is_real))
         denoised, compressed, losses, denoised_is_real_inferred, fake_negatives_for_upper = self.training_forward(
             all_sentence_vectors,
             is_real_inferred,
@@ -2102,7 +2117,8 @@ class ZonkeyLayer(nn.Module):
             mlm_only=mlm_only,
             fake_negatives=fake_negatives,
             window_ids=window_ids,
-            child_ids=child_ids)
+            child_ids=child_ids,
+            upward_is_real=upward_is_real)
         if mlm_only:
             return None, None, None, losses, None, None, None, None, None
 

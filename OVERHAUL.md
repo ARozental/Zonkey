@@ -33,6 +33,13 @@ Three levels:
 - `FREEZE_LEVELS_UNTIL`: a level only encodes (no losses, no updates) until a step. A new level must
   learn on frozen trained levels first: trained jointly from the start it wrecks them.
 - `LEVEL_LR_SCALE`: per-level learning-rate multipliers.
+- `ONE_LEVEL_GRADIENTS` (default on): a level's losses update that level and the one below, never
+  lower ones (level 2's losses do not reach level 0). A middle level compresses its windows a second
+  time from a detached copy of its input for the level above (one more compressor pass and one
+  more splitter-classifier pass there; nothing extra at level 0 or the top level). The values and
+  the gradients into levels 1 and 2 are unchanged (tests/test_overhaul.py). In the first 3-level
+  run from scratch (all losses reaching every level) level 1 never learned to decode words: child
+  word accuracy ~0 through 45k steps, against 0.71 at 3k steps for the same 2-level setup.
 
 ## Runs
 
@@ -45,7 +52,8 @@ both together lower them.
 Three levels from scratch, all levels training from step 0, half width (128 / 512 / 512), hard
 negatives on, documents of 2048 characters (63% of articles fit whole, 42% at 1024; per-document
 caps 272 / 44 / 12), batch 38. `MAX_SEQUENCES_PER_BATCH` [8160, 1320, 360] is the memory budget:
-worst case 24.9 GB from `--calibrate`, ~28.5 GB on nvidia-smi with optimizer and EMA. An average
+worst case 24.9 GB from `--calibrate`, ~28.5 GB on nvidia-smi with optimizer and EMA (measured
+before `ONE_LEVEL_GRADIENTS`, whose second level-1 compressor pass adds an estimated 0.6-0.8 GB). An average
 batch fills ~78% of it; only a batch ~3 sigma above average overflows, and then its last documents
 skip that step. The LR decays over the whole 4 epochs (640k steps):
 

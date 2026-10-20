@@ -312,9 +312,10 @@ class SegmentSplitter(nn.Module):
         
         return is_bos_extra
 
-    def forward(self, input_sequence, is_real_position, deterministic=False, input_tokens=None):
-        batch_size, full_seq_len, _ = input_sequence.shape
-        
+    def bos_probabilities(self, input_sequence, is_real_position):
+        """Per-position BOS probabilities [batch, seq_len] (the first position certain, only child
+        starts at k > 1, 0 on padding) and the child-start mask (None at k = 1)."""
+        full_seq_len = input_sequence.shape[1]
         bos_probs = self.bos_classifier(input_sequence)   # [batch, full_seq_len]
         if self.force_max_segments:
             bos_probs = torch.ones_like(bos_probs)
@@ -325,8 +326,21 @@ class SegmentSplitter(nn.Module):
             # Boundaries only between children: the other tokens of a child never start a window.
             child_start = (torch.arange(full_seq_len, device=bos_probs.device) % self.k == 0).unsqueeze(0)
             bos_probs = torch.where(child_start, bos_probs, torch.full_like(bos_probs, Config.EPS))
-        bos_probs = bos_probs * is_real_position
-        
+        return bos_probs * is_real_position, child_start
+
+    @staticmethod
+    def window_bos_probs(bos_probs, original_position, window_is_real):
+        """The windows' BOS probabilities exactly as forward() lays them out, from per-position
+        ones: window token j is document position original_position[w, j]; 1 - 1e-6 past the text."""
+        pos = original_position[..., 1].clamp(max=bos_probs.shape[1] - 1)
+        win = bos_probs[original_position[..., 0], pos]
+        return torch.where(window_is_real > 0.5, win, torch.full_like(win, 1.0 - 1e-6))
+
+    def forward(self, input_sequence, is_real_position, deterministic=False, input_tokens=None):
+        batch_size, full_seq_len, _ = input_sequence.shape
+
+        bos_probs, child_start = self.bos_probabilities(input_sequence, is_real_position)
+
         device = input_sequence.device
         max_sentence_length = self.max_sentence_length
         

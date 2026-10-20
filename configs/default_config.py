@@ -208,6 +208,13 @@ class Config:
     # [20000, 20000, 0]: a new level 2 learns on finished levels 0 and 1 first (they stay intact
     # and steps are cheap), then all levels train together. None: never frozen.
     FREEZE_LEVELS_UNTIL = None
+    # A level's losses update that level and the one below it, never lower ones: level 2's losses
+    # reach level 1's weights but not level 0's (level 0's input, the character embedding, is part
+    # of level 0). A level that has a level below and one above computes the codes it passes up a
+    # second time, from a detached copy of its input (one more compressor pass and one more
+    # splitter-classifier pass); its own losses reach the level below through the first. Same
+    # values, same gradients into the level itself. False: every loss reaches every level below.
+    ONE_LEVEL_GRADIENTS = True
 
     # ---- Speed (same method) ----
     # Batched Muon/Adam step (muon.FastSingleDeviceMuonWithAuxAdam): same update, same state.
