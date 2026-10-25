@@ -26,15 +26,15 @@ class Config:
     LEARNING_RATE = 3e-4
     # LR schedule (manual optimization → applied per optimizer step by PlZonkey._lr_factor).
     # LEARNING_RATE and MUON_LR are PEAK values: do not lower them by hand, the schedule
-    # decays both groups. factor = warmup(steps since this run started) * cosine(schedule step),
+    # decays both groups. factor = warmup(steps since this run started) * decay(schedule step),
     # where schedule step = global_step + offset. A full resume restores global_step, so the
     # schedule continues where it stopped; a weights-only resume (Lightning restarts
     # global_step at 0) takes the offset from the checkpoint's saved schedule step
     # automatically (run_trainer.py), so it continues too.
-    LR_SCHEDULE = "cosine"       # "cosine" or "constant"
+    LR_SCHEDULE = "cosine"       # "cosine", "exponential" (geometric, 1 -> MIN_LR_RATIO) or "constant"
     WARMUP_STEPS = 1000          # linear warmup at the start of a fresh run
     RESUME_WARMUP_STEPS = 500    # short re-warmup after any resume (restored optimizer state can be stale)
-    LR_DECAY_STEPS = 300000      # cosine horizon in schedule steps; flat at MIN_LR_RATIO afterwards
+    LR_DECAY_STEPS = 300000      # decay horizon in schedule steps; flat at MIN_LR_RATIO afterwards
     MIN_LR_RATIO = 0.1           # final LR = peak * MIN_LR_RATIO
     LR_SCHEDULE_OFFSET = 0       # set only to override the automatic weights-only resume offset
     DROPOUT = 0.0
@@ -192,9 +192,56 @@ class Config:
     # steps, 0.88 at 100 (real text 0.90); L0 ode 0.61, renoise 0.50, so L0 stays on the ODE.
     SAMPLER = ["ode", "renoise"]
     SAMPLE_STEPS = [30, 100]
+    # renoise only: re-noise to SAMPLE_RENOISE_SCALE * t_next (label t_next); < 1 is a lower
+    # sampling temperature. 2.09M L1: 0.84/0.73 at 1.0, 0.91/0.85 at 0.8 (100 steps).
+    SAMPLE_RENOISE_SCALE = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 
     # Compile each level's compressor, decompressor and denoiser in place (PlZonkey), so
     # they also run compiled inside the checkpointed denoise passes, which execute outside
     # torch.compile. Same math; set False to fall back if a torch version misbehaves.
     COMPILE_TRANSFORMER_STACKS = True
+
+    # Per-level LR multipliers (both optimizer groups), e.g. [0.3, 0.3, 1.0] when a new level is
+    # trained on top of trained ones. None: one LR for all levels (and the old optimizer layout).
+    LEVEL_LR_SCALE = None
+    # Per-level step until which that level is frozen (only encodes: no losses, no updates), e.g.
+    # [20000, 20000, 0]: a new level 2 learns on finished levels 0 and 1 first (they stay intact
+    # and steps are cheap), then all levels train together. None: never frozen.
+    FREEZE_LEVELS_UNTIL = None
+    # A level's losses update that level and the one below it, never lower ones: level 2's losses
+    # reach level 1's weights but not level 0's (level 0's input, the character embedding, is part
+    # of level 0). A level that has a level below and one above computes the codes it passes up a
+    # second time, from a detached copy of its input (one more compressor pass and one more
+    # splitter-classifier pass); its own losses reach the level below through the first. Same
+    # values, same gradients into the level itself. False: every loss reaches every level below.
+    ONE_LEVEL_GRADIENTS = True
+
+    # ---- Speed (same method) ----
+    # Batched Muon/Adam step (muon.FastSingleDeviceMuonWithAuxAdam): same update, same state.
+    FAST_OPTIMIZER = True
+    # bf16 autocast inside the transformer stacks only; their outputs and every loss stay fp32.
+    STACK_BF16 = False
+
+    # ---- Component switches (defaults = the full method; the ablations turn them off) ----
+    # Stitcher: training losses (clean-pass position/sequence, null_*) and generation assembly.
+    # Off: windows are assembled by ASSEMBLY ("align": cut where the next window's first positions
+    # match, "concat": existence > ASSEMBLY_CUTOFF). On the 2.09M model (exact L1 reconstruction):
+    # stitcher 0.896, stitcher without its refinement 0.896, align 0.833, concat 0.333.
+    STITCHER = True
+    STITCHER_REFINE = True          # cross-attention refinement of the overlap (no measured effect)
+    STITCHER_SEQUENCE_LOSS = True   # reconstruction of the refined overlap (clean pass)
+    STITCHER_NULL_LOSSES = True     # position/sequence losses on the input windows themselves
+    ASSEMBLY = "align"
+    ASSEMBLY_MATCH_WEIGHT = 4.0
+    ASSEMBLY_MATCH_LEN = 4
+    ASSEMBLY_CUTOFF = 0.5
+    # The three MLM losses per level (clean via denoiser and compressor, MLM on the clean decode).
+    MLM_LOSSES = True
+    # Generative passes. FM_PASS: the flow-matching pass (true-code-centered input, flow loss).
+    # DIRTY_TRUE_CODE_PROB: share of the dirty pass's samples centered on the true code with a
+    # null self-condition instead of on the model's estimate (1 pass covering both cases).
+    # DIRTY_FLOW_LOSS: the flow-velocity loss on the dirty pass's estimate as well.
+    FM_PASS = True
+    DIRTY_TRUE_CODE_PROB = 0.0
+    DIRTY_FLOW_LOSS = False
 

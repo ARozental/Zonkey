@@ -4,6 +4,43 @@ from configs.default_config import Config
 from utils.helper_functions import arc_cosine_similarity_seq
 
 
+class _GatheredDot(torch.autograd.Function):
+    """out[i, j] = a[i] . b[index[i, j]], in row chunks of `chunk`.
+
+    torch.gather saves its whole input for backward, so gather(a @ b.T, index) kept every
+    [rows, len(b)] similarity matrix alive until backward even when built in row chunks (level 0
+    MLM at batch 36: ~3.7 GB per call). The backward only needs a, b and the index."""
+
+    @staticmethod
+    def forward(ctx, a, b, index, chunk):
+        ctx.save_for_backward(a, b, index)
+        ctx.chunk = chunk
+        return torch.cat([torch.gather(a[s:s + chunk] @ b.t(), 1, index[s:s + chunk])
+                          for s in range(0, a.shape[0], chunk)], dim=0)
+
+    @staticmethod
+    def backward(ctx, grad):
+        a, b, index = ctx.saved_tensors
+        c = ctx.chunk
+        grad_a = torch.empty_like(a) if ctx.needs_input_grad[0] else None
+        grad_b = torch.zeros_like(b) if ctx.needs_input_grad[1] else None
+        for s in range(0, a.shape[0], c):
+            g = grad.new_zeros(min(c, a.shape[0] - s), b.shape[0]).scatter_add_(1, index[s:s + c], grad[s:s + c])
+            if grad_a is not None:
+                grad_a[s:s + c] = g @ b
+            if grad_b is not None:
+                grad_b += g.t() @ a[s:s + c]
+        return grad_a, grad_b, None, None
+
+
+def gathered_dot(a, b, index, chunk=4096):
+    """Dot products of the rows of a [n, d] with the rows of b [m, d] picked by index [n, k]:
+    the values and gradients of torch.gather(a @ b.T, 1, index) without the [n, m] matrix."""
+    if a.shape[0] == 0:
+        return torch.gather(a @ b.t(), 1, index)
+    return _GatheredDot.apply(a, b, index, chunk)
+
+
 def _regression_blend(ce_per_pos, pos_cos, noise_level, regression_power):
     """Blend the contrastive CE with a direct cosine-regression target, weighted by
     t^power per sample. Negligible at low noise, dominant near t=1 (where contrastive
@@ -287,11 +324,9 @@ def calculate_reconstruction_loss(
             fake_neg_norm = F.normalize(fake_negatives, p=2, dim=-1)
 
         def contrastive_ce(d_n, t_n, extra):
-            # Compute full similarity matrix: (N, N), much smaller than
-            # gathering (N, num_neg, hidden) and doing elementwise multiply+sum.
-            full_sim = torch.matmul(d_n, t_n.T)
-            neg = torch.gather(full_sim, 1, sampled_indices)
-            del full_sim
+            # Similarities at the sampled negatives only, never the N x N matrix (O(batch^2):
+            # 1.4 GB at level 1 with batch 36, kept until backward by torch.gather).
+            neg = gathered_dot(d_n, t_n, sampled_indices)
             if fake_neg_norm is not None:
                 neg = torch.cat([neg, torch.matmul(d_n, fake_neg_norm.T)], dim=1)  # (N, K)
             if extra is not None:

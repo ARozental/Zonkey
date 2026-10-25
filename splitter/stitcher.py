@@ -16,17 +16,24 @@ It also computes a loss IF in training mode (if labels are available)
 """
 
 class Stitcher(nn.Module):
-    def __init__(self,level=0,token_embedding_layer=None):
+    def __init__(self,level=0,token_embedding_layer=None,child_tokens=1):
         super().__init__()
+        # At a level with k tokens per child the stitcher works on whole children (k * d wide,
+        # window lengths in children).
         self.level = level
         self.max_doc_len = Config.MAX_DOC_LENGTHS[level]
-        self.max_seq_len = Config.MAX_SEQ_LENGTHS[level]
-        self.d_model = Config.D_MODEL[level]
+        self.max_seq_len = Config.MAX_SEQ_LENGTHS[level] // child_tokens
+        self.d_model = Config.D_MODEL[level] * child_tokens
         self.max_sequences = Config.MAX_SEQUENCES_PER_BATCH[level]
         
-        self.score_linear = nn.Linear(2 * self.d_model + 2, 1)
-        self.correction_linear = nn.Linear(self.d_model, self.d_model)
-        self.refiner = TransformerEncoderLayer(d_model = self.d_model,n_heads = Config.NUM_HEADS[level],d_ff = self.d_model*Config.FF_DIM_RATIO)
+        if getattr(Config, "STITCHER_REFINE", True):
+            # Never used in the forward; kept only so old checkpoints resume with identical params.
+            self.score_linear = nn.Linear(2 * self.d_model + 2, 1)
+            self.correction_linear = nn.Linear(self.d_model, self.d_model)
+        # The cross-attention refinement of the overlap changed no decode of the 2.09M model
+        # (exact reconstruction 0.896 with and without it); STITCHER_REFINE False drops it.
+        self.refiner = (TransformerEncoderLayer(d_model = self.d_model,n_heads = Config.NUM_HEADS[level],d_ff = self.d_model*Config.FF_DIM_RATIO)
+                        if getattr(Config, "STITCHER_REFINE", True) and child_tokens == 1 else None)
         self.refiner_portion = nn.Parameter(torch.tensor([0.1],device=Config.DEVICE,requires_grad=True))
         self.proj = nn.Linear(self.d_model, self.d_model//4)
         self.similarity_weight = nn.Parameter(torch.tensor([1.0],device=Config.DEVICE,requires_grad=True))
@@ -34,9 +41,9 @@ class Stitcher(nn.Module):
         self.token_embedding_layer = token_embedding_layer
         self.dim_norm = expected_l2_norm(self.d_model)
         
-        # Scratch space for assembled documents (generation only). Not persistent: it is all
-        # zeros, it used to add ~0.6 GB to every checkpoint, and its shape depends on config.
-        self.register_buffer('_output_buffer', torch.zeros(self.max_sequences, self.max_doc_len, self.d_model), persistent=False)
+        # Assembled documents (generation only) are allocated per call: a buffer for
+        # MAX_SEQUENCES_PER_BATCH documents held 3.5 GB of GPU memory at level 0 (6656 x 1024 x 128)
+        # while generation assembles a handful.
         # Per document, where the last (never-merged) segment was placed by the last
         # assembling forward. Generation uses it to cut that segment at its own existence.
         self.last_segment_start = []
@@ -214,14 +221,20 @@ class Stitcher(nn.Module):
         """
         batch_size = denoised_input_sequence1.shape[0]
         inferred_denoised2_start_position = self.infer_start_position(denoised_input_sequence1, denoised_input_sequence2, denoised_is_real_position1, denoised_is_real_position2,self.similarity_weight)
-        inferred_input_sequence1 = self.to_original1(denoised_input_sequence1, denoised_is_real_position1, denoised_input_sequence2, denoised_is_real_position2)
+        if self.refiner is not None and getattr(Config, "STITCHER_REFINE", True):
+            inferred_input_sequence1 = self.to_original1(denoised_input_sequence1, denoised_is_real_position1, denoised_input_sequence2, denoised_is_real_position2)
+        else:   # the stitcher's cut only, without its cross-attention refinement
+            inferred_input_sequence1 = denoised_input_sequence1
         if denoised2_start_position is None:
             k = inferred_denoised2_start_position.round().clamp(0, self.max_seq_len).long()
             return inferred_input_sequence1, torch.zeros(batch_size, device=inferred_input_sequence1.device), torch.zeros(1, device=inferred_input_sequence1.device).sum(), k
         
         k = denoised2_start_position.round().clamp(0, self.max_seq_len).long().view(batch_size)
         position_loss = self.get_position_loss(denoised2_start_position, inferred_denoised2_start_position, p_exist_share1)
-        sequence_loss = self.get_sequence_loss(inferred_input_sequence1, original_input_sequence1, p_exist_share1, all_tokens=all_tokens, is_real_inferred1=denoised_is_real_position1, previous_denoised1=previous_denoised1, source_ids1=source_ids1)
+        if getattr(Config, "STITCHER_SEQUENCE_LOSS", True):
+            sequence_loss = self.get_sequence_loss(inferred_input_sequence1, original_input_sequence1, p_exist_share1, all_tokens=all_tokens, is_real_inferred1=denoised_is_real_position1, previous_denoised1=previous_denoised1, source_ids1=source_ids1)
+        else:
+            sequence_loss = position_loss.new_zeros(batch_size)
 
         
        
@@ -267,12 +280,9 @@ class Stitcher(nn.Module):
 
         if not assemble:
             all_patches = None
-        elif num_docs <= self.max_sequences:
-            all_patches = self._output_buffer[:num_docs, :self.max_doc_len, :d_model].detach()
-            all_patches.fill_(0)
         else:
-            all_patches = torch.zeros(num_docs, self.max_doc_len, d_model, 
-                                     device=denoised_input_sequences.device, dtype=denoised_input_sequences.dtype)
+            all_patches = torch.zeros(num_docs, self.max_doc_len, d_model,
+                                      device=denoised_input_sequences.device, dtype=denoised_input_sequences.dtype)
         
         stitched_len = torch.full((num_docs,), seq_len, device=denoised_input_sequences.device, dtype=torch.long)
         if assemble:
