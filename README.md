@@ -8,6 +8,10 @@ Zonkey is a fully differentiable hierarchical diffusion language model that lear
 
 Trained end-to-end on Wikipedia, Zonkey generates coherent text with emergent word- and sentence-level hierarchies.
 
+![Zonkey decoding: one code sampled on a sphere unfolds outward into phrase codes, overlapping phrase windows, stitched word codes, overlapping word windows and the stitched text, with learned soft boundaries and no end token](figures/zonkey_decoding.png)
+
+*Decoding unfolds outward from a single code sampled on a sphere. At every level the windows overlap and fade instead of ending, and the Stitcher merges them into the level below. Boundary probabilities and the level-1 split are illustrative.*
+
 
 ### Repository Status
 This is a research prototype / proof-of-concept implementation. It demonstrates coherent sentence-level generation with emergent hierarchies (levels 0–1). Scaling to deeper hierarchies or larger datasets is left for future work.
